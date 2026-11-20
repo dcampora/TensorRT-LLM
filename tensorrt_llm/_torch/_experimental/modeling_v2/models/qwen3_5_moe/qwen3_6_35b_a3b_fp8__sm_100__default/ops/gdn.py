@@ -6,7 +6,10 @@ from dataclasses import dataclass
 
 import torch
 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+from .verify_conv import verify_conv
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,8 @@ class RecurrentStep:
     """State and sequence views shared by all recurrent layers of a step."""
 
     context_tokens: int
+    decode_width: int
+    verify: bool
     context_slots: torch.Tensor
     decode_slots: torch.Tensor
     initial_slots: torch.Tensor | None
@@ -22,7 +27,7 @@ class RecurrentStep:
     cu_seqlens_long: torch.Tensor | None
 
     @classmethod
-    def from_metadata(cls, metadata):
+    def from_metadata(cls, metadata, spec_metadata=None):
         """Bind the context-then-generation order supplied by the scheduler."""
         mamba = metadata.mamba_metadata
         count = metadata.num_contexts
@@ -40,6 +45,8 @@ class RecurrentStep:
             decode_slots = slots
         return cls(
             metadata.num_ctx_tokens,
+            spec_metadata.runtime_draft_len + 1 if spec_metadata is not None else 1,
+            spec_metadata is not None and metadata.kv_cache_manager.is_speculative(),
             context_slots,
             decode_slots,
             initial_slots,
@@ -102,23 +109,57 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
             beta_is_logit=True,
         )
     if context < qkv.shape[0]:
-        x = qkv[context:].contiguous()
-        torch.ops.trtllm.causal_conv1d_update(
-            x.unsqueeze(-1), cache.conv, conv_weight, None, True, None, step.decode_slots, -1
-        )
+        x = qkv[context:]
+        width = step.decode_width
+        if step.verify:
+            x = verify_conv(
+                x, conv_weight, cache.conv, step.decode_slots, cache.intermediate_conv_window, width
+            )
+        else:
+            x = x.contiguous()
+            torch.ops.trtllm.causal_conv1d_update(
+                x.unsqueeze(-1), cache.conv, conv_weight, None, True, None, step.decode_slots, -1
+            )
+        batch_size = step.decode_slots.numel()
         q, k, v = _split_qkv(x, key_heads, value_heads, head_dim)
-        gated_delta_rule_decode_pretranspose(
-            q.unsqueeze(1),
-            k.unsqueeze(1),
-            v.unsqueeze(1),
-            None,
-            a_log,
-            a[context:].unsqueeze(1).contiguous(),
-            dt_bias,
-            b[context:].unsqueeze(1).contiguous(),
-            output=out[context:].unsqueeze(1),
-            initial_state=cache.temporal,
-            initial_state_indices=step.decode_slots,
-            backend="flashinfer",
-        )
+        q = q.view(batch_size, width, key_heads, head_dim)
+        k = k.view_as(q)
+        output = out[context:].view(batch_size, width, value_heads, head_dim)
+        v = v.view_as(output)
+        a = a[context:].contiguous().view(batch_size, width, value_heads)
+        b = b[context:].contiguous().view(batch_size, width, value_heads)
+        if step.verify:
+            gated_delta_rule_mtp(
+                A_log=a_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=cache.temporal,
+                initial_state_indices=step.decode_slots,
+                intermediate_states_buffer=cache.intermediate_ssm[:batch_size],
+                disable_state_update=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=head_dim**-0.5,
+                output=output,
+            )
+        else:
+            gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                None,
+                a_log,
+                a,
+                dt_bias,
+                b,
+                output=output,
+                initial_state=cache.temporal,
+                initial_state_indices=step.decode_slots,
+                backend="flashinfer",
+            )
     return out

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import traceback
+from contextlib import ExitStack
 
 
 def _score(llm, request, sampling_params, vocab_size):
@@ -14,7 +15,7 @@ def _score(llm, request, sampling_params, vocab_size):
     ids = request["ids"]
     positions = max(0, len(ids) - 1)
     top_k = request.get("top_k", 0)
-    if not isinstance(top_k, int) or not 0 <= top_k <= vocab_size:
+    if type(top_k) is not int or not 0 <= top_k <= vocab_size:
         raise ValueError("top_k must be between zero and the vocabulary size")
     requested = request.get("logprob_ids")
     if "logprob_ids" in request and (
@@ -78,34 +79,49 @@ def _run(model, mode):
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
     import torch
-    from transformers import GenerationConfig
 
     from tensorrt_llm import LLM, SamplingParams
-    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
     torch.set_num_threads(4)
-    llm = LLM(
-        model,
-        modeling_v2=mode,
-        disable_mm_encoder=True,
-        skip_tokenizer_init=True,
-        lm_head_output_dtype="float32" if mode == "require" else "auto",
-        max_batch_size=1,
-        max_seq_len=8192,
-        max_num_tokens=8192,
-        kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
-            free_gpu_memory_fraction=0.10,
-        ),
-        cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
-    )
-    config = llm._hf_model_config
+    with ExitStack() as stack:
+
+        def load_engine(speculative_config=None):
+            return stack.enter_context(
+                LLM(
+                    model,
+                    modeling_v2=mode,
+                    disable_mm_encoder=True,
+                    skip_tokenizer_init=True,
+                    lm_head_output_dtype="float32" if mode == "require" else "auto",
+                    max_batch_size=1,
+                    max_seq_len=8192,
+                    max_num_tokens=8192,
+                    kv_cache_config=KvCacheConfig(
+                        enable_block_reuse=False,
+                        free_gpu_memory_fraction=0.10,
+                    ),
+                    cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+                    speculative_config=speculative_config,
+                )
+            )
+
+        scorer = load_engine()
+        # The speculative sampler cannot return teacher-forced context logits.
+        generator = load_engine(MTPDecodingConfig(max_draft_len=1)) if mode == "require" else scorer
+        _dispatch(protocol, model, scorer, generator, SamplingParams)
+
+
+def _dispatch(protocol, model, scorer, generator, sampling_params_cls):
+    from transformers import GenerationConfig
+
+    config = scorer._hf_model_config
     vocab_size = config.get_text_config().vocab_size
     eos_ids = GenerationConfig.from_pretrained(model).eos_token_id
     if isinstance(eos_ids, int):
         eos_ids = [eos_ids]
     eos, *other_eos = eos_ids
-    score_params = SamplingParams(
+    score_params = sampling_params_cls(
         temperature=0,
         max_tokens=1,
         ignore_eos=True,
@@ -114,57 +130,56 @@ def _run(model, mode):
         detokenize=False,
         return_context_logits=True,
     )
-    warmup = SamplingParams(
+    warmup = sampling_params_cls(
         temperature=0, max_tokens=4, ignore_eos=True, end_id=eos, pad_id=eos, detokenize=False
     )
-    try:
-        llm.generate([eos] * 128, warmup, use_tqdm=False)
-        print(json.dumps({"ready": True}), file=protocol)
-        for line in sys.stdin:
-            try:
-                request = json.loads(line)
-                if not isinstance(request, dict):
-                    raise ValueError("request must be a JSON object")
-                operation = request["op"]
-                if operation == "shutdown":
-                    print(json.dumps({"ok": True}), file=protocol)
-                    break
-                if operation not in ("score", "generate"):
-                    raise ValueError(f"unknown operation {operation!r}")
-                ids = request["ids"]
-                _validate_ids(ids, vocab_size)
-                if operation == "score":
-                    response = _score(llm, request, score_params, vocab_size)
+    scorer.generate([eos] * 128, score_params, use_tqdm=False)
+    generator.generate([eos] * 128, warmup, use_tqdm=False)
+    print(json.dumps({"ready": True}), file=protocol)
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("request must be a JSON object")
+            operation = request["op"]
+            if operation == "shutdown":
+                print(json.dumps({"ok": True}), file=protocol)
+                break
+            if operation not in ("score", "generate"):
+                raise ValueError(f"unknown operation {operation!r}")
+            ids = request["ids"]
+            _validate_ids(ids, vocab_size)
+            if operation == "score":
+                response = _score(scorer, request, score_params, vocab_size)
+            else:
+                count = request["max_new_tokens"]
+                ignore_eos = request["ignore_eos"]
+                if type(count) is not int or count < 0 or type(ignore_eos) is not bool:
+                    raise ValueError(
+                        "expected a nonnegative max_new_tokens and a boolean ignore_eos"
+                    )
+                if not ids:
+                    raise ValueError("generation requires at least one prompt token")
+                if count:
+                    params = sampling_params_cls(
+                        temperature=0,
+                        max_tokens=count,
+                        ignore_eos=ignore_eos,
+                        end_id=eos,
+                        pad_id=eos,
+                        stop_token_ids=None if ignore_eos else other_eos,
+                        include_stop_str_in_output=True,
+                        detokenize=False,
+                    )
+                    result = generator.generate(ids, params, use_tqdm=False)
+                    response = {"ids": result.outputs[0].token_ids}
                 else:
-                    count = request["max_new_tokens"]
-                    ignore_eos = request["ignore_eos"]
-                    if type(count) is not int or count < 0 or type(ignore_eos) is not bool:
-                        raise ValueError(
-                            "expected a nonnegative max_new_tokens and a boolean ignore_eos"
-                        )
-                    if not ids:
-                        raise ValueError("generation requires at least one prompt token")
-                    if count:
-                        params = SamplingParams(
-                            temperature=0,
-                            max_tokens=count,
-                            ignore_eos=ignore_eos,
-                            end_id=eos,
-                            pad_id=eos,
-                            stop_token_ids=None if ignore_eos else other_eos,
-                            include_stop_str_in_output=True,
-                            detokenize=False,
-                        )
-                        result = llm.generate(ids, params, use_tqdm=False)
-                        response = {"ids": result.outputs[0].token_ids}
-                    else:
-                        response = {"ids": []}
-            except (KeyError, TypeError, ValueError, RuntimeError) as error:
-                traceback.print_exc()
-                response = {"error": str(error)}
-            print(json.dumps(response, allow_nan=False), file=protocol)
-    finally:
-        llm.shutdown()
+                    response = {"ids": []}
+            payload = json.dumps(response, allow_nan=False)
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            traceback.print_exc()
+            payload = json.dumps({"error": str(error)})
+        print(payload, file=protocol)
 
 
 if __name__ == "__main__":

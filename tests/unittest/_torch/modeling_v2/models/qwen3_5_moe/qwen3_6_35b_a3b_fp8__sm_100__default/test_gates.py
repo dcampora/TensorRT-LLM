@@ -25,7 +25,7 @@ def test_sigmoid_gate(cell, certifying):  # noqa: F811
     gate = torch.randn(rows, 2 * width + 1024, device="cuda", dtype=torch.bfloat16, generator=rng)[
         :, -gate_width:
     ]
-    addend = torch.randn_like(x) if shared else None
+    addend = torch.randn(x.shape, device="cuda", dtype=x.dtype, generator=rng) if shared else None
     actual = sigmoid_gate(x, gate, addend)
     reference = sigmoid_gate.reference(x, gate, addend)
     assert_within_ulp(actual, reference, element_ulp=1, rms_ulp=0.1)

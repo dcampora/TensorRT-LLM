@@ -4,6 +4,8 @@
 
 import torch
 
+from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 # Qwen3.6-35B-A3B's official checkpoint shares the Qwen3.5 architecture name.
@@ -35,7 +37,9 @@ def route(model_config, llm_args, compute_capability):
     if not llm_args.disable_mm_encoder or llm_args.mm_encoder_only:
         raise NoTarget("Qwen3.6 FP8 serves text only with disable_mm_encoder=True")
     composite = model_config.pretrained_config
-    config = composite.text_config
+    config = getattr(composite, "text_config", None)
+    if config is None:
+        raise NoTarget("Qwen3.6 FP8 requires the composite checkpoint with a text_config")
     for name, expected in _TEXT_GEOMETRY.items():
         if getattr(config, name, None) != expected:
             raise NoTarget(f"Qwen3.6 FP8 requires text_config.{name}={expected}")
@@ -49,7 +53,11 @@ def route(model_config, llm_args, compute_capability):
     ):
         raise NoTarget("Qwen3.6 FP8 requires the checkpoint's BF16 gated hybrid decoder")
     rope = config.rope_parameters
-    if rope.get("type") != "mrope" or rope.get("partial_rotary_factor") != 0.25:
+    if (
+        not isinstance(rope, dict)
+        or rope.get("type") != "mrope"
+        or rope.get("partial_rotary_factor") != 0.25
+    ):
         raise NoTarget("Qwen3.6 FP8 requires partial rotary embeddings with factor 0.25")
     quantization = getattr(composite, "quantization_config", None) or {}
     if (
@@ -75,8 +83,21 @@ def route(model_config, llm_args, compute_capability):
         raise NoTarget("Qwen3.6 FP8 requires TRTLLM dense attention metadata")
     if model_config.lora_config is not None or llm_args.max_beam_width != 1:
         raise NoTarget("Qwen3.6 FP8 supports no LoRA adapters and one beam")
-    if model_config.spec_config is not None:
-        raise NoTarget("Qwen3.6 FP8 currently supports decoding without speculation")
+    spec = model_config.spec_config
+    if spec is not None:
+        if (
+            not spec.spec_dec_mode.is_mtp_eagle_one_model()
+            or spec.uses_replacement_heads
+            or spec.use_dynamic_tree
+            or spec.sa_config is not None
+            or spec.use_relaxed_acceptance_for_thinking
+            or spec.draft_moe_dtype != "auto"
+            or spec.draft_lm_head_dtype != "auto"
+            or spec.max_draft_len not in (1, 2, 3)
+        ):
+            raise NoTarget("Qwen3.6 FP8 supports linear MTP with one to three draft tokens")
+        if is_gdn_replay_enabled() or llm_args.kv_cache_config.mamba_ssm_cache_dtype == "float32":
+            raise NoTarget("Qwen3.6 FP8 MTP requires BF16 GDN state and TRTLLM_USE_GDN_REPLAY=0")
 
     from .qwen3_6_35b_a3b_fp8__sm_100__default.modeling import ModelingV2Qwen3635bA3bFp8Sm100Default
 

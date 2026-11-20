@@ -35,7 +35,8 @@ budget of 8192, graph padding, and a BF16 paged KV cache sized from 80% of
 free GPU memory. The benchmark used one request per concurrent client (at
 least two), with a 16-output-token warmup. At ISL 1024 the first run
 completed concurrency 1–64. The benchmark client disconnected during the
-concurrency-128 warmup.
+concurrency-128 warmup. A fresh client completed that point and the
+three ISL 4096 measurements.
 
 ### Modeling V1 serving, ISL 1024 and OSL 1024
 
@@ -48,6 +49,15 @@ concurrency-128 warmup.
 | 16 | 2598.64 | 231.60 | 5.93 |
 | 32 | 4527.05 | 352.13 | 6.72 |
 | 64 | 6922.77 | 514.50 | 8.73 |
+| 128 | 9926.17 | 819.13 | 12.05 |
+
+### Modeling V1 serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 305.00 | 73.21 | 3.21 |
+| 8 | 1514.50 | 314.53 | 4.97 |
+| 32 | 3839.28 | 841.23 | 7.48 |
 
 ## Modeling V2 bring-up
 
@@ -116,3 +126,63 @@ that already depart from the external reference's continuation.
 | 128 | 1024 | 50.58 | 211.50 |
 | 1024 | 1024 | 50.57 | 211.69 |
 | 4096 | 1024 | 71.07 | 210.02 |
+
+The first V2 serving benchmark used the same scheduler, KV budget and graph sizes as the baseline.
+
+### First Modeling V2 serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 208.32 | 58.51 | 4.75 |
+| 2 | 375.38 | 107.96 | 5.23 |
+| 4 | 674.83 | 111.35 | 5.82 |
+| 8 | 1196.53 | 161.16 | 6.53 |
+| 16 | 2109.76 | 253.23 | 7.34 |
+| 32 | 3610.97 | 373.61 | 8.49 |
+| 64 | 5653.24 | 603.12 | 10.71 |
+| 128 | 8247.26 | 1048.24 | 14.44 |
+
+### First Modeling V2 serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 208.33 | 78.45 | 4.73 |
+| 8 | 1129.14 | 401.09 | 6.69 |
+| 32 | 3057.98 | 1101.56 | 9.35 |
+
+## Speculative decode and batch-1 profile
+
+The Nsight Systems capture ran a batch-1 request with ISL 14 and OSL 48
+after warmup. The CUDA graph node report attributed 26.2% of GPU kernel
+time to the dense FP8 GEMM. The two routed expert GEMMs accounted for
+15.7%. Activation quantization and the scale-layout copy together
+accounted for 10.1%. These fractions come from
+`nsys stats --report cuda_gpu_kern_sum` and include the request's prefill.
+
+The MTP draft owns a single full-attention layer, the shared embedding
+and vocabulary projection, and the checkpoint's embedding and hidden
+state concatenation projection. The existing speculative worker accepts
+tokens against the trunk's logits. During verification a target-local
+Triton convolution writes each candidate's convolution history to the
+runtime's staging buffer. FlashInfer writes the corresponding recurrent
+state to its staging buffer. The hybrid cache manager advances both
+histories to the accepted position. The convolution is another candidate
+for target-local `csrc/` in a full native build.
+
+One-token MTP passed the 32 greedy development checks in a single-process
+LLM API probe against the original scorer. The JSONL runner has separate
+TensorRT-LLM executors for generation and scoring because the speculative
+sampler cannot return teacher-forced context logits. Both use this target
+and warm up before the runner emits its ready response.
+
+### One-token MTP through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 49.13 | 334.97 |
+| 1024 | 1024 | 50.21 | 332.16 |
+| 4096 | 1024 | 72.95 | 329.08 |
+
+The dual-executor JSONL run passed all 32 development cases with mean KL
+0.007827 and 99.587% non-tie top-1 agreement. No shared inference runtime
+code was changed.

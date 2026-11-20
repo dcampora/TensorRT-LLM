@@ -7,6 +7,10 @@ from .....catalog.attention.thop_attention import thop_attention
 
 def attention_step(metadata):
     """Read the attention arguments shared by every full-attention layer."""
+    num_generations = metadata.seq_lens.shape[0] - metadata.num_contexts
+    num_gen_tokens = metadata.num_tokens - metadata.num_ctx_tokens
+    # SM100 uses ordinary causal FMHA with multiple query rows for a linear draft.
+    predicted_tokens = num_gen_tokens // num_generations if num_generations else 1
     return dict(
         sequence_length=metadata.kv_lens_cuda_runtime,
         host_past_key_value_lengths=metadata.kv_lens_runtime,
@@ -31,6 +35,7 @@ def attention_step(metadata):
         num_ctx_tokens=metadata.num_ctx_tokens,
         trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
         max_num_sequences=metadata.max_num_sequences,
+        predicted_tokens_per_seq=predicted_tokens,
     )
 
 
@@ -52,7 +57,6 @@ def paged_attention(qkv, output, local_layer_idx, num_heads, num_kv_heads, head_
         attention_sinks=None,
         is_fused_qkv=True,
         update_kv_cache=True,
-        predicted_tokens_per_seq=1,
         local_layer_idx=local_layer_idx,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,

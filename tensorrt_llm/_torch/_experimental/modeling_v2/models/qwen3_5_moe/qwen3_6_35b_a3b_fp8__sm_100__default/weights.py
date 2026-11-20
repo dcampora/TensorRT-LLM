@@ -111,7 +111,7 @@ def load(model, checkpoint):
     _copy(model.model.embed_tokens.weight, checkpoint, prefix + ".embed_tokens.weight")
     _copy(model.model.norm, checkpoint, prefix + ".norm.weight")
     _copy(model.lm_head.weight, checkpoint, "lm_head.weight")
-    for i, layer in enumerate(model.model.layers):
+    for i, layer in enumerate(model.model.layers[: model.model.num_layers]):
         base = f"{prefix}.layers.{i}"
         _copy(layer.input_norm, checkpoint, base + ".input_layernorm.weight")
         _copy(layer.post_attention_norm, checkpoint, base + ".post_attention_layernorm.weight")
@@ -120,3 +120,15 @@ def load(model, checkpoint):
         else:
             _load_attention(layer.mixer, checkpoint, base + ".self_attn")
         _load_moe(layer.mlp, checkpoint, base + ".mlp")
+
+    if model.draft_model is not None:
+        draft = model.draft_model.mtp_layers[0]
+        _copy(draft.fc, checkpoint, "mtp.fc.weight")
+        _copy(draft.embedding_norm, checkpoint, "mtp.pre_fc_norm_embedding.weight")
+        _copy(draft.hidden_norm, checkpoint, "mtp.pre_fc_norm_hidden.weight")
+        _copy(draft.shared_head.norm, checkpoint, "mtp.norm.weight")
+        base = "mtp.layers.0"
+        _copy(draft.input_norm, checkpoint, base + ".input_layernorm.weight")
+        _copy(draft.post_attention_norm, checkpoint, base + ".post_attention_layernorm.weight")
+        _load_attention(draft.mixer, checkpoint, base + ".self_attn")
+        _load_moe(draft.mlp, checkpoint, base + ".mlp")

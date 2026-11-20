@@ -9,7 +9,8 @@ from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2 import disable_v2_by_default
-from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 
 from ....catalog.activation.flashinfer_silu_and_mul import flashinfer_silu_and_mul
 from ....catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
@@ -166,7 +167,59 @@ class _DecoderLayer(nn.Module):
         self.post_attention_norm = _parameter((config.hidden_size,))
 
 
+class _DraftHead(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.norm = _parameter((hidden_size,))
+
+    def forward(self, hidden, lm_head, metadata, return_context_logits=False):
+        if not return_context_logits:
+            if metadata is None:
+                hidden = hidden[-1:]
+            else:
+                last = metadata.seq_lens_cuda.cumsum(dim=0, dtype=torch.long) - 1
+                hidden = hidden.index_select(0, last)
+        return lm_head(hidden, is_spec_decoding_head=True)
+
+
+class _DraftLayer(_DecoderLayer):
+    """Predict the next token from the target state and the preceding token."""
+
+    def __init__(self, model_config, layer_index, aux_streams):
+        config = model_config.pretrained_config
+        super().__init__(config, "full_attention")
+        self.layer_index = layer_index
+        self.eps = config.rms_norm_eps
+        hidden_size = config.hidden_size
+        self.embedding_norm = _parameter((hidden_size,))
+        self.hidden_norm = _parameter((hidden_size,))
+        self.fc = _parameter((hidden_size, 2 * hidden_size))
+        self.shared_head = _DraftHead(hidden_size)
+
+    def forward(
+        self, input_ids, position_ids, hidden_states, embed_tokens, attn_metadata, **kwargs
+    ):
+        embeddings = gemma_rmsnorm(embed_tokens(input_ids), self.embedding_norm, self.eps)
+        hidden = gemma_rmsnorm(hidden_states, self.hidden_norm, self.eps)
+        residual = cublas_mm(torch.cat((embeddings, hidden), dim=-1), self.fc.T)
+        hidden = gemma_rmsnorm(residual, self.input_norm, self.eps)
+        positions = position_ids.reshape(-1, hidden.shape[0])[0].to(torch.int32)
+        cache_manager = attn_metadata.kv_cache_manager
+        hidden = self.mixer(
+            hidden,
+            positions,
+            cache_manager.layer_offsets[self.layer_index],
+            attention_step(attn_metadata),
+        )
+        gemma_fused_add_rmsnorm(hidden, residual, self.post_attention_norm, self.eps)
+        hidden = self.mlp(hidden)
+        gemma_fused_add_rmsnorm(hidden, residual, self.shared_head.norm, self.eps)
+        return hidden
+
+
 class _Decoder(DecoderModel):
+    mtp_layer_cls = _DraftLayer
+
     def __init__(self, model_config):
         super().__init__(model_config)
         config = model_config.pretrained_config
@@ -174,6 +227,8 @@ class _Decoder(DecoderModel):
             config.vocab_size, config.hidden_size, dtype=torch.bfloat16
         )
         self.layers = nn.ModuleList(_DecoderLayer(config, kind) for kind in config.layer_types)
+        self.num_layers = len(self.layers)
+        self.aux_stream_dict = {}
         self.norm = _parameter((config.hidden_size,))
         self.eps = config.rms_norm_eps
 
@@ -184,10 +239,10 @@ class _Decoder(DecoderModel):
         residual = hidden
         hidden = gemma_rmsnorm(hidden, self.layers[0].input_norm, self.eps)
         attention = attention_step(attn_metadata)
-        recurrent = RecurrentStep.from_metadata(attn_metadata)
+        recurrent = RecurrentStep.from_metadata(attn_metadata, kwargs.get("spec_metadata"))
         cache_manager = attn_metadata.kv_cache_manager
         positions = position_ids.reshape(-1, hidden.shape[0])[0].to(torch.int32)
-        for index, layer in enumerate(self.layers):
+        for index, layer in enumerate(self.layers[: self.num_layers]):
             if layer.recurrent:
                 cache = cache_manager.mamba_layer_cache(index)
                 hidden = layer.mixer(hidden, cache, recurrent)
@@ -198,25 +253,29 @@ class _Decoder(DecoderModel):
             gemma_fused_add_rmsnorm(hidden, residual, layer.post_attention_norm, self.eps)
             hidden = layer.mlp(hidden)
             next_norm = (
-                self.layers[index + 1].input_norm if index + 1 < len(self.layers) else self.norm
+                self.layers[index + 1].input_norm if index + 1 < self.num_layers else self.norm
             )
             gemma_fused_add_rmsnorm(hidden, residual, next_norm, self.eps)
         return hidden
 
 
 @disable_v2_by_default
-class ModelingV2Qwen3635bA3bFp8Sm100Default(DecoderModelForCausalLM):
+class ModelingV2Qwen3635bA3bFp8Sm100Default(SpecDecOneEngineForCausalLM):
     """Serve the checkpoint's text tower through the standard causal LM shell."""
 
     def __init__(self, model_config):
         text_config = model_config.pretrained_config.text_config
         model_config.pretrained_config = text_config
+        if model_config.spec_config is not None:
+            text_config.num_nextn_predict_layers = 1
         super().__init__(
             _Decoder(model_config),
-            config=model_config,
+            model_config=model_config,
             hidden_size=text_config.hidden_size,
             vocab_size=text_config.vocab_size,
         )
+        if self.draft_model is not None:
+            self.model.layers.extend(self.draft_model.mtp_layers)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> Literal["V2"]:

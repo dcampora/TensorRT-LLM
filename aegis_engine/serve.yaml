@@ -13,3 +13,6 @@ kv_cache_config:
 cuda_graph_config:
   max_batch_size: 128
   enable_padding: true
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 1

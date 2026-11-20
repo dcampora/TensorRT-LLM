@@ -6,4 +6,5 @@ if [[ $# -ne 1 ]]; then
     printf 'Usage: %s MODEL_DIR\n' "$0" >&2
     exit 2
 fi
+export TRTLLM_USE_GDN_REPLAY=0
 exec python3 -m aegis_engine "$1"
