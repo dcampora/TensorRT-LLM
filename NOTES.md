@@ -596,8 +596,57 @@ head changed some proposals at larger row counts. The model's verified
 target logits use the original BF16 weights and FP32 output.
 
 The concurrency sweep checked every listed level from 1 through 128.
-The replay trace reproduced the engine's logits at all 52 unique first
-differences. Fifty-one margins were below 0.5 nats. One position,
+The replay trace reproduced the engine's token prefixes at all 52 unique
+first differences and measured the margins from decode logits. Fifty-one
+margins were below 0.5 nats. One position,
 observed at concurrency 64 and 128, had a margin of 0.585 nats. The
 trace accepted 65.2% of drafts and emitted 2.96 tokens per verification
 step across the traced development requests.
+
+FP32 expert routing was also tested through a direct LLM API probe to
+reduce sensitivity to BF16 rounding at the expert-selection boundary.
+It diverged at two oracle positions whose reference margins were exactly
+0.5 nats. The committed target uses BF16 router logits.
+
+## Native small-row projection trial
+
+This trial used the existing TensorRT-LLM FP8 GEMM for small projections.
+It passed the same 32-prompt JSONL oracle, with mean KL 0.006933 and
+99.587% non-tie top-1 agreement. All 20 operation cases for this
+configuration passed.
+
+### Native small-row projection trial through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 53.31 | 555.03 |
+| 1024 | 1024 | 50.24 | 542.48 |
+| 4096 | 1024 | 60.33 | 538.82 |
+
+The server started and matched all 32 JSONL engine generations at concurrency 1.
+
+### Native small-row projection trial serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 548.86 | 56.19 | 1.77 |
+| 2 | 906.87 | 117.62 | 2.08 |
+| 4 | 1537.40 | 125.85 | 2.40 |
+| 8 | 2757.81 | 137.40 | 2.73 |
+| 16 | 4601.32 | 203.76 | 3.09 |
+| 32 | 7290.28 | 305.00 | 3.89 |
+| 64 | 9527.69 | 490.30 | 5.87 |
+| 128 | 15537.69 | 940.69 | 6.94 |
+
+### Native small-row projection trial serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 508.55 | 72.81 | 1.90 |
+| 8 | 1959.45 | 358.78 | 3.66 |
+| 32 | 5717.23 | 887.70 | 4.49 |
+
+The native-only trial had three first differences at or above 0.5 nats
+across the tested concurrency levels. The selected deployment uses the
+small-row Triton projection. It had higher batch-1 decode throughput at
+all three input lengths and one serving difference outside the allowance.
