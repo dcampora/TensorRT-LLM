@@ -402,3 +402,61 @@ agreement. Its 32 generations exactly matched the preceding revision.
 
 The OpenAI server started and all 32 completions matched the engine at
 concurrency 1.
+
+### Fused epilogues serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 510.76 | 65.07 | 1.90 |
+| 2 | 839.80 | 112.55 | 2.26 |
+| 4 | 1356.45 | 131.13 | 2.75 |
+| 8 | 2354.18 | 136.91 | 3.17 |
+| 16 | 3924.47 | 203.47 | 3.69 |
+| 32 | 6052.05 | 312.18 | 4.72 |
+| 64 | 7642.15 | 493.94 | 7.55 |
+| 128 | 7820.65 | 1805.10 | 14.16 |
+
+### Fused epilogues serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 477.25 | 70.84 | 2.03 |
+
+The client disconnected during the ISL 4096 concurrency-8 warmup.
+The ISL 4096 concurrency-8 and concurrency-32 measurements for this
+revision remain unmeasured.
+
+Of the 44 unique first differences traced across concurrency 8, 32 and
+128, 43 had batch-1 margins below 0.5 nats. One was 0.786 nats.
+
+## Compact recurrent cache
+
+The generator now verifies three-token MTP drafts with FlashInfer's
+BF16 recurrent checkpoint and ring of accepted updates. The runtime
+hybrid cache manager owns the state, per-request ring cursors and
+acceptance updates. The model gathers each step's cursor views once for
+all recurrent layers. The scoring engine uses ordinary teacher-forced
+prefill. Paged attention KV, convolution state and recurrent checkpoints
+all remain BF16.
+
+In a four-token verification microbenchmark at batch 128, replay took
+44.47 µs with an empty history, 48.80 µs with eight history entries, and
+99.80 µs when it flushed a checkpoint. The intermediate-state kernel
+took 180.81 µs. At batch 1 the corresponding replay times were 6.42, 6.62,
+and 11.92 µs, compared with 5.66 µs for intermediate-state verification.
+
+The JSONL engine passed all 32 development prompts with mean KL 0.006933
+and 99.587% non-tie top-1 agreement. EOS handling and malformed-request
+recovery passed. The Modeling V2 CPU checks passed all nine selected
+cases.
+
+### Compact recurrent cache through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 50.87 | 513.66 |
+| 1024 | 1024 | 48.93 | 506.30 |
+| 4096 | 1024 | 60.29 | 483.89 |
+
+The OpenAI server started with replay enabled and matched the engine's
+32 completions exactly at concurrency 1.

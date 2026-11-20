@@ -4,7 +4,7 @@
 
 import torch
 
-from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_required, is_gdn_replay_enabled
 
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
@@ -97,8 +97,21 @@ def route(model_config, llm_args, compute_capability):
             or spec.max_draft_len not in (1, 2, 3)
         ):
             raise NoTarget("Qwen3.6 FP8 supports linear MTP with one to three draft tokens")
-        if is_gdn_replay_enabled() or llm_args.kv_cache_config.mamba_ssm_cache_dtype == "float32":
-            raise NoTarget("Qwen3.6 FP8 MTP requires BF16 GDN state and TRTLLM_USE_GDN_REPLAY=0")
+        if llm_args.kv_cache_config.mamba_ssm_cache_dtype == "float32":
+            raise NoTarget("Qwen3.6 FP8 MTP requires BF16 GDN state")
+        if is_gdn_replay_enabled():
+            if not is_gdn_flashinfer_replay_required():
+                raise NoTarget(
+                    "Qwen3.6 FP8 MTP needs the FlashInfer replay ring or intermediate states. "
+                    "Set TRTLLM_USE_GDN_FLASHINFER_REPLAY=force or TRTLLM_USE_GDN_REPLAY=0."
+                )
+            if (
+                spec.max_draft_len != 3
+                or spec.draft_len_schedule is not None
+                or spec.max_concurrency is not None
+                or spec.acceptance_rate_window_size
+            ):
+                raise NoTarget("Qwen3.6 FP8 FlashInfer replay needs a fixed three-token draft")
 
     from .qwen3_6_35b_a3b_fp8__sm_100__default.modeling import ModelingV2Qwen3635bA3bFp8Sm100Default
 

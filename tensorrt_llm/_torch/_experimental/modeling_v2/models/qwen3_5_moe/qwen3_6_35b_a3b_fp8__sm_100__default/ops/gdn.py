@@ -7,10 +7,20 @@ from dataclasses import dataclass
 import torch
 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache_flush import gated_delta_rule_mtp_ucache_flush
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 from .gdn_pack import pack_gdn_input
 from .verify_conv import verify_conv
+
+
+@dataclass(frozen=True)
+class ReplayCursors:
+    """Per-request FlashInfer ring positions, gathered once for all recurrent layers."""
+
+    history_length: torch.Tensor
+    ring_start: torch.Tensor
+    history_capacity: int
 
 
 @dataclass(frozen=True)
@@ -20,6 +30,7 @@ class RecurrentStep:
     context_tokens: int
     decode_width: int
     verify: bool
+    replay: ReplayCursors | None
     context_slots: torch.Tensor
     decode_slots: torch.Tensor
     initial_slots: torch.Tensor | None
@@ -44,10 +55,22 @@ class RecurrentStep:
         else:
             has_initial_state = initial_slots = cu_seqlens = cu_seqlens_long = None
             decode_slots = slots
+        manager = metadata.kv_cache_manager
+        verify = spec_metadata is not None and manager.is_speculative()
+        replay = None
+        if verify and decode_slots.numel() and manager.use_gdn_flashinfer_ring_replay:
+            cache = manager.mamba_layer_cache(0)
+            slots = decode_slots.clamp_min(0)
+            replay = ReplayCursors(
+                cache.prev_num_accepted_tokens.index_select(0, slots),
+                cache.cache_base.index_select(0, slots),
+                manager.get_replay_state_update_metadata().replay_history_size,
+            )
         return cls(
             metadata.num_ctx_tokens,
             spec_metadata.runtime_draft_len + 1 if spec_metadata is not None else 1,
-            spec_metadata is not None and metadata.kv_cache_manager.is_speculative(),
+            verify,
+            replay,
             context_slots,
             decode_slots,
             initial_slots,
@@ -129,19 +152,42 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
         k = k.view_as(q)
         output = out[context:].view(batch_size, width, value_heads, head_dim)
         v = v.view_as(output)
-        a = a[context:].contiguous().view(batch_size, width, value_heads)
-        b = b[context:].contiguous().view(batch_size, width, value_heads)
-        if step.verify:
-            gated_delta_rule_mtp(
+        a = a[context:].reshape(batch_size, width, value_heads)
+        b = b[context:].reshape(batch_size, width, value_heads)
+        if step.replay is not None:
+            replay = step.replay
+            gated_delta_rule_mtp_ucache_flush(
                 A_log=a_log,
                 a=a,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=cache.temporal,
+                initial_state_indices=step.decode_slots,
+                use_qk_l2norm_in_kernel=True,
+                scale=head_dim**-0.5,
+                output=output,
+                k_cache=cache.k_ring,
+                u_cache=cache.u_ring,
+                g_cache=cache.g_ring,
+                hist_len=replay.history_length,
+                cache_base=replay.ring_start,
+                flush_min=replay.history_capacity - width + 1,
+                restart_hist_on_flush=False,
+            )
+        elif step.verify:
+            gated_delta_rule_mtp(
+                A_log=a_log,
+                a=a.contiguous(),
                 dt_bias=dt_bias,
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
                 q=q,
                 k=k,
                 v=v,
-                b=b,
+                b=b.contiguous(),
                 initial_state_source=cache.temporal,
                 initial_state_indices=step.decode_slots,
                 intermediate_states_buffer=cache.intermediate_ssm[:batch_size],
@@ -157,9 +203,9 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
                 v,
                 None,
                 a_log,
-                a,
+                a.contiguous(),
                 dt_bias,
-                b,
+                b.contiguous(),
                 output=output,
                 initial_state=cache.temporal,
                 initial_state_indices=step.decode_slots,
