@@ -9,7 +9,7 @@ import triton.language as tl
 from .quantize import _to_fp8
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _gated_quantize(
     X,
     Gate,
@@ -17,7 +17,7 @@ def _gated_quantize(
     PickRows,
     Out,
     Scales,
-    rows: tl.constexpr,
+    rows,
     width: tl.constexpr,
     x_stride: tl.constexpr,
     gate_stride: tl.constexpr,

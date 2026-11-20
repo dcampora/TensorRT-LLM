@@ -460,3 +460,95 @@ cases.
 
 The OpenAI server started with replay enabled and matched the engine's
 32 completions exactly at concurrency 1.
+
+### Compact recurrent cache serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 517.44 | 59.47 | 1.88 |
+| 2 | 856.60 | 130.81 | 2.18 |
+| 4 | 1421.83 | 124.62 | 2.65 |
+| 8 | 2494.14 | 135.84 | 3.02 |
+| 16 | 4202.71 | 210.72 | 3.40 |
+| 32 | 6798.87 | 308.72 | 4.23 |
+| 64 | 9948.23 | 492.78 | 5.54 |
+| 128 | 6941.22 | 1759.03 | 16.20 |
+
+### Compact recurrent cache serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 483.63 | 68.18 | 2.00 |
+| 8 | 2233.85 | 322.81 | 3.18 |
+| 32 | 1793.44 | 4150.25 | 13.66 |
+
+At ISL 1024 and OSL 1024, concurrency 128 reached 12.03 seconds p99
+TTFT with replay enabled. Earlier fused Triton revisions also showed
+several-second tails at that point. The projection and packing kernels
+specialized on each row count, and the strided recurrent replay kernel
+specialized on decode batch size during mixed batches.
+
+The replay decode trace found 36 unique first differences across
+concurrency 8, 32 and 128. Thirty-five had engine margins below 0.5 nats.
+One margin was 0.585 nats. The traced development requests accepted 64.0%
+of drafts, or 2.92 output tokens per verification step.
+
+## Matched Modeling V1 serving with compact recurrent replay
+
+V1 repeated the same serving YAML with `modeling_v2: off`. Both
+servers used three draft tokens, FP32 logits, and the FlashInfer BF16
+replay ring. The client settings and prompt hashes matched.
+
+### Matched Modeling V1 with replay, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 582.11 | 77.43 | 1.64 |
+| 2 | 947.49 | 180.15 | 1.85 |
+| 4 | 1577.50 | 179.30 | 2.32 |
+| 8 | 2594.00 | 242.77 | 2.76 |
+| 16 | 4401.54 | 256.62 | 3.23 |
+| 32 | 6958.82 | 401.94 | 3.97 |
+| 64 | 10712.72 | 615.43 | 5.13 |
+| 128 | 8623.36 | 1426.06 | 13.04 |
+
+### Matched Modeling V1 with replay, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 547.70 | 79.28 | 1.75 |
+| 8 | 2536.79 | 413.99 | 2.66 |
+| 32 | 2520.33 | 3516.01 | 9.11 |
+
+At concurrency 128 and ISL 1024, V1 reached 8,623 output tokens/s with
+replay and 12,821 with intermediate-state staging in the earlier run.
+
+## Variable batch shapes and shared-expert overlap
+
+Projection quantization, gated epilogues and Gated DeltaNet input packing
+take the row count at runtime. Mixed prefill and decode reuses recurrent
+replay shapes prepared for CUDA graphs. Padding rows carry no state slot.
+The shared expert runs on an auxiliary CUDA stream for up to 128 packed
+rows. Larger batches run both expert paths on the main stream. The JSONL
+generator uses TensorRT-LLM's in-process worker, and the scorer retains
+its separate worker.
+
+Using the first layer's checkpoint weights, the two expert streams were
+bitwise identical to the sequential path. At four rows they took 60.92 µs
+compared with 76.86 µs sequentially. At 128 rows they took 206.33 µs
+compared with 230.45 µs. At 512 rows the sequential path was faster.
+
+All 23 GPU operation cases and the 32-prompt oracle passed. Mean KL was
+0.006933 and non-tie top-1 agreement was 99.587%. The JSONL protocol checks
+passed.
+
+### Variable batch shapes through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 55.29 | 583.19 |
+| 1024 | 1024 | 53.90 | 575.33 |
+| 4096 | 1024 | 59.71 | 549.24 |
+
+The OpenAI server started and matched all 32 engine generations at
+concurrency 1.

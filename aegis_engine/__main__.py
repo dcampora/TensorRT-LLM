@@ -112,6 +112,7 @@ def _run(model, mode):
         if mode == "require":
             os.environ["TRTLLM_USE_GDN_REPLAY"] = "1"
             os.environ["TRTLLM_USE_GDN_FLASHINFER_REPLAY"] = "force"
+            os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
             generator = load_engine(MTPDecodingConfig(max_draft_len=3))
         _dispatch(protocol, model, scorer, generator, SamplingParams)
 

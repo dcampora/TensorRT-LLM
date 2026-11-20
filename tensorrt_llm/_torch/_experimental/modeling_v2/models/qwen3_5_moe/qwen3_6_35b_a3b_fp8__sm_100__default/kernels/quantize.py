@@ -17,12 +17,12 @@ def _to_fp8(x):
     return quantized, tl.div_rn(1.0, qscale)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _quantize_kernel(
     X,
     Out,
     Scale,
-    rows: tl.constexpr,
+    rows,
     width: tl.constexpr,
     stride: tl.constexpr,
     groups_per_cta: tl.constexpr,

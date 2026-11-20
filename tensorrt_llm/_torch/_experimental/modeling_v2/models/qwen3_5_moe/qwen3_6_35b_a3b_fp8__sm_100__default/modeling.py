@@ -120,9 +120,19 @@ class _FullAttention(nn.Module):
         return self.output.quantized(*gated_quantize(out, "attention", gate, pick_rows=pick_rows))
 
 
+class _SharedExpertStream:
+    """Coordinate shared-expert work with the routed-expert stream."""
+
+    def __init__(self):
+        self.stream = torch.cuda.Stream()
+        self.ready = torch.cuda.Event()
+        self.done = torch.cuda.Event()
+
+
 class _Moe(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, shared_stream):
         super().__init__()
+        self.shared_stream = shared_stream
         experts = config.num_experts
         hidden = config.hidden_size
         intermediate = config.moe_intermediate_size
@@ -141,8 +151,8 @@ class _Moe(nn.Module):
         self.shared_down = _Fp8Linear(hidden, shared_intermediate)
         self.shared_router = _parameter((1, hidden))
 
-    def forward(self, x, x_fp8, x_scale):
-        routed = fp8.routed_experts(
+    def _routed(self, x, x_fp8, x_scale):
+        return fp8.routed_experts(
             cublas_mm(x, self.router.T),
             x_fp8,
             x_scale,
@@ -152,20 +162,40 @@ class _Moe(nn.Module):
             self.down_scale,
             self.top_k,
         )
+
+    def _shared(self, x, x_fp8, x_scale):
         shared = fp8.linear_quantized(
             x_fp8, x_scale, self.shared_gate_up.weight, self.shared_gate_up.scale
         )
         shared = self.shared_down.quantized(*gated_quantize(shared, "swiglu"))
-        gate = cublas_mm(x, self.shared_router.T)
+        return shared, cublas_mm(x, self.shared_router.T)
+
+    def forward(self, x, x_fp8, x_scale):
+        # Large packed batches already saturate the expert kernels.
+        if x.shape[0] > 128:
+            routed = self._routed(x, x_fp8, x_scale)
+            shared, gate = self._shared(x, x_fp8, x_scale)
+        else:
+            aux = self.shared_stream
+            main = torch.cuda.current_stream()
+            aux.ready.record(main)
+            with torch.cuda.stream(aux.stream):
+                aux.ready.wait()
+                shared, gate = self._shared(x, x_fp8, x_scale)
+                aux.done.record()
+            routed = self._routed(x, x_fp8, x_scale)
+            aux.done.wait()
+            shared.record_stream(main)
+            gate.record_stream(main)
         return sigmoid_gate(shared, gate, routed)
 
 
 class _DecoderLayer(nn.Module):
-    def __init__(self, config, layer_type):
+    def __init__(self, config, layer_type, shared_stream):
         super().__init__()
         self.recurrent = layer_type == "linear_attention"
         self.mixer = _GatedDeltaNet(config) if self.recurrent else _FullAttention(config)
-        self.mlp = _Moe(config)
+        self.mlp = _Moe(config, shared_stream)
         self.input_norm = _parameter((config.hidden_size,))
         self.post_attention_norm = _parameter((config.hidden_size,))
 
@@ -192,7 +222,7 @@ class _DraftLayer(_DecoderLayer):
 
     def __init__(self, model_config, layer_index, aux_streams):
         config = model_config.pretrained_config
-        super().__init__(config, "full_attention")
+        super().__init__(config, "full_attention", _SharedExpertStream())
         self.layer_index = layer_index
         self.eps = config.rms_norm_eps
         hidden_size = config.hidden_size
@@ -244,8 +274,12 @@ class _Decoder(DecoderModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=torch.bfloat16
         )
-        self.layers = nn.ModuleList(_DecoderLayer(config, kind) for kind in config.layer_types)
+        shared_stream = _SharedExpertStream()
+        self.layers = nn.ModuleList(
+            _DecoderLayer(config, kind, shared_stream) for kind in config.layer_types
+        )
         self.num_layers = len(self.layers)
+        self.graph_batch_sizes = tuple(model_config.cuda_graph_batch_sizes or ())
         self.aux_stream_dict = {}
         self.norm = _parameter((config.hidden_size,))
         self.eps = config.rms_norm_eps
@@ -258,7 +292,9 @@ class _Decoder(DecoderModel):
         hidden = gemma_rmsnorm(hidden, self.layers[0].input_norm, self.eps)
         x_fp8, x_scale = fp8.quantize(hidden)
         attention = attention_step(attn_metadata)
-        recurrent = RecurrentStep.from_metadata(attn_metadata, kwargs.get("spec_metadata"))
+        recurrent = RecurrentStep.from_metadata(
+            attn_metadata, kwargs.get("spec_metadata"), self.graph_batch_sizes
+        )
         cache_manager = attn_metadata.kv_cache_manager
         positions = position_ids.reshape(-1, hidden.shape[0])[0].to(torch.int32)
         for index, layer in enumerate(self.layers[: self.num_layers]):

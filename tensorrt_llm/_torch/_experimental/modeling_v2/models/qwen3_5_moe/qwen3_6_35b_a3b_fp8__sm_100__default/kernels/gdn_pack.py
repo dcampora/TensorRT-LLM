@@ -7,14 +7,14 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _pack_gdn_input(
     Qkv,
     A,
     B,
     Pack,
     Gates,
-    rows: tl.constexpr,
+    rows,
     q_stride: tl.constexpr,
     a_stride: tl.constexpr,
     b_stride: tl.constexpr,

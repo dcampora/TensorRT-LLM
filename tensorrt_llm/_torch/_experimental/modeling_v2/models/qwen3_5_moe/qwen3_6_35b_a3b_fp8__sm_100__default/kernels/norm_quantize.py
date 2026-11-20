@@ -9,9 +9,9 @@ import triton.language as tl
 from .quantize import _to_fp8
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _add_rmsnorm_quant(
-    Hidden, Residual, Weight, FP8, Scale, rows: tl.constexpr, size: tl.constexpr, eps: tl.constexpr
+    Hidden, Residual, Weight, FP8, Scale, rows, size: tl.constexpr, eps: tl.constexpr
 ):
     row = tl.program_id(0)
     col = tl.arange(0, size)

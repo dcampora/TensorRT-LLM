@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Causal convolution and FlashInfer Gated DeltaNet scan against runtime state pools."""
 
+from bisect import bisect_left
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,7 @@ from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache_flush import gated_delta_rule_mtp_ucache_flush
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from torch.nn.functional import pad
 
 from .gdn_pack import pack_gdn_input
 from .verify_conv import verify_conv
@@ -18,6 +20,7 @@ from .verify_conv import verify_conv
 class ReplayCursors:
     """Per-request FlashInfer ring positions, gathered once for all recurrent layers."""
 
+    state_slots: torch.Tensor
     history_length: torch.Tensor
     ring_start: torch.Tensor
     history_capacity: int
@@ -39,7 +42,7 @@ class RecurrentStep:
     cu_seqlens_long: torch.Tensor | None
 
     @classmethod
-    def from_metadata(cls, metadata, spec_metadata=None):
+    def from_metadata(cls, metadata, spec_metadata=None, graph_batch_sizes=()):
         """Bind the context-then-generation order supplied by the scheduler."""
         mamba = metadata.mamba_metadata
         count = metadata.num_contexts
@@ -60,8 +63,18 @@ class RecurrentStep:
         replay = None
         if verify and decode_slots.numel() and manager.use_gdn_flashinfer_ring_replay:
             cache = manager.mamba_layer_cache(0)
-            slots = decode_slots.clamp_min(0)
+            replay_slots = decode_slots
+            if count:
+                # The ring specializes strided pools by batch size. Reuse captured
+                # shapes for decode rows in mixed prefill and decode batches.
+                index = bisect_left(graph_batch_sizes, decode_slots.numel())
+                if index < len(graph_batch_sizes):
+                    padding = graph_batch_sizes[index] - decode_slots.numel()
+                    if padding:
+                        replay_slots = pad(decode_slots, (0, padding), value=-1)
+            slots = replay_slots.clamp_min(0)
             replay = ReplayCursors(
+                replay_slots,
                 cache.prev_num_accepted_tokens.index_select(0, slots),
                 cache.cache_base.index_select(0, slots),
                 manager.get_replay_state_update_metadata().replay_history_size,
@@ -156,6 +169,17 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
         b = b[context:].reshape(batch_size, width, value_heads)
         if step.replay is not None:
             replay = step.replay
+            replay_batch = replay.state_slots.numel()
+            replay_output = output
+            if replay_batch > batch_size:
+                padding = replay_batch - batch_size
+                packed = pad(x, (0, 0, 0, padding * width))
+                q, k, v = _split_qkv(packed, key_heads, value_heads, head_dim)
+                q = q.view(replay_batch, width, key_heads, head_dim)
+                k = k.view_as(q)
+                v = v.view(replay_batch, width, value_heads, head_dim)
+                a, b = pad(torch.cat((a, b), dim=-1), (0, 0, 0, 0, 0, padding)).chunk(2, dim=-1)
+                replay_output = output.new_empty((replay_batch, width, value_heads, head_dim))
             gated_delta_rule_mtp_ucache_flush(
                 A_log=a_log,
                 a=a,
@@ -165,10 +189,10 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
                 v=v,
                 b=b,
                 initial_state_source=cache.temporal,
-                initial_state_indices=step.decode_slots,
+                initial_state_indices=replay.state_slots,
                 use_qk_l2norm_in_kernel=True,
                 scale=head_dim**-0.5,
-                output=output,
+                output=replay_output,
                 k_cache=cache.k_ring,
                 u_cache=cache.u_ring,
                 g_cache=cache.g_ring,
@@ -177,6 +201,8 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
                 flush_min=replay.history_capacity - width + 1,
                 restart_hist_on_flush=False,
             )
+            if replay_output is not output:
+                output.copy_(replay_output[:batch_size])
         elif step.verify:
             gated_delta_rule_mtp(
                 A_log=a_log,
