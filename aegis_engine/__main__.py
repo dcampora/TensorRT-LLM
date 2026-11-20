@@ -108,7 +108,7 @@ def _run(model, mode):
 
         scorer = load_engine()
         # The speculative sampler cannot return teacher-forced context logits.
-        generator = load_engine(MTPDecodingConfig(max_draft_len=1)) if mode == "require" else scorer
+        generator = load_engine(MTPDecodingConfig(max_draft_len=3)) if mode == "require" else scorer
         _dispatch(protocol, model, scorer, generator, SamplingParams)
 
 

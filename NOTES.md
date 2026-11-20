@@ -186,3 +186,46 @@ and warm up before the runner emits its ready response.
 The dual-executor JSONL run passed all 32 development cases with mean KL
 0.007827 and 99.587% non-tie top-1 agreement. No shared inference runtime
 code was changed.
+
+With one-token MTP, the server started and all 32 development completions matched the batch-1 engine exactly at concurrency 1. Batched outputs were checked separately at higher concurrency.
+
+### One-token MTP serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 325.89 | 68.59 | 3.00 |
+| 2 | 571.42 | 117.28 | 3.35 |
+| 4 | 1037.88 | 124.52 | 3.66 |
+| 8 | 1793.82 | 159.17 | 4.20 |
+| 16 | 3050.27 | 249.91 | 4.91 |
+| 32 | 4803.53 | 400.89 | 6.16 |
+| 64 | 7155.62 | 629.15 | 8.19 |
+| 128 | 10344.75 | 1097.67 | 11.10 |
+
+### One-token MTP serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 316.21 | 83.84 | 3.08 |
+| 8 | 1676.09 | 418.69 | 4.31 |
+| 32 | 3929.26 | 1135.55 | 6.82 |
+
+The one-token serving comparison produced 46 unique first-difference
+positions across concurrency 8, 32 and 128. Replaying the batch-1
+generation with its actual speculative logits showed 43 margins below
+0.5 nats and three at or above 0.5. The trace reproduced the batch-1
+prefixes at every measured position. It also measured 1.86 accepted
+tokens per verification step on the checked development prompts.
+
+Two-token MTP reached 378–434 tokens/s in the direct LLM API probe and had
+one greedy miss at the oracle's 0.5-nat cutoff. Three-token MTP passed
+through the JSONL engine with mean KL 0.007827, non-tie top-1 agreement
+99.587%, and no greedy misses outside the allowance.
+
+### Three-token MTP through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 52.22 | 446.36 |
+| 1024 | 1024 | 53.59 | 440.80 |
+| 4096 | 1024 | 75.39 | 436.57 |

@@ -15,4 +15,4 @@ cuda_graph_config:
   enable_padding: true
 speculative_config:
   decoding_type: MTP
-  max_draft_len: 1
+  max_draft_len: 3
