@@ -324,3 +324,81 @@ malformed requests, single-token scoring, EOS stopping and `ignore_eos`.
 
 The OpenAI server started with the same revision and matched all 32 engine
 completions exactly at concurrency 1.
+
+### Fused FP8 preparation serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 499.05 | 61.73 | 1.95 |
+| 2 | 818.57 | 119.21 | 2.31 |
+| 4 | 1330.58 | 124.88 | 2.84 |
+| 8 | 2298.54 | 164.20 | 3.22 |
+| 16 | 3688.60 | 251.03 | 3.94 |
+| 32 | 5587.26 | 389.64 | 5.08 |
+| 64 | 7149.93 | 621.73 | 7.93 |
+| 128 | 7495.97 | 1871.15 | 14.87 |
+
+### Fused FP8 preparation serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 463.63 | 80.67 | 2.08 |
+| 8 | 2146.62 | 408.73 | 3.22 |
+| 32 | 3053.91 | 1470.96 | 8.73 |
+
+With the same prompt hashes and YAML, this revision increased ISL 1024
+throughput at concurrency 1–32 and reduced it at 64 and 128. The largest
+drop was at concurrency 128, with a median TTFT of 1.87 s and median TPOT
+of 14.87 ms.
+
+The decode-log trace on this revision reproduced the engine prefixes for
+all 45 unique first differences across concurrency 8, 32 and 128.
+Forty-three margins were below 0.5 nats. The remaining margins were 0.692
+and 0.786 nats. Batch-1 MTP accepted 61.5% of proposed drafts on the traced
+prompts.
+
+A synthetic four-token Gated DeltaNet test found bitwise equality in the
+output and staged BF16 state across batches 1, 2, 8, 32 and 128 when using
+FlashInfer's wide-vector kernel. Its small-batch ILP4 kernel used a
+different reduction order. At batch 1, a 32-value tile took 5.80 µs
+compared with 5.66 µs for the default ILP4 kernel. At batch 128, the
+128-value tile remained fastest at 180.82 µs.
+
+Forcing the wide-vector recurrence on small batches passed the operation
+tests but the engine diverged at one development generation position
+with a reference margin of exactly 0.5 nats. That trial measured 515,
+476 and 485 decode tokens/s at ISL 128, 1024 and 4096, respectively,
+with OSL 1024. The next candidate restored FlashInfer's default
+recurrent dispatch.
+
+## Gated projection epilogues and aligned FP8 GEMMs
+
+Triton now quantizes Gated DeltaNet's normalized gated output, full
+attention's sigmoid-gated output and the shared expert's SwiGLU output
+directly. Each epilogue rounds to BF16 before quantization. The attention
+epilogue also gathers the draft worker's selected rows. Gated DeltaNet
+prefill packs Q, K, V and both gates in one launch. The native
+recurrence still receives the original values. Both new Triton kernels
+are candidates for target-local native code under `csrc/`.
+
+A CuTe DSL GEMM uses the original FP8 scale blocks on aligned larger
+activation batches. At 4096 rows the QKVZ projection took 124.58 µs with
+CuTe DSL and 254.08 µs with the native block-scaled GEMM. All five target
+projection shapes produced bitwise-identical BF16 results in the
+measured synthetic comparison. At 512 rows the same projection took
+19.85 µs and 37.07 µs, respectively.
+
+All 23 GPU operation cases passed. The JSONL engine passed all 32
+development prompts with mean KL 0.006933 and 99.587% non-tie top-1
+agreement. Its 32 generations exactly matched the preceding revision.
+
+### Fused epilogues through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 47.81 | 509.78 |
+| 1024 | 1024 | 48.74 | 510.76 |
+| 4096 | 1024 | 60.13 | 490.52 |
+
+The OpenAI server started and all 32 completions matched the engine at
+concurrency 1.

@@ -9,6 +9,7 @@ from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
+from .gdn_pack import pack_gdn_input
 from .verify_conv import verify_conv
 
 
@@ -86,13 +87,15 @@ def gdn_scan(qkv, a, b, conv_weight, a_log, dt_bias, cache, step, key_heads, val
             -1,
             convolved.T,
         )
-        q, k, v = _split_qkv(convolved, key_heads, value_heads, head_dim)
+        q, k, v, a_ctx, b_ctx = pack_gdn_input(
+            convolved, a[:context], b[:context], key_heads, value_heads, head_dim
+        )
         chunk_gated_delta_rule(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            a[:context].contiguous(),
-            b[:context].contiguous(),
+            q,
+            k,
+            v,
+            a_ctx,
+            b_ctx,
             initial_state=cache.temporal,
             output_final_state=True,
             cu_seqlens=step.cu_seqlens_long,

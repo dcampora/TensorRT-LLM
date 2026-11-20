@@ -88,6 +88,7 @@ def route(model_config, llm_args, compute_capability):
         if (
             not spec.spec_dec_mode.is_mtp_eagle_one_model()
             or spec.uses_replacement_heads
+            or spec.uses_external_draft_model
             or spec.use_dynamic_tree
             or spec.sa_config is not None
             or spec.use_relaxed_acceptance_for_thinking

@@ -3,7 +3,6 @@
 """Gated attention and MoE epilogues."""
 
 import torch
-from torch.nn import functional as F
 
 from .....catalog._op import Arch, Cell, OpWrapper
 from ..kernels import gates
@@ -40,25 +39,4 @@ class SigmoidGate(OpWrapper):
         return out.to(x.dtype)
 
 
-class GatedRmsNorm(OpWrapper):
-    """Normalize [tokens, heads, width] and multiply by a row-strided SiLU gate."""
-
-    ARCHS = frozenset({Arch.SM_100})
-    CELLS = (
-        Cell(why="batch-1 decode", spec=dict(rows=1, heads=32, width=128)),
-        Cell(why="multi-request decode", spec=dict(rows=32, heads=32, width=128)),
-        Cell(why="long packed prefill", spec=dict(rows=4096, heads=32, width=128)),
-    )
-
-    def __call__(self, x, z, weight, eps):
-        out = torch.empty_like(x, memory_format=torch.contiguous_format)
-        gates.gated_rms_norm(x, z, weight, eps, out)
-        return out
-
-    def reference(self, x, z, weight, eps):
-        normalized = F.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps)
-        return (normalized * F.silu(z.float())).to(x.dtype)
-
-
 sigmoid_gate = SigmoidGate()
-gated_rms_norm = GatedRmsNorm()

@@ -12,13 +12,13 @@ from tensorrt_llm._torch._experimental.modeling_v2 import disable_v2_by_default
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
 
-from ....catalog.activation.flashinfer_silu_and_mul import flashinfer_silu_and_mul
 from ....catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
 from ....catalog.gemm.cublas_mm import cublas_mm
 from . import weights
 from .ops import fp8
 from .ops.attention import attention_step, paged_attention
-from .ops.gates import gated_rms_norm, sigmoid_gate
+from .ops.epilogue_quantize import gated_quantize
+from .ops.gates import sigmoid_gate
 from .ops.gdn import RecurrentStep, gdn_scan
 from .ops.quantize import add_rmsnorm_quant
 
@@ -32,9 +32,6 @@ class _Fp8Linear(nn.Module):
         super().__init__()
         self.weight = _parameter((n, k), torch.float8_e4m3fn)
         self.scale = _parameter((n // fp8.BLOCK, k // fp8.BLOCK), torch.float32)
-
-    def forward(self, x):
-        return fp8.linear(x, self.weight, self.scale)
 
     def quantized(self, x, scale):
         return fp8.linear_quantized(x, scale, self.weight, self.scale)
@@ -75,8 +72,9 @@ class _GatedDeltaNet(nn.Module):
             self.value_heads,
             self.head_dim,
         )
-        y = gated_rms_norm(y, z.view_as(y), self.norm, self.eps)
-        return self.output(y.view(-1, self.value_width))
+        return self.output.quantized(
+            *gated_quantize(y.view(-1, self.value_width), "gdn", z, self.norm, self.eps)
+        )
 
 
 class _FullAttention(nn.Module):
@@ -119,10 +117,7 @@ class _FullAttention(nn.Module):
         )
         out = torch.empty((x.shape[0], self.q_width), dtype=x.dtype, device=x.device)
         paged_attention(qkv, out, local_layer_idx, self.heads, self.kv_heads, self.head_dim, step)
-        if pick_rows is not None:
-            out = out.index_select(0, pick_rows)
-            gate = gate.index_select(0, pick_rows)
-        return self.output(sigmoid_gate(out, gate))
+        return self.output.quantized(*gated_quantize(out, "attention", gate, pick_rows=pick_rows))
 
 
 class _Moe(nn.Module):
@@ -160,7 +155,7 @@ class _Moe(nn.Module):
         shared = fp8.linear_quantized(
             x_fp8, x_scale, self.shared_gate_up.weight, self.shared_gate_up.scale
         )
-        shared = self.shared_down(flashinfer_silu_and_mul(shared))
+        shared = self.shared_down.quantized(*gated_quantize(shared, "swiglu"))
         gate = cublas_mm(x, self.shared_router.T)
         return sigmoid_gate(shared, gate, routed)
 

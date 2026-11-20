@@ -219,6 +219,8 @@ l0_b200:
   - unittest/_torch/modeling_v2/models/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_verify_conv.py
   - unittest/_torch/modeling_v2/models/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_quantize.py
   - unittest/_torch/modeling_v2/models/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_fp8_low_m.py
+  - unittest/_torch/modeling_v2/models/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_epilogue_quantize.py
+  - unittest/_torch/modeling_v2/models/qwen3_5_moe/qwen3_6_35b_a3b_fp8__sm_100__default/test_gdn_pack.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py

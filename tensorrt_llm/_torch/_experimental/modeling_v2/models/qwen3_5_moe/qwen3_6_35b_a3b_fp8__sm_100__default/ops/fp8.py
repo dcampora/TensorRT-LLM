@@ -15,15 +15,14 @@ def quantize(x):
     return block_quantize(x)
 
 
-def linear(x, weight, scale):
-    """Multiply [tokens, K] activations by the FP8 [N, K] weight."""
-    return linear_quantized(*quantize(x), weight, scale)
-
-
 def linear_quantized(x, x_scale, weight, scale):
-    """Run the TRTLLM-Gen block-scaled GEMM on a prequantized activation."""
+    """Choose a block-scaled GEMM for the packed activation rows."""
     if block_scaled_low_m.supports(x, weight):
         return block_scaled_low_m(x, x_scale, weight, scale)
+    rows = x.shape[0]
+    # CuTe reads the FP32 activation scale rows at 16-byte aligned addresses.
+    if rows % 4 == 0 and (rows >= 128 or (rows >= 64 and weight.shape[1] >= 2048)):
+        return torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(x, weight, x_scale, scale)
     return torch.ops.trtllm.fp8_block_scaling_gemm(x, weight, x_scale, scale)
 
 
