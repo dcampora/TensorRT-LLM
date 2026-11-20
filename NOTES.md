@@ -552,3 +552,52 @@ passed.
 
 The OpenAI server started and matched all 32 engine generations at
 concurrency 1.
+
+### Variable batch shapes serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 590.45 | 58.19 | 1.64 |
+| 2 | 970.38 | 122.99 | 1.91 |
+| 4 | 1603.97 | 122.44 | 2.33 |
+| 8 | 2740.02 | 145.34 | 2.73 |
+| 16 | 4588.78 | 211.40 | 3.08 |
+| 32 | 7339.69 | 306.44 | 3.91 |
+| 64 | 10450.59 | 487.86 | 5.31 |
+| 128 | 15494.86 | 935.76 | 7.02 |
+
+### Variable batch shapes serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 550.29 | 69.59 | 1.75 |
+| 8 | 2494.16 | 323.01 | 2.79 |
+| 32 | 5736.99 | 879.82 | 4.43 |
+
+For ISL 1024 and OSL 1024 at concurrency 128, p99 TTFT fell from
+12.03 s to 1.65 s. The throughput rose from 6,941 to 15,495 output
+tokens/s. One of 523 Python stack samples taken during the latter run
+included the Triton compiler.
+
+### Sustained serving with variable batch shapes, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Output tokens/s | Median TTFT (ms) | p99 TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 512 | 13870.94 | 215.90 | 1507.08 | 8.78 |
+
+The sustained run used the benchmark client's default four requests per
+concurrent client.
+
+An isolated draft-head probe compared the original BF16 head with
+MXFP8 and tensor-scaled FP8 projections. At one row the BF16 projection
+and argmax took 161.80 µs, the tensor-scaled FP8 path took 104.90 µs, and
+the faster of the two MXFP8 paths took 201.79 µs. The tensor-scaled FP8
+head changed some proposals at larger row counts. The model's verified
+target logits use the original BF16 weights and FP32 output.
+
+The concurrency sweep checked every listed level from 1 through 128.
+The replay trace reproduced the engine's logits at all 52 unique first
+differences. Fifty-one margins were below 0.5 nats. One position,
+observed at concurrency 64 and 128, had a margin of 0.585 nats. The
+trace accepted 65.2% of drafts and emitted 2.96 tokens per verification
+step across the traced development requests.
