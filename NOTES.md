@@ -229,3 +229,98 @@ through the JSONL engine with mean KL 0.007827, non-tie top-1 agreement
 | 128 | 1024 | 52.22 | 446.36 |
 | 1024 | 1024 | 53.59 | 440.80 |
 | 4096 | 1024 | 75.39 | 436.57 |
+
+Three-token MTP also served all 32 oracle requests exactly like the batch-1 engine at concurrency 1.
+
+### Three-token MTP serving, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 427.38 | 62.93 | 2.28 |
+| 2 | 735.96 | 122.13 | 2.57 |
+| 4 | 1304.14 | 123.75 | 2.85 |
+| 8 | 2230.96 | 165.33 | 3.19 |
+| 16 | 3584.57 | 247.65 | 4.06 |
+| 32 | 5467.29 | 400.88 | 5.22 |
+| 64 | 8111.45 | 634.98 | 6.88 |
+| 128 | 11461.00 | 1170.86 | 9.46 |
+
+### Three-token MTP serving, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 413.61 | 81.79 | 2.34 |
+| 8 | 2035.44 | 418.80 | 3.39 |
+| 32 | 4362.37 | 1138.59 | 5.82 |
+
+The three-token serving comparison found 50 unique first-difference
+positions across the checked concurrency levels. All 50 batch-1
+prefixes were reproduced in the decode trace. Forty-nine margins were
+below 0.5 nats and one was 1.075 nats. The trace measured 2.98 tokens per
+verification step and 65.9% draft-token acceptance on the development
+requests.
+
+A repeated-row probe returned identical BF16 outputs for the native
+dense projections, MoE and residual norm across the tested batch sizes.
+FlashInfer verification had small batch-dependent differences in its
+BF16 recurrent checkpoints. A Triton variant rounded the Gated DeltaNet
+state at each candidate token boundary. Its four-token kernel took
+8.76 µs at batch 1 and 286.27 µs at batch 128, compared with 5.85 µs and
+180.80 µs for FlashInfer. The Triton variant passed its operation tests
+and had one greedy oracle miss, so the target kept FlashInfer verification.
+
+## Matched Modeling V1 serving comparison
+
+This V1 run used the same serving YAML as the three-token V2 revision, with `modeling_v2` set to `off`. Both runs used FP32 output logits and BF16 attention and recurrent caches.
+
+### Matched Modeling V1 with MTP, ISL 1024 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 598.28 | 73.79 | 1.60 |
+| 2 | 952.96 | 161.15 | 1.90 |
+| 4 | 1655.04 | 165.60 | 2.20 |
+| 8 | 2839.39 | 164.77 | 2.53 |
+| 16 | 4300.53 | 239.39 | 3.38 |
+| 32 | 6566.61 | 354.73 | 4.37 |
+| 64 | 9727.25 | 550.47 | 5.79 |
+| 128 | 12821.15 | 974.45 | 8.61 |
+
+### Matched Modeling V1 with MTP, ISL 4096 and OSL 1024
+
+| Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 565.76 | 84.59 | 1.69 |
+| 8 | 2561.77 | 378.78 | 2.72 |
+| 32 | 4810.02 | 1525.46 | 4.90 |
+
+
+## Fused FP8 input preparation and draft-row selection
+
+The new Triton quantizers produce contiguous `[block, token]` FP32 scales
+directly. Fused residual addition, Gemma RMSNorm and quantization retain
+the BF16 normalized activation used by unquantized projections and the
+original FP8 block scales used by quantized projections. Three small
+projection shapes use split-K Triton GEMMs on up to eight rows. The draft
+layer writes attention KV for every input and runs its output projection
+and MoE only for rows the runtime will sample. All 18 GPU operation cases
+passed. The quantization, norm and small-row GEMM kernels are candidates
+for target-local native code under `csrc/`.
+
+Fused add, norm and quantization reduced the two-row GPU time from
+6.48 µs to 2.63 µs and the 1024-row GPU time from 10.71 µs to 5.51 µs.
+The width-4096 output projection reduced GPU time from 11.4 µs to 6.1 µs
+on four rows. The JSONL engine passed the 32 development prompts at mean KL
+0.006933 and 99.587% non-tie top-1 agreement. Protocol checks exercised
+malformed requests, single-token scoring, EOS stopping and `ignore_eos`.
+
+### Fused FP8 preparation through the JSONL engine, ISL 128 / 1024 / 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | Decode (tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 50.96 | 488.17 |
+| 1024 | 1024 | 52.76 | 488.93 |
+| 4096 | 1024 | 72.88 | 470.19 |
+
+The OpenAI server started with the same revision and matched all 32 engine
+completions exactly at concurrency 1.
