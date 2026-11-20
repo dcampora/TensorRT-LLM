@@ -501,6 +501,11 @@
 /tests/unittest/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang
 /tests/integration/defs/accuracy/modeling_v2/qwen4_exp @Wanli-Jiang
 
+# Qwen3.6 FP8
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen3_5_moe @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/_torch/modeling_v2/models/qwen3_5_moe @NVIDIA/trt-llm-modeling_v2-dev
+/tests/integration/defs/accuracy/modeling_v2/qwen3_5_moe @NVIDIA/trt-llm-modeling_v2-dev
+
 # Kimi K3
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl @vsabavat
 /tests/unittest/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
