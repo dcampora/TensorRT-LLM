@@ -514,3 +514,41 @@ the local Triton attention path throughout.
 | 128 | 1024 | 10.92 | 1.495 | 668.9 |
 | 1024 | 1024 | 18.41 | 1.379 | 725.0 |
 | 4096 | 1024 | 44.35 | 1.521 | 657.5 |
+
+## Additional expert-kernel measurements
+
+FlashInfer Cake's SM100 W4A16 kernels consumed the checkpoint's packed
+E2M1 values and block scales directly. On the layer-13 fixture, the
+four-row projection took 24.2 microseconds versus 23.3 for the existing
+CuTe route. At 512 rows the fastest Cake cell took 153.6 microseconds
+versus 151.7, and at 4096 rows it took 399.0 versus 349.6. Its unmodified
+epilogue also rounded the activation differently. Using FlashInfer's
+native route sort with the existing CuTe GEMMs preserved the expert
+rows bitwise and changed the 512-row timing from 145.7 to 143.8
+microseconds. The existing expert kernels and sorting remained the
+default.
+
+## Small mixed scheduler steps
+
+In a two-request trace, BF16 router scores first differed in 100 of
+1028 entries when cuBLAS saw eight rows instead of two jobs of four
+rows. Independently evaluating each four-row request restored the
+same first-layer scores and routing decisions seen at batch 1. The
+short DeltaNet and shared-expert paths also use the single-request
+tile geometry. Small mixed steps process context and generation
+rows in separate model passes, retaining the scheduler's physical
+K/V pages and DeltaNet slots. The two-request trace matched 64 output
+tokens exactly with CUDA graphs enabled.
+
+All 32 engine oracle cases passed again (mean KL 0.005972, confident
+top-1 agreement 99.726%). HTTP passed against both the external oracle
+and batch-1 scores at concurrency 1, 2, 4, 32, 96, and 128. At concurrency
+2, 29 of the 32 continuations matched batch 1 token for token. The
+external comparison still found strict differences at 8, 16, 24,
+and 48. The batch-1 comparison also found a 0.75-nat difference at 64.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 667.9 | 25.84 |
+| 1024 | 1024 | 32 | 6375.9 | 223.71 |
+| 1024 | 1024 | 128 | 10520.2 | 287.70 |

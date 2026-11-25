@@ -169,7 +169,7 @@ class Experts(nn.Module):
         self.correct_gate = RoundedShared(self.shared_gate_up, band=256, floor=139)
         self.correct_down = RoundedShared(self.shared_down, band=128, floor=130)
 
-    def _shared(self, x, packed_prefill):
+    def _shared(self, x, packed_prefill, small_verify=False):
         if packed_prefill:
             raw = self.correct_gate.packed._raw(x)
             mid = torch.empty((x.shape[0], EXPERT_WIDTH), dtype=x.dtype, device=x.device)
@@ -178,7 +178,7 @@ class Experts(nn.Module):
         if x.shape[0] >= 64:
             return self.correct_down(self.correct_gate(x, True), False)
         mid = gemv(x, self.shared_gate_up, 1)
-        if x.shape[0] >= 16:
+        if x.shape[0] >= 16 and not small_verify:
             return shared_down(mid, self.shared_down)
         return gemv(mid, self.shared_down)
 
@@ -188,19 +188,24 @@ class Experts(nn.Module):
         grouped = rows >= cutoff
         use_gemv = rows <= 128
         packed_prefill = contexts and grouped
+        verifying = not contexts and width > 1
+        small_verify = verifying and batch <= 8
         share_in_parallel = side is not None and (grouped or use_gemv)
 
         if share_in_parallel:
             main = torch.cuda.current_stream()
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                shared = self._shared(x, packed_prefill)
+                shared = self._shared(x, packed_prefill, small_verify)
 
         router = (
             self.router if grouped and (contexts or batch > 1) else self.router[: NUM_EXPERTS + 1]
         )
-        verifying = not contexts and width > 1
-        logits = torch.mm(x, router.T)
+        if small_verify and batch > 1:
+            weight = self.router[: NUM_EXPERTS + 1].T
+            logits = torch.cat([torch.mm(request, weight) for request in x.split(width)])
+        else:
+            logits = torch.mm(x, router.T)
         weighted = grouped and epilogue is not None
         ids, probs, shared_gate = route_topk(logits, self.down.alpha if weighted else None)
         if grouped:
@@ -223,7 +228,7 @@ class Experts(nn.Module):
             if share_in_parallel:
                 main.wait_stream(side)
             else:
-                shared = self._shared(x, packed_prefill)
+                shared = self._shared(x, packed_prefill, small_verify)
             if epilogue is None:
                 out = torch.empty_like(x)
                 alpha = self.shared_down.alpha if packed_prefill else None

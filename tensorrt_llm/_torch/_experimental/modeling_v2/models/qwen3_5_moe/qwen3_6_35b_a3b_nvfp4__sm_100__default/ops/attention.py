@@ -241,7 +241,7 @@ class GatedAttention(OpWrapper):
             positions, requests = step.positions[ctx:], step.request_rows[ctx:]
             rows = m - ctx
             width = step.width
-            short_tile = rows <= width * 4
+            short_tile = rows <= width * 8
             if short_tile:
                 split, block, warps = 64, 64, 4
             else:

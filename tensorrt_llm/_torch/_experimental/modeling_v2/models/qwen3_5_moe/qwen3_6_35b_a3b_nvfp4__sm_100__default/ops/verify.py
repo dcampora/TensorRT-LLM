@@ -116,7 +116,7 @@ class DeltaVerify(OpWrapper):
                 num_warps=4,
             )
             return out
-        tile = 8 if rows <= 4 else 32
+        tile = 8 if conv is not None or rows <= 4 else 32
         weight, history, windows = conv if conv else (None, None, None)
         k.delta_verify[(rows // width, 32, 128 // tile)](
             qkv,

@@ -153,7 +153,7 @@ class LinearAttention(nn.Module):
             with torch.cuda.stream(side):
                 ba = (
                     delta_gate_projection(x, self.ba)
-                    if step.batch == 1 and step.width > 1
+                    if step.batch <= 8 and step.width > 1
                     else torch.mm(x, self.ba.T)
                 )
             qkvz = fp8_linear(x8, self.qkvz)
@@ -172,7 +172,7 @@ class LinearAttention(nn.Module):
             else:
                 conv = self.conv, history, cache.intermediate_conv_window
                 qkv = qkvz[ctx:]
-                if step.batch > 1:
+                if step.batch > 8:
                     qkv = convolution_verify(qkv, self.conv, slots, *conv[1:], step.width)
                     conv = None
                 decode = delta_verify(
@@ -193,7 +193,7 @@ class LinearAttention(nn.Module):
                     conv,
                 )
             y = torch.cat((y, decode)) if ctx else decode
-        scale = self.output.input_scale if ctx or step.batch == 1 else None
+        scale = self.output.input_scale if ctx or step.batch <= 8 else None
         return fp8_linear(delta_norm(y, qkvz, self.norm, scale), self.output)
 
 
@@ -329,6 +329,40 @@ class QwenDecoder(DecoderModel):
             x = self.embed_tokens(input_ids[: step.positions.numel()])
         else:
             x = inputs_embeds[: step.positions.numel()]
+        if 0 < step.contexts < step.batch <= 8:
+            # Small mixed steps preserve the arithmetic of the matching
+            # single-phase graph for each set of rows.
+            contexts, tokens = step.contexts, step.context_tokens
+            context_step = replace(
+                step,
+                positions=step.positions[:tokens],
+                request_rows=step.request_rows[:tokens],
+                slots=step.slots[:contexts],
+                batch=contexts,
+                width=1,
+                replay_slots=None,
+            )
+            generation_step = replace(
+                step,
+                positions=step.positions[tokens:],
+                request_rows=step.request_rows[tokens:],
+                slots=step.slots[contexts:],
+                batch=step.batch - contexts,
+                contexts=0,
+                context_tokens=0,
+                cu=None,
+                has_initial=None,
+                max_context=0,
+            )
+            return torch.cat(
+                (
+                    self._forward(x[:tokens], context_step, block_offsets, False),
+                    self._forward(x[tokens:], generation_step, block_offsets, False),
+                )
+            )
+        return self._forward(x, step, block_offsets, prefill_graph)
+
+    def _forward(self, x, step, block_offsets, prefill_graph):
         side = None if prefill_graph else self.side
         context_inputs = paged_context_inputs(step)
         decode_lengths = paged_decode_lengths(step)
