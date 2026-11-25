@@ -73,7 +73,6 @@ def _context_groups(lengths: list[int]):
 
 class Step(NamedTuple):
     context: Context | None
-    context_rows: int
     context_indices: torch.Tensor | None
     fresh_context: bool
     context_spans: tuple[tuple[int, int], ...]
@@ -106,10 +105,10 @@ class Layer(nn.Module):
             self.register_buffer("q_norm", None)
             self.register_buffer("k_norm", None)
 
-    def linear_attention(self, x: torch.Tensor, step: Step, cache) -> torch.Tensor:
+    def linear_attention(
+        self, x: torch.Tensor, projection: torch.Tensor, step: Step, cache
+    ) -> torch.Tensor:
         rows = x.shape[0]
-        decode = step.context is None
-        projection = self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
         z = projection[:, 10240:]
         if step.context is not None:
             if len(step.context_spans) == 1 or step.projection_rows == _PREFILL_MIN_ROWS:
@@ -131,8 +130,7 @@ class Layer(nn.Module):
                 cache.temporal,
                 step.context,
             )
-            out = gated_rmsnorm(prefills, z, self.gate_norm, self.eps)
-            return self.out(_pad(out, step.projection_rows))[:rows]
+            return gated_rmsnorm(prefills, z, self.gate_norm, self.eps)
 
         if rows <= _PREFILL_MIN_ROWS:
             ba = F.linear(_pad(x, _PREFILL_MIN_ROWS), self.ba)[:rows]
@@ -173,35 +171,58 @@ class Layer(nn.Module):
             )
         else:
             decoded = gdn_decode(*args)
-        packed = gated_rmsnorm(
+        return gated_rmsnorm(
             decoded, z, self.gate_norm, self.eps, self.out.input_scale, decode=True
         )
-        return self.out.gemm(packed, decode=True)
 
     def full_attention(
-        self, x: torch.Tensor, step: Step, rope: torch.Tensor, cache: Cache
+        self, projection: torch.Tensor, step: Step, rope: torch.Tensor, cache: Cache
     ) -> torch.Tensor:
-        rows = x.shape[0]
         decode = step.context is None
-        projection = self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
         q, k, v, gate = prepare_qkv(
             projection, self.q_norm, self.k_norm, rope, step.positions, self.eps
         )
         table = step.block_offsets[cache.group, :, 0]
         if decode:
             append_kv(k, v, step.positions, cache, table, None, step.decode_width)
-            result = decode_attention(
+            return decode_attention(
                 q, gate, step.positions, cache, table, self.out.input_scale, step.decode_width
             )
-            return self.out.gemm(result, decode=True)
         append_kv(k, v, step.positions, cache, table, step.context_indices)
         starts, chunks = step.context.starts, step.context.chunks
         if step.fresh_context:
             output = context_attention(q, k, v, starts, chunks)
         else:
             output = paged_context_attention(q, starts, chunks, step.positions, cache, table)
-        output = apply_gate(output, gate)
-        return self.out(_pad(output, step.projection_rows))[:rows]
+        return apply_gate(output, gate)
+
+    def attention_projections(self, x: torch.Tensor, step: Step) -> torch.Tensor:
+        return self.qkv(_pad(x, step.projection_rows), decode=step.context is None)[: x.shape[0]]
+
+    def attention_core(
+        self, x: torch.Tensor, projection: torch.Tensor, step: Step, rope: torch.Tensor, cache
+    ) -> torch.Tensor:
+        if self.is_linear:
+            return self.linear_attention(x, projection, step, cache)
+        return self.full_attention(projection, step, rope, cache)
+
+    def project_attention(self, x: torch.Tensor, step: Step) -> torch.Tensor:
+        if step.context is None:
+            return self.out.gemm(x, decode=True)
+        return self.out(_pad(x, step.projection_rows))[: x.shape[0]]
+
+    def input_rms_norm(
+        self, x: torch.Tensor, residual: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return fi.gemma_rmsnorm(x, self.input_norm, self.eps), x
+        fi.gemma_fused_add_rmsnorm(x, residual, self.input_norm, self.eps)
+        return x, residual
+
+    def post_rms_norm(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        x = x.contiguous()
+        fi.gemma_fused_add_rmsnorm(x, residual, self.post_norm, self.eps)
+        return x
 
     def forward(
         self,
@@ -211,21 +232,47 @@ class Layer(nn.Module):
         rope: torch.Tensor,
         layer_cache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = x
-            x = fi.gemma_rmsnorm(x, self.input_norm, self.eps)
-        else:
-            fi.gemma_fused_add_rmsnorm(x, residual, self.input_norm, self.eps)
-
-        if self.is_linear:
-            x = self.linear_attention(x, step, layer_cache)
-        else:
-            x = self.full_attention(x, step, rope, layer_cache)
-        x = x.contiguous()
-        fi.gemma_fused_add_rmsnorm(x, residual, self.post_norm, self.eps)
+        x, residual = self.input_rms_norm(x, residual)
+        x = self.attention_core(x, self.attention_projections(x, step), step, rope, layer_cache)
+        x = self.post_rms_norm(self.project_attention(x, step), residual)
         intermediate = self.gate_up(_pad(x, step.projection_rows))
-        x = self.down.swiglu(intermediate, step.mlp_rows, decode=not step.context_rows)
+        x = self.down.swiglu(intermediate, step.mlp_rows, decode=step.context is None)
         return x[: residual.shape[0]].contiguous(), residual
+
+    def forward_grouped(
+        self,
+        hidden: list[torch.Tensor],
+        residuals: list[torch.Tensor | None],
+        steps: list[Step],
+        rope: torch.Tensor,
+        cache,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        # Schedule the same weight matrix back to back across groups.
+        pairs = [self.input_rms_norm(x, r) for x, r in zip(hidden, residuals, strict=True)]
+        normalized, residuals = zip(*pairs, strict=True)
+        del pairs
+        projections = [
+            self.attention_projections(x, step) for x, step in zip(normalized, steps, strict=True)
+        ]
+        attn = [
+            self.attention_core(x, p, step, rope, cache)
+            for x, p, step in zip(normalized, projections, steps, strict=True)
+        ]
+        del projections, normalized
+        projected = [self.project_attention(x, step) for x, step in zip(attn, steps, strict=True)]
+        del attn
+        intermediate = [
+            self.gate_up(_pad(self.post_rms_norm(x, r), step.projection_rows))
+            for x, r, step in zip(projected, residuals, steps, strict=True)
+        ]
+        del projected
+        output = [
+            self.down.swiglu(x, step.mlp_rows, decode=step.context is None)[
+                : r.shape[0]
+            ].contiguous()
+            for x, r, step in zip(intermediate, residuals, steps, strict=True)
+        ]
+        return output, list(residuals)
 
 
 class Qwen38Decoder(DecoderModel):
@@ -275,7 +322,8 @@ class Qwen38Decoder(DecoderModel):
         ctx_rows = md.num_ctx_tokens
         num_decodes = md.num_seqs - contexts
         mamba = md.mamba_metadata
-        outputs = []
+        hidden = []
+        steps = []
         # In a mixed iteration each phase retains its own projection tactics
         # and rounding. The worker receives rows in the runtime's packed order.
         if contexts:
@@ -286,13 +334,13 @@ class Qwen38Decoder(DecoderModel):
                 step = self._context_step(
                     md, positions[begin:end], lengths[first:last], first, last, begin, end, x.device
                 )
-                outputs.append(self._compute_layers(x[begin:end], step))
+                hidden.append(x[begin:end])
+                steps.append(step)
         if num_decodes:
             decode_rows = x.shape[0] - ctx_rows
             replay_slots = mamba.replay_state_indices
             step = Step(
                 None,
-                0,
                 None,
                 False,
                 (),
@@ -305,8 +353,18 @@ class Qwen38Decoder(DecoderModel):
                 verify,
                 replay_slots[contexts : md.num_seqs] if replay_slots is not None else None,
             )
-            outputs.append(self._compute_layers(x[ctx_rows:], step))
-        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+            hidden.append(x[ctx_rows:])
+            steps.append(step)
+        if len(steps) == 1:
+            return self._compute_layers(hidden[0], steps[0])
+        residuals = [None] * len(steps)
+        for i, cache in enumerate(self._caches):
+            hidden, residuals = self.layers[i].forward_grouped(
+                hidden, residuals, steps, self.rope, cache
+            )
+        for x, r in zip(hidden, residuals, strict=True):
+            fi.gemma_fused_add_rmsnorm(x, r, self.norm_weight, self.eps)
+        return torch.cat(hidden)
 
     def _context_step(
         self,
@@ -342,7 +400,6 @@ class Qwen38Decoder(DecoderModel):
         projection_rows = max(end - begin, _PREFILL_MIN_ROWS)
         return Step(
             context,
-            end - begin,
             indices,
             not mamba.use_initial_states,
             tuple(zip(spans[:-1], spans[1:], strict=True)),

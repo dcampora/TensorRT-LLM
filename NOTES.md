@@ -378,3 +378,41 @@ distinct prompts at ISLs 127, 128, 257, 1024, and 4096.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 3887.93 | 1123.86 | 6.601 |
 | 128 | 128 | 5789.07 | 3040.77 | 18.510 |
+
+### Modeling V1 dynamic-MTP comparison, ISL 1024 and 4096, OSL 1024
+
+Changing the serving YAML's selector to `"off"` reaches Modeling V1. Its
+GDN replay implementation aborts CUDA graph warmup when two verification
+rows reach a replay buffer reserved for five rows. Running the same
+Modeling V1 configuration with `TRTLLM_USE_GDN_REPLAY=0` enables the
+runtime's full-state checkpoint path and starts serving. The benchmark
+below used the same one-wave prompts as the Modeling V2 measurements.
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1 | 1 | 188.36 | 79.57 | 5.236 |
+| 1024 | 32 | 32 | 3553.43 | 764.28 | 6.824 |
+| 1024 | 128 | 128 | 4521.97 | 2483.82 | 24.707 |
+| 4096 | 1 | 1 | 202.34 | 134.06 | 4.816 |
+
+## Projection locality for mixed iterations
+
+Context and decode groups keep their calibrated matrix shapes. The target
+runs a layer over all the groups before advancing to the next layer and
+schedules each weight's projections together, including the output and
+MLP matrices. This lets the GPU reuse weights in L2 across groups.
+The groups share the runtime-owned cache views and keep independent
+state and page slots.
+
+Both checkpoint-backed integration tests and all 38 operation cells
+passed. The 32 contract cases and all 384 serving comparisons matched
+the first-row checkpoint results. Batch-1 decode measured 414.83,
+374.63, and 344.99 tokens/s at ISLs 128, 1024, and 4096 with OSL 1024,
+close to the preceding measurements.
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 3852.03 | 1047.99 | 6.708 |
+| 128 | 128 | 5970.47 | 2626.63 | 18.269 |
