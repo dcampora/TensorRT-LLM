@@ -22,19 +22,29 @@ def _paged_parts(
     KV_STRIDE: tl.constexpr,
     DIVISOR: tl.constexpr,
     Q_STRIDE: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # Six query heads from each of two adjacent verifier rows share the KV tile.
+    first_row = tl.program_id(0) * 2
     head = tl.program_id(1)
     split = tl.program_id(2)
-    end = tl.load(POS + row) + 1
+    last_row = tl.minimum(first_row + 1, ROWS - 1)
+    end = tl.load(POS + last_row) + 1
     start = split * SPAN
     if start < end:
         head_row = tl.arange(0, 16)
-        h = head * 6 + head_row
+        row = first_row + head_row // 6
+        h = head * 6 + head_row % 6
         d = tl.arange(0, 256)
         tile = tl.arange(0, 32)
-        use = head_row < 6
-        q = tl.load(Q + row * Q_STRIDE + h[:, None] * 256 + d[None, :], use[:, None], 0)
+        use = (head_row < 12) & (row < ROWS)
+        q_end = tl.load(POS + row, use, -1) + 1
+        use &= start < q_end
+        q = tl.load(
+            Q + row[:, None] * Q_STRIDE + h[:, None] * 256 + d[None, :],
+            use[:, None],
+            0,
+        )
 
         out = tl.full((16, 256), 0, tl.float32)
         peak = tl.where(use, -float("inf"), 0.0)
@@ -56,7 +66,7 @@ def _paged_parts(
                 0.0,
             )
             score = tl.dot(q, key) * 0.0625
-            score = tl.where((t[None, :] < end) & use[:, None], score, -float("inf"))
+            score = tl.where((t[None, :] < q_end[:, None]) & use[:, None], score, -float("inf"))
             new_peak = tl.maximum(peak, tl.max(score, 1))
             probability = tl.exp(score - new_peak[:, None])
             ratio = tl.exp(peak - new_peak)
@@ -126,7 +136,7 @@ def decode_paged(
     n_splits = tr.cdiv(max_seq_len, span)
     part = torch.empty((rows, n_splits, 24, 256), dtype=torch.float32, device=q.device)
     lse = torch.empty((rows, n_splits, 24), dtype=torch.float32, device=q.device)
-    _paged_parts[(rows, 4, n_splits)](
+    _paged_parts[(tr.cdiv(rows, 2), 4, n_splits)](
         q,
         pages,
         table,
@@ -140,6 +150,7 @@ def decode_paged(
         pages.stride(1),
         divisor,
         q.stride(0),
+        rows,
         num_warps=4,
     )
     padded = tr.cdiv(rows, 4) * 4

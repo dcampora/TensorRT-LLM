@@ -713,6 +713,11 @@ pages used BF16 throughout this trial.
 | Pilot | ISL | OSL | C1 tokens/s | C32 tokens/s | C128 tokens/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16 recurrent state | 1024 | 1024 | 268.72 | 4194.66 | 7275.69 |
+| FP16 recurrent state | 1024 | 1024 | — | 4222.98 | 7357.25 |
+
+The FP16 recurrent-cache trial passed the development HTTP checks at
+concurrency 1 and 32. At concurrency 128, four replicas of item 3 first
+diverged at a score gap of 0.50000006 nats, outside the greedy pass rule.
 
 ## Full packed-scale serving sweep
 
@@ -740,3 +745,44 @@ of the nine supplemental mixed chats returned an intermittent first
 difference at a 0.625-nat solo score gap on one 1,024-input chat at
 concurrency 32 and 128. The earlier run of the same serving configuration
 had gaps of at most 0.375 nats on these chats.
+
+Disabling context chunking passed the standard nine-chat sweep with
+first differences of at most 0.125 nats. In a more concentrated repeat
+of the 1,024-input prompt, two of 22 replicas at concurrency 32 and three
+of 86 at concurrency 128 diverged again at output position 37. When the
+matching 37-token prefix was supplied as input, all replicas returned the
+expected next token. The one-wave rates with whole contexts were 4,117.41
+and 6,910.99 tokens/s at concurrency 32 and 128 with ISL and OSL 1,024.
+
+## Paired verifier queries
+
+The single-request paged attention shares each 32-token K/V tile between
+two consecutive verifier queries, following the grouping in the reference
+engine's `attention_packed.py`. Each query retains its own causal mask and
+128-token split reduction. The isolated five-row kernel and output merge
+took 13.48 us versus 15.79 us at a 1,024-token history and 19.00 us versus
+27.74 us at 4,096. The FP8 activation bytes and scale values were identical
+at every tested shape.
+
+The wider batched version passed the development HTTP checks. The
+supplemental 0.625-nat difference recurred at concurrency 32. Its one-wave
+throughput at ISL and OSL 1,024 was 3,893.94 tokens/s at concurrency 32
+and 6,482.39 at 128. The batch-1 change is limited to the single-request
+path. All 88 target tests passed on GB200.
+
+The paired-query `engine.sh` passed all 32 development items with mean
+KL 0.003288 and 99.909% non-tie top-1 agreement. Both EOS checks passed.
+This run used the larger physical KV pool and allocated 69,946 MiB of
+GPU memory at readiness. End-to-end throughput varied slightly from the
+previous measurements despite the lower isolated kernel time.
+The actual `serve.sh` launcher started and reproduced the development
+continuations at concurrency 1, 32 and 128.
+
+| Batch | ISL | OSL | Prompt | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 1 | 29.47 | 3.411 | 293.14 |
+| 1 | 128 | 1024 | 2 | 29.42 | 2.745 | 364.35 |
+| 1 | 1024 | 1024 | 1 | 44.21 | 3.566 | 280.43 |
+| 1 | 1024 | 1024 | 2 | 44.24 | 3.152 | 317.24 |
+| 1 | 4096 | 1024 | 1 | 138.45 | 3.405 | 293.65 |
+| 1 | 4096 | 1024 | 2 | 134.79 | 3.048 | 328.10 |

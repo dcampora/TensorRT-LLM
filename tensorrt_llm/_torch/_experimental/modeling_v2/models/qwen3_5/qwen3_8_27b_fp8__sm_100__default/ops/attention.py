@@ -240,6 +240,7 @@ class SingleSequencePagedGqa(OpWrapper):
     CELLS = (
         Cell("Four verifier tokens with a partial final split", dict(rows=4, length=1535)),
         Cell("Six verifier tokens across a split boundary", dict(rows=6, length=4094)),
+        Cell("Five verifier tokens with a single row in the final tile", dict(rows=5, length=4094)),
     )
 
     def __call__(
