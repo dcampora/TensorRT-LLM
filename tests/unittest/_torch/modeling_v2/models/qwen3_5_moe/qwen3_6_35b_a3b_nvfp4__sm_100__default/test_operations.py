@@ -278,11 +278,12 @@ def test_gated_attention(cell, certifying):
     storage = fixture_rand((32, 2, 2, page, 256), FP8, factor=0.4)
     table = (2 * torch.randperm(32, device=DEV, dtype=torch.int32)).reshape(2, -1)
     table = torch.stack((table, table + 1), dim=1)
-    ctx = 3 if cell.spec["context"] else 0
+    native = cell.spec.get("native", False)
+    ctx = (128 if native else 3) if cell.spec["context"] else 0
     width = cell.spec["width"]
     if ctx:
-        positions = [40, 41, 42, 303]
-        requests = [0, 0, 0, 1]
+        positions = list(range(40, 40 + ctx)) + [303]
+        requests = [0] * ctx + [1]
     else:
         positions = list(range(166 - width, 166)) + list(range(304 - width, 304))
         requests = [0] * width + [1] * width
@@ -299,7 +300,12 @@ def test_gated_attention(cell, certifying):
         width=width,
     )
     scale = torch.tensor(0.01, device=DEV)
-    args = (q, gate, storage, table, step, scale)
+    if native:
+        workspace = torch.zeros(128 * 1024**2, device=DEV, dtype=torch.uint8)
+        context = attention.paged_context_inputs(step)
+    else:
+        workspace = context = None
+    args = (q, gate, storage, table, step, scale, workspace, context)
     output, reference = op(*args).float(), op.reference(*args).float()
     relative_l2 = (output - reference).norm() / reference.norm()
     # Quantizing the online softmax probabilities and then the gated output

@@ -3,8 +3,11 @@
 
 """Qwen's gated FP8 GQA over TensorRT-LLM paged KV."""
 
+from typing import NamedTuple
+
 import torch
 import triton
+from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import paged_attention as k
@@ -83,6 +86,53 @@ class PrepareQkv(OpWrapper):
 prepare_qkv = PrepareQkv()
 
 
+class PagedContextInputs(NamedTuple):
+    query_offsets: torch.Tensor
+    kv_lengths: torch.Tensor
+    kv_offsets: torch.Tensor
+
+
+def paged_context_inputs(step) -> PagedContextInputs | None:
+    if not step.contexts or step.max_context < 128:
+        return None
+    query_offsets = step.cu.to(torch.int32)
+    tails = query_offsets[1:].long() - 1
+    kv_lengths = step.positions[tails].to(torch.int32) + 1
+    kv_offsets = torch.nn.functional.pad(kv_lengths.cumsum(dim=0, dtype=torch.int32), (1, 0))
+    return PagedContextInputs(query_offsets, kv_lengths, kv_offsets)
+
+
+def _role_pages(kv):
+    # The block table indexes K and V role pages independently. The pool
+    # view already points at this layer's first K page.
+    page_size = kv.shape[-2]
+    stride = kv.stride(1)
+    return kv.as_strided(
+        ((kv.shape[0] - 1) * kv.stride(0) // stride + 2, 2, page_size, 256),
+        (stride, *kv.stride()[-3:]),
+    )
+
+
+def _native_context(q, kv, table, step, workspace, metadata):
+    pages = _role_pages(kv)
+    return trtllm_batch_context_with_kv_cache(
+        q[: step.context_tokens],
+        (pages, pages),
+        workspace,
+        table[: step.contexts],
+        metadata.kv_lengths,
+        step.max_context,
+        step.capacity,
+        0.0625,
+        1.0,
+        step.contexts,
+        metadata.query_offsets,
+        metadata.kv_offsets,
+        out_dtype=BF16,
+        uses_shared_paged_kv_idx=False,
+    ).reshape(step.context_tokens, 4096)
+
+
 class GatedAttention(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
@@ -90,39 +140,46 @@ class GatedAttention(OpWrapper):
             "packed continuations with context and generation together",
             {"context": True, "width": 1},
         ),
+        Cell(
+            "native FP8 context with cached prefix and a decode row",
+            {"context": True, "width": 1, "native": True},
+        ),
         Cell("split-KV decode across nonconsecutive cache pages", {"context": False, "width": 1}),
         Cell("multi-token verification grouped by request", {"context": False, "width": 3}),
     )
 
-    def __call__(self, q, gate, kv, table, step, output_scale):
+    def __call__(self, q, gate, kv, table, step, output_scale, workspace=None, paged_context=None):
         ctx = step.context_tokens
         m = q.shape[0]
         quantized = output_scale is not None
         attention = torch.empty((m, 4096), dtype=FP8 if quantized else BF16, device=q.device)
         strides = (table.stride(0), table.stride(1), kv.shape[-2], kv.stride(1))
         if ctx:
-            y = torch.empty((ctx, 4096), dtype=BF16, device=q.device)
-            longest = step.max_context
-            bq = 128 if longest >= 1024 else 64 if longest > 128 else 32
-            k.attention[(triton.cdiv(longest, bq // 8), 2, step.contexts)](
-                q,
-                kv,
-                y,
-                None,
-                step.cu,
-                step.positions,
-                step.request_rows,
-                table,
-                *strides,
-                True,
-                bq,
-                128,
-                0,
-                0,
-                448.0,
-                num_warps=8 if bq == 128 else 4,
-                num_stages=2,
-            )
+            if paged_context is not None and kv.shape[-2] == 32:
+                y = _native_context(q, kv, table, step, workspace, paged_context)
+            else:
+                y = torch.empty((ctx, 4096), dtype=BF16, device=q.device)
+                longest = step.max_context
+                bq = 128 if longest >= 1024 else 64 if longest > 128 else 32
+                k.attention[(triton.cdiv(longest, bq // 8), 2, step.contexts)](
+                    q,
+                    kv,
+                    y,
+                    None,
+                    step.cu,
+                    step.positions,
+                    step.request_rows,
+                    table,
+                    *strides,
+                    True,
+                    bq,
+                    128,
+                    0,
+                    0,
+                    448.0,
+                    num_warps=8 if bq == 128 else 4,
+                    num_stages=2,
+                )
             k.attn_gate[(triton.cdiv(y.numel(), 1024),)](
                 y,
                 gate,
@@ -182,13 +239,10 @@ class GatedAttention(OpWrapper):
             )
         return attention
 
-    def reference(self, q, gate, kv, table, step, output_scale):
+    def reference(self, q, gate, kv, table, step, output_scale, workspace=None, paged_context=None):
         rows = []
         page_size = kv.shape[-2]
-        pages = kv.as_strided(
-            ((kv.shape[0] - 1) * kv.stride(0) // kv.stride(1) + 2, 2, page_size, 256),
-            (kv.stride(1), *kv.stride()[-3:]),
-        ).float()
+        pages = _role_pages(kv).float()
         with true_fp32_matmul():
             for query, row, position in zip(
                 q.float(), step.request_rows.tolist(), step.positions.tolist()

@@ -372,3 +372,44 @@ exactly in that run. The other requests diverged at eligible ties.
 | 1024 | 1024 | 1 | 655.0 | 26.06 | 1.501 |
 | 1024 | 1024 | 32 | 6072.7 | 199.19 | 4.861 |
 | 1024 | 1024 | 128 | 9694.2 | 301.15 | 12.022 |
+
+## Native FP8 context attention and four-lane verification
+
+Four value channels share each warp in the wide DeltaNet verifier. The
+contraction explicitly sums the original groups in the original order.
+The outputs remained bitwise identical in the strided cache fixture.
+Verification fell to 57.6 microseconds at batch 32 and width three,
+205.3 microseconds at batch 128 and width two, and 258.7 microseconds
+at batch 128 and width four.
+
+Full-attention layers use FlashInfer's native FP8 context kernel with
+32-token pages for context steps of at least 128 tokens. It consumes the
+runtime's separate K and V role indices, including cached prefixes. The
+context and full-KV offsets are prepared once per decoder step and
+shared across the ten layers. The kernel uses a reusable 128 MiB
+workspace. The local Triton attention path handles smaller contexts and
+the other page geometry. At ISL 4096, one FP8 prefill attention call
+fell from 398.5 to 166.4 microseconds. At batch 32 with 256 new tokens
+and 1024 total tokens per request, the same comparison fell from 505.0
+to 128.4 microseconds. The isolated outputs agreed within 0.015%
+relative L2 across the measured shapes.
+
+All 52 target unit and routing tests and all 32 development oracle
+items passed. Mean KL was 0.005972 and confident top-1 agreement was
+99.726%. The native server started and accepted all short development
+prompt comparisons to the batch-1 launcher at concurrency 1, 32 and
+128.
+
+| ISL | OSL | Batch-1 median TTFT (ms) | Batch-1 median TPOT (ms) | Decode tokens/s from median TPOT |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 11.29 | 1.496 | 668.3 |
+| 1024 | 1024 | 19.43 | 1.632 | 612.6 |
+| 4096 | 1024 | 44.20 | 1.525 | 655.6 |
+
+The two ISL 1024 decode trials had TPOT of 1.378 and 1.887 ms.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 666.1 | 25.97 | 1.471 |
+| 1024 | 1024 | 32 | 6359.9 | 221.70 | 4.663 |
+| 1024 | 1024 | 128 | 10491.3 | 281.77 | 11.107 |

@@ -18,7 +18,7 @@ from .... import disable_v2_by_default
 from ..routing import LAYER_TYPES
 from .kernels.cute_moe import PackedVocabulary
 from .mtp import DraftLayer, mtp_step
-from .ops.attention import gated_attention, prepare_qkv
+from .ops.attention import gated_attention, paged_context_inputs, prepare_qkv
 from .ops.moe import ExpertEpilogue, Experts, residual_rms_norm
 from .ops.projections import delta_gate_projection, fp8_linear
 from .ops.recurrent import convolution_decode, delta_decode, delta_norm, delta_prefill
@@ -108,12 +108,14 @@ class FullAttention(nn.Module):
     def input_scale(self) -> torch.Tensor:
         return self.qkv.input_scale
 
-    def forward(self, x8, step, kv, table, rope):
+    def forward(self, x8, step, kv, table, rope, workspace, context_inputs):
         qkv = fp8_linear(x8, self.qkv)
         q, gate = prepare_qkv(
             qkv, self.qnorm, self.knorm, rope, step.positions, step.request_rows, kv, table
         )
-        y = gated_attention(q, gate, kv, table, step, self.output.input_scale)
+        y = gated_attention(
+            q, gate, kv, table, step, self.output.input_scale, workspace, context_inputs
+        )
         return fp8_linear(y, self.output)
 
 
@@ -233,6 +235,9 @@ class QwenDecoder(DecoderModel):
 
     def prepare(self, config):
         self.side = torch.cuda.Stream()
+        self.attention_workspace = torch.zeros(
+            128 * 1024**2, dtype=torch.uint8, device=self.final_norm.device
+        )
         kw = {"device": self.final_norm.device, "dtype": torch.int32}
         self.bins = torch.arange(NUM_EXPERTS + 1, **kw)
         self.requests = torch.arange(4096, **kw)
@@ -317,6 +322,7 @@ class QwenDecoder(DecoderModel):
         else:
             x = inputs_embeds[: step.positions.numel()]
         side = None if prefill_graph else self.side
+        context_inputs = paged_context_inputs(step)
         residual = torch.empty_like(x)
         first = self.layers[0]
         x8 = torch.empty_like(x, dtype=FP8)
@@ -327,7 +333,9 @@ class QwenDecoder(DecoderModel):
             if layer.full_attention:
                 kv, pool = cache
                 table = block_offsets[pool]
-                x = layer.attention(x8, step, kv, table, self.rope)
+                x = layer.attention(
+                    x8, step, kv, table, self.rope, self.attention_workspace, context_inputs
+                )
             else:
                 x = layer.attention(x, x8, step, cache, side)
             x = residual_rms_norm(x, residual, layer.after, True, True)

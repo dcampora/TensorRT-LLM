@@ -33,6 +33,15 @@ def prepare(QKV, BA, ALog, Bias, QK, Gates):
 
 
 @gluon.jit
+def _contract(values, BV: gl.constexpr, output_layout: gl.constexpr):
+    # Preserve the narrow verifier's order: four adjacent elements per
+    # lane, the four groups of eight lanes, then the final eight lanes.
+    lanes = gl.sum(values.reshape((BV, 4, 8, 4)), 3)
+    subwarp = gl.sum(lanes, 1)
+    return gl.convert_layout(gl.sum(subwarp, 1), output_layout)
+
+
+@gluon.jit
 def verify(
     QKV,
     QK,
@@ -57,9 +66,8 @@ def verify(
     WIDTH: gl.constexpr,
     BV: gl.constexpr,
 ):
-    # A full warp owns a value channel, preserving the contraction order
-    # of the smaller-batch verifier.
-    layout: gl.constexpr = BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])
+    layout: gl.constexpr = BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
+    value_layout: gl.constexpr = SliceLayout(1, layout)
     tile, head, request = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     state_slot = gl.load(Slots + request).to(gl.int64)
     replay_slot = gl.load(ReplaySlots + request).to(gl.int64)
@@ -70,7 +78,7 @@ def verify(
     write_offset = gl.where(rollover, 0, accepted)
 
     k = gl.arange(0, 128, layout=SliceLayout(0, layout))
-    v = tile * BV + gl.arange(0, BV, layout=SliceLayout(1, layout))
+    v = tile * BV + gl.arange(0, BV, layout=value_layout)
     state_ptr = State + state_slot * SS + (head * 128 + v[:, None]) * 128 + k[None, :]
     s = gl.load(state_ptr, cache_modifier=".cg")
     history_k = Key + replay_slot * KS[0] + (head // 2) * KS[3] + k * KS[4]
@@ -101,9 +109,9 @@ def verify(
         decay, beta = gl.load(gates + 1), gl.load(gates + 2)
         previous += gl.load(gates)
         s *= decay
-        delta = (value - gl.sum(s * key[None, :], 1)) * beta
+        delta = (value - _contract(s * key[None, :], BV, value_layout)) * beta
         s = gl.fma(delta[:, None], key[None, :], s)
-        gl.store(Y + (row * 32 + head) * 128 + v, gl.sum(s * q[None, :], 1))
+        gl.store(Y + (row * 32 + head) * 128 + v, _contract(s * q[None, :], BV, value_layout))
 
         index = write_offset + token
         gl.store(history_u + write_buffer * US[1] + index * US[2], delta)

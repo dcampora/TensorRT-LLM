@@ -89,7 +89,7 @@ class DeltaVerify(OpWrapper):
             qk = torch.empty((rows, 16, 256), dtype=torch.float32, device=qkv.device)
             gates = torch.empty((rows, 32, 3), dtype=torch.float32, device=qkv.device)
             verify_gdn_tiled.prepare[(rows, 16)](qkv, ba, a_log, dt, qk, gates, num_warps=4)
-            tile = 32
+            tile = 64
             verify_gdn_tiled.verify[(128 // tile, 32, batch)](
                 qkv,
                 qk,
