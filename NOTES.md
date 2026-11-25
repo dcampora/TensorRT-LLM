@@ -1036,3 +1036,11 @@ and `TRTLLM_USE_GDN_REPLAY=0` to enable its full-state checkpoint path.
 | 4096 | 1 | 16 | 202.11 | 330.06 | +63.3% | 131.16 | 2.963 |
 | 4096 | 8 | 32 | 1227.94 | 1519.18 | +23.7% | 163.81 | 4.805 |
 | 4096 | 32 | 128 | 2558.43 | 2900.53 | +13.4% | 287.30 | 10.166 |
+
+A repeat at ISL 1024, OSL 1024 and concurrency 128 on the
+same 512 requests reached 5,763.05 output tokens/s. The median
+TTFT was 454.37 ms and the median TPOT was 21.440 ms.
+
+After the cache-manager line wrap required by the pinned formatter,
+the syntax tree was identical. The contract oracle and protocol checks,
+server smoke test, and 32-request serving oracle check passed again.

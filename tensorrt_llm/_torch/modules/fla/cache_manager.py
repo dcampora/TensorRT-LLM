@@ -321,7 +321,8 @@ class GDNReplayState:
         self.history_dtype = history_dtype
         self.replay_step_width = tokens_per_gen_step
         self.replay_history_size = (
-            tokens_per_gen_step if step_history
+            tokens_per_gen_step
+            if step_history
             else max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
         )
         # Whether the GDN layers verify drafts with the fused kernels, which commit
