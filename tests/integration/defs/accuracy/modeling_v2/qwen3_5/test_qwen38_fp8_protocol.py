@@ -35,6 +35,9 @@ def test_qwen38_fp8_dev_oracle() -> None:
     )
     root = Path(__file__).resolve().parents[6]
     oracle = json.loads(Path(oracle_path).read_text())
+    eos = json.loads((model / "generation_config.json").read_text())["eos_token_id"]
+    eos_ids = {eos} if isinstance(eos, int) else set(eos)
+    vocab_size = json.loads((model / "config.json").read_text())["text_config"]["vocab_size"]
     fragile = {(item["prompt"], item["token"]) for item in oracle["fragile"]}
     total_kl = 0.0
     positions = non_ties = correct_top1 = 0
@@ -50,13 +53,25 @@ def test_qwen38_fp8_dev_oracle() -> None:
         assert engine.stdin is not None and engine.stdout is not None
         assert json.loads(engine.stdout.readline()) == {"ready": True}
 
-        def call(op: str, **args: object) -> dict:
+        def exchange(op: str, **args: object) -> dict:
             print(json.dumps({"op": op, **args}), file=engine.stdin, flush=True)
-            response = json.loads(engine.stdout.readline())
+            return json.loads(engine.stdout.readline())
+
+        def call(op: str, **args: object) -> dict:
+            response = exchange(op, **args)
             assert "error" not in response, response
             return response
 
         try:
+            assert "error" in exchange(
+                "generate", ids=[vocab_size], max_new_tokens=1, ignore_eos=True
+            )
+            assert call("generate", ids=[1], max_new_tokens=0, ignore_eos=True) == {"ids": []}
+            assert call("score", ids=[1], top_k=0, logprob_ids=[]) == {
+                "top1": [],
+                "top_k": [],
+                "logprobs": [],
+            }
             for index, item in enumerate(oracle["items"]):
                 top_k = item["top_k"]
                 prompt = item["prompt_ids"]
@@ -75,6 +90,12 @@ def test_qwen38_fp8_dev_oracle() -> None:
                 generated = call(
                     "generate", ids=prompt, max_new_tokens=len(expected), ignore_eos=True
                 )["ids"]
+                end = next((i + 1 for i, token in enumerate(generated) if token in eos_ids), None)
+                if end is not None:
+                    stopped = call(
+                        "generate", ids=prompt, max_new_tokens=len(expected), ignore_eos=False
+                    )["ids"]
+                    assert stopped == generated[:end]
                 for offset, (actual, wanted) in enumerate(zip(generated, expected, strict=True)):
                     if actual == wanted:
                         continue

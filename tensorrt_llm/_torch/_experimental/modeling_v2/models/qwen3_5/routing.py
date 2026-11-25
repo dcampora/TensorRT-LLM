@@ -4,6 +4,9 @@
 
 from typing import TYPE_CHECKING
 
+from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_required, is_gdn_replay_enabled
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
 from ..._router_index import NoTarget, routes
 
 if TYPE_CHECKING:
@@ -76,8 +79,26 @@ def route(
         raise NoTarget("Qwen3.8-27B FP8 requires enable_block_reuse=False")
     if llm_args.attn_backend != "TRTLLM" or llm_args.max_beam_width != 1:
         raise NoTarget("Qwen3.8-27B FP8 requires TRTLLM attention metadata and beam width 1")
-    if model_config.spec_config is not None:
-        raise NoTarget("Qwen3.8-27B FP8 currently supports non-speculative decoding")
+    spec = model_config.spec_config
+    if spec is not None:
+        if (
+            not isinstance(spec, MTPDecodingConfig)
+            or not spec.spec_dec_mode.is_mtp_eagle_one_model()
+            or spec.use_dynamic_tree
+            or spec.use_relaxed_acceptance_for_thinking
+            or spec.uses_replacement_heads
+            or spec.draft_lm_head_dtype != "auto"
+            or spec.max_draft_len > 7
+            or getattr(text, "mtp_num_hidden_layers", None) != 1
+            or getattr(text, "mtp_use_dedicated_embeddings", True)
+        ):
+            raise NoTarget(
+                "Qwen3.8-27B FP8 runs the checkpoint's single MTP layer as a linear chain"
+            )
+        if kv.mamba_ssm_cache_dtype != "float32":
+            raise NoTarget("Qwen3.8-27B MTP needs a float32 recurrent cache")
+        if not is_gdn_replay_enabled() or is_gdn_flashinfer_replay_required():
+            raise NoTarget("Qwen3.8-27B MTP needs the hybrid manager's double-buffer replay")
     if llm_args.enable_lora or llm_args.mm_encoder_only:
         raise NoTarget("Qwen3.8-27B FP8 serves the text decoder without adapters")
     if llm_args.cache_transceiver_config is not None or llm_args.kv_connector_config is not None:

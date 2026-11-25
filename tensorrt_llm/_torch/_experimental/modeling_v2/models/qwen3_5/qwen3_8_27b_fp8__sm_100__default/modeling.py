@@ -12,7 +12,9 @@ from flashinfer import gemma_fused_add_rmsnorm, gemma_rmsnorm, silu_and_mul
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from torch import nn
 
-from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
 from .... import disable_v2_by_default
 from . import weights
@@ -32,6 +34,7 @@ from .ops.recurrent import (
     recurrent_delta,
     short_context_delta,
 )
+from .ops.speculative import ReplayHistory, reset_replay, verify_convolution, verify_delta
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -72,6 +75,8 @@ class Step:
     context_slots: torch.Tensor
     generation_slots: torch.Tensor
     gate_workspace: torch.Tensor
+    predicted: int
+    speculative: bool
     context_offsets: torch.Tensor | None = None
     host_offsets: list[int] | None = None
     context_lengths: list[int] | None = None
@@ -81,19 +86,27 @@ class Step:
 
     @classmethod
     def prepare(
-        cls, md: "TrtllmAttentionMetadata", positions: torch.Tensor, gate_workspace: torch.Tensor
+        cls,
+        md: "TrtllmAttentionMetadata",
+        positions: torch.Tensor,
+        gate_workspace: torch.Tensor,
+        speculative: bool,
     ) -> "Step":
         """Use only device metadata for the graph-captured decode path."""
         mamba = md.mamba_metadata
         contexts = md.num_contexts
+        generation = md.num_seqs - contexts
+        predicted = (md.num_tokens - md.num_ctx_tokens) // generation if generation else 1
         step = cls(
             md,
             positions,
-            attention_arguments(md, predicted=1),
+            attention_arguments(md, predicted=predicted),
             md.num_ctx_tokens,
             mamba.state_indices[:contexts],
             mamba.state_indices[contexts : md.num_seqs],
             gate_workspace,
+            predicted,
+            speculative,
         )
         if contexts:
             lengths = md.seq_lens[:contexts].tolist()
@@ -226,19 +239,61 @@ class DecoderLayer(nn.Module):
                 if gen.shape[0] <= 512
                 else F.linear(gen, self.ba)
             )
-            convolved = causal_convolution(p[split:], self.conv, conv_state, step.generation_slots)
-            parts.append(
-                recurrent_delta(
-                    convolved,
-                    ba,
-                    self.a_log,
-                    self.dt_bias,
-                    state,
-                    step.generation_slots,
+            if step.speculative:
+                parts.append(self._verify_delta(p[split:], ba, step))
+            else:
+                convolved = causal_convolution(
+                    p[split:], self.conv, conv_state, step.generation_slots
                 )
-            )
+                parts.append(
+                    recurrent_delta(
+                        convolved, ba, self.a_log, self.dt_bias, state, step.generation_slots
+                    )
+                )
         out = parts[0] if len(parts) == 1 else torch.cat(parts)
         return gated_head_norm(out, p, self.gdn_norm)
+
+    def _verify_delta(self, projection: torch.Tensor, ba: torch.Tensor, step: Step) -> torch.Tensor:
+        manager = step.metadata.kv_cache_manager
+        mamba = step.metadata.mamba_metadata
+        context = step.metadata.num_contexts
+        replay = manager.get_replay_state_update_metadata()
+        cache = manager.mamba_layer_cache(self.index)
+        slots = step.generation_slots
+        replay_slots = mamba.replay_state_indices[context : step.metadata.num_seqs]
+        direct = step.predicted == 1
+        if direct:
+            qkv = causal_convolution(projection, self.conv, cache.conv, slots)
+        else:
+            qkv = verify_convolution(
+                projection,
+                self.conv,
+                cache.conv,
+                cache.intermediate_conv_window,
+                slots,
+                manager.intermediate_state_indices[: slots.numel()],
+                step.predicted,
+            )
+        history = ReplayHistory(
+            replay.prev_num_accepted_tokens,
+            replay.cache_buf_idx,
+            cache.old_x,
+            cache.old_B,
+            cache.old_dt,
+            replay.replay_step_width,
+        )
+        return verify_delta(
+            qkv,
+            ba,
+            self.a_log,
+            self.dt_bias,
+            cache.temporal,
+            slots,
+            replay_slots,
+            history,
+            step.predicted,
+            direct,
+        )
 
     def _full_attention(self, p: torch.Tensor, rope: torch.Tensor, step: Step) -> torch.Tensor:
         q, k, v = prepare_qkv(
@@ -269,7 +324,7 @@ class DecoderLayer(nn.Module):
                 out[split:],
                 divisor,
                 step.metadata.num_contexts,
-                1,
+                step.predicted,
             )
         if step.short_chunks is not None:
             split = step.context_rows
@@ -306,6 +361,17 @@ class DecoderLayer(nn.Module):
         return hidden, residual
 
 
+class TokenEmbedding(nn.Module):
+    """The BF16 token embedding shared by the trunk and the speculative draft."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("weight", None)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return F.embedding(ids, self.weight)
+
+
 class Qwen38TextModel(DecoderModel):
     """Qwen3.8's text embedding, hybrid decoder, and final normalization."""
 
@@ -314,13 +380,19 @@ class Qwen38TextModel(DecoderModel):
     def __init__(self, model_config: "ModelConfig") -> None:
         super().__init__(model_config)
         self.config = model_config.pretrained_config
+        self.embed_tokens = TokenEmbedding()
+        self.aux_stream_dict = {}  # The draft is TP1 and has no auxiliary collectives.
+        if model_config.spec_config is not None:
+            from .draft import DraftLayer
+
+            self.mtp_layer_cls = DraftLayer
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(index, layer_type == "linear_attention")
                 for index, layer_type in enumerate(self.config.layer_types)
             ]
         )
-        for name in ("embedding", "final_norm", "rope", "gate_workspace"):
+        for name in ("final_norm", "rope", "gate_workspace"):
             self.register_buffer(name, None)
 
     def forward(
@@ -334,27 +406,48 @@ class Qwen38TextModel(DecoderModel):
         """Generate hidden rows in the same packed order supplied by the executor."""
         assert position_ids is not None
         positions = position_ids.reshape(-1, position_ids.shape[-1])[0]
-        step = Step.prepare(attn_metadata, positions, self.gate_workspace)
-        x = F.embedding(input_ids, self.embedding) if inputs_embeds is None else inputs_embeds
+        speculative = self.model_config.spec_config is not None
+        step = Step.prepare(attn_metadata, positions, self.gate_workspace, speculative)
+        x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         residual = None
         for layer in self.layers:
             x, residual = layer(x, residual, self.rope, step)
+        if speculative and step.predicted == 1 and step.generation_slots.numel():
+            md = attn_metadata.mamba_metadata
+            replay = attn_metadata.kv_cache_manager.get_replay_state_update_metadata()
+            reset_replay(
+                md.replay_state_indices[attn_metadata.num_contexts : attn_metadata.num_seqs],
+                replay.prev_num_accepted_tokens,
+                replay.cache_buf_idx,
+            )
         return residual_norm(x, residual, self.final_norm)[0]
 
 
 @disable_v2_by_default
-class ModelingV2Qwen38_27bFp8Sm100Default(DecoderModelForCausalLM):
+class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
     """Dense text-only Qwen3.8-27B FP8 on one SM100 GPU."""
 
     def __init__(self, config: "ModelConfig") -> None:
         text = config.pretrained_config.text_config
         config.pretrained_config = text
+        if config.spec_config is not None:
+            text.num_nextn_predict_layers = 1
         super().__init__(
             Qwen38TextModel(config),
-            config=config,
+            config,
             hidden_size=text.hidden_size,
             vocab_size=text.vocab_size,
         )
+
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: "ModelConfig") -> bool:
+        return True
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks | None:
+        if self.spec_config is not None:
+            return RuntimeHooks(loop_on_execution_stream=True, gdn_fused_verify=True)
+        return None
 
     def load_weights(self, checkpoint: dict[str, torch.Tensor]) -> None:
         """Populate the target using the original HF keys."""

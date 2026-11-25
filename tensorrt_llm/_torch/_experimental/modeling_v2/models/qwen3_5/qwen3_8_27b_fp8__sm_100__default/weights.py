@@ -10,7 +10,7 @@ import torch
 from .ops.projection import block_requantize
 
 if TYPE_CHECKING:
-    from .modeling import BlockProjection, ModelingV2Qwen38_27bFp8Sm100Default
+    from .modeling import BlockProjection, DecoderLayer, ModelingV2Qwen38_27bFp8Sm100Default
 
 
 TEXT_PREFIX = "model.language_model."
@@ -53,42 +53,12 @@ def load_model(
     """Load the text tower from the composite HF checkpoint."""
     decoder = model.model
     device = model.lm_head.weight.device
-    decoder.embedding = weights[TEXT_PREFIX + "embed_tokens.weight"].to(device)
+    decoder.embed_tokens.weight = weights[TEXT_PREFIX + "embed_tokens.weight"].to(device)
     decoder.final_norm = weights[TEXT_PREFIX + "norm.weight"].to(device)
     model.lm_head.weight.copy_(weights["lm_head.weight"])
 
     for index, layer in enumerate(decoder.layers):
-        prefix = f"{TEXT_PREFIX}layers.{index}."
-        layer.pre_norm = weights[prefix + "input_layernorm.weight"].to(device)
-        layer.post_norm = weights[prefix + "post_attention_layernorm.weight"].to(device)
-        load_projection(
-            layer.gate_up, weights, [prefix + "mlp.gate_proj", prefix + "mlp.up_proj"], device
-        )
-        load_projection(layer.down, weights, [prefix + "mlp.down_proj"], device)
-        if layer.is_linear:
-            linear = prefix + "linear_attn."
-            load_projection(
-                layer.input_proj, weights, [linear + "in_proj_qkv", linear + "in_proj_z"], device
-            )
-            load_projection(layer.output_proj, weights, [linear + "out_proj"], device)
-            layer.ba = torch.cat(
-                [weights[linear + f"in_proj_{name}.weight"] for name in ("b", "a")]
-            ).to(device)
-            layer.conv = weights[linear + "conv1d.weight"].to(device)
-            layer.a_log = weights[linear + "A_log"].to(device)
-            layer.dt_bias = weights[linear + "dt_bias"].to(device)
-            layer.gdn_norm = weights[linear + "norm.weight"].to(device)
-        else:
-            attention = prefix + "self_attn."
-            load_projection(
-                layer.input_proj,
-                weights,
-                [attention + name + "_proj" for name in ("q", "k", "v")],
-                device,
-            )
-            load_projection(layer.output_proj, weights, [attention + "o_proj"], device)
-            layer.q_norm = weights[attention + "q_norm.weight"].to(device)
-            layer.k_norm = weights[attention + "k_norm.weight"].to(device)
+        load_layer(layer, f"{TEXT_PREFIX}layers.{index}.", weights, device)
 
     inv_freq = 1.0 / (
         decoder.config.rope_theta
@@ -100,3 +70,48 @@ def load_model(
     )
     decoder.rope = torch.cat((phase.cos(), phase.sin()), dim=1)
     decoder.gate_workspace = torch.empty(16 * 1024 * 1024, device=device, dtype=torch.uint8)
+
+    if model.draft_model is not None:
+        draft = model.draft_model.mtp_layers[0]
+        load_layer(draft, "mtp.layers.0.", weights, device)
+        draft.fc = weights["mtp.fc.weight"].to(device)
+        draft.embedding_norm = weights["mtp.pre_fc_norm_embedding.weight"].to(device)
+        draft.hidden_norm = weights["mtp.pre_fc_norm_hidden.weight"].to(device)
+        draft.output_norm = weights["mtp.norm.weight"].to(device)
+        draft.rope = decoder.rope
+
+
+def load_layer(
+    layer: "DecoderLayer", prefix: str, weights: Mapping[str, torch.Tensor], device: torch.device
+) -> None:
+    """Load one decoder layer from its checkpoint prefix."""
+    layer.pre_norm = weights[prefix + "input_layernorm.weight"].to(device)
+    layer.post_norm = weights[prefix + "post_attention_layernorm.weight"].to(device)
+    load_projection(
+        layer.gate_up, weights, [prefix + "mlp.gate_proj", prefix + "mlp.up_proj"], device
+    )
+    load_projection(layer.down, weights, [prefix + "mlp.down_proj"], device)
+    if layer.is_linear:
+        linear = prefix + "linear_attn."
+        load_projection(
+            layer.input_proj, weights, [linear + "in_proj_qkv", linear + "in_proj_z"], device
+        )
+        load_projection(layer.output_proj, weights, [linear + "out_proj"], device)
+        layer.ba = torch.cat(
+            [weights[linear + f"in_proj_{name}.weight"] for name in ("b", "a")]
+        ).to(device)
+        layer.conv = weights[linear + "conv1d.weight"].to(device)
+        layer.a_log = weights[linear + "A_log"].to(device)
+        layer.dt_bias = weights[linear + "dt_bias"].to(device)
+        layer.gdn_norm = weights[linear + "norm.weight"].to(device)
+    else:
+        attention = prefix + "self_attn."
+        load_projection(
+            layer.input_proj,
+            weights,
+            [attention + name + "_proj" for name in ("q", "k", "v")],
+            device,
+        )
+        load_projection(layer.output_proj, weights, [attention + "o_proj"], device)
+        layer.q_norm = weights[attention + "q_norm.weight"].to(device)
+        layer.k_norm = weights[attention + "k_norm.weight"].to(device)

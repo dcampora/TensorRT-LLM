@@ -5,14 +5,17 @@
 import json
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from tensorrt_llm import LLM
 
+MAX_SEQ_LEN = 8192
 
-def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
+
+def handle(llm: "LLM", request: dict, eos_ids: list[int], vocab_size: int) -> dict:
     import torch
 
     from tensorrt_llm import SamplingParams
@@ -21,8 +24,10 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
     if operation not in ("generate", "score"):
         raise ValueError(f"Unknown operation {operation!r}")
     ids = request["ids"]
-    if not isinstance(ids, list) or any(type(token) is not int for token in ids):
-        raise ValueError("ids must be a list of token IDs")
+    if not isinstance(ids, list) or any(
+        type(token) is not int or not 0 <= token < vocab_size for token in ids
+    ):
+        raise ValueError("ids must be a list of in-vocabulary token IDs")
 
     if operation == "generate":
         count = request["max_new_tokens"]
@@ -35,6 +40,8 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
             raise ValueError("ignore_eos must be a boolean")
         if count == 0:
             return {"ids": []}
+        if len(ids) + count > MAX_SEQ_LEN:
+            raise ValueError(f"Prompt and output exceed the {MAX_SEQ_LEN}-token sequence limit")
         params = SamplingParams(
             temperature=0,
             max_tokens=count,
@@ -45,19 +52,22 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
             detokenize=False,
         )
         result = llm.generate(ids, params, use_tqdm=False)
-        return {"ids": result.outputs[0].token_ids}
+        tokens = result.outputs[0].token_ids
+        if ignore_eos and len(tokens) != count:
+            raise RuntimeError(f"Requested {count} new tokens and received {len(tokens)}")
+        return {"ids": tokens}
 
     top_k = request.get("top_k")
     probes = request.get("logprob_ids")
     count = max(0, len(ids) - 1)
-    if top_k is not None and (type(top_k) is not int or top_k < 0):
-        raise ValueError("top_k must be a nonnegative integer")
+    if top_k is not None and (type(top_k) is not int or not 0 <= top_k <= vocab_size):
+        raise ValueError("top_k must be an integer between zero and the vocabulary size")
     if probes is not None and (
         not isinstance(probes, list)
         or len(probes) != count
         or any(
             not isinstance(tokens, list)
-            or any(type(token) is not int or token < 0 for token in tokens)
+            or any(type(token) is not int or not 0 <= token < vocab_size for token in tokens)
             for tokens in probes
         )
     ):
@@ -69,6 +79,11 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
         response["logprobs"] = []
     if not count:
         return response
+    if len(ids) >= MAX_SEQ_LEN:
+        # The final supplied ID is the label of the last scored prefix.
+        ids = ids[:-1]
+    if len(ids) + 1 > MAX_SEQ_LEN:
+        raise ValueError(f"Scoring exceeds the {MAX_SEQ_LEN}-token sequence limit")
 
     params = SamplingParams(
         temperature=0,
@@ -83,8 +98,6 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
     logprobs = torch.log_softmax(logits, dim=-1)
     response["top1"] = logits.argmax(dim=-1).tolist()
     if top_k is not None:
-        if top_k > logits.shape[-1]:
-            raise ValueError("top_k exceeds the model vocabulary size")
         values, indices = logprobs.topk(top_k, dim=-1)
         response["top_k"] = [list(zip(i, v)) for i, v in zip(indices.tolist(), values.tolist())]
     if probes is not None:
@@ -94,33 +107,47 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int]) -> dict:
     return response
 
 
-def main(mode: Literal["require", "off"] = "require") -> None:
+def _build_llm(model: Path, mode: Literal["require", "off"], draft_len: int) -> "LLM":
+    from tensorrt_llm import LLM
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    return LLM(
+        model,
+        modeling_v2=mode,
+        skip_tokenizer_init=True,
+        disable_mm_encoder=True,
+        max_batch_size=1,
+        max_seq_len=MAX_SEQ_LEN,
+        max_num_tokens=MAX_SEQ_LEN,
+        cuda_graph_config={"batch_sizes": [1]},
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=MAX_SEQ_LEN,
+            host_cache_size=0,
+            mamba_ssm_cache_dtype="auto" if mode == "off" and draft_len == 0 else "float32",
+        ),
+        speculative_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len else None,
+    )
+
+
+def main(mode: Literal["require", "off"] = "require", draft_len: int = 0) -> None:
     with os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1) as protocol:
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-        from tensorrt_llm import LLM
-        from tensorrt_llm.llmapi import KvCacheConfig
-
         model = Path(sys.argv[1]).resolve()
+        vocab_size = json.loads((model / "config.json").read_text())["text_config"]["vocab_size"]
         eos_ids = json.loads((model / "generation_config.json").read_text())["eos_token_id"]
         if isinstance(eos_ids, int):
             eos_ids = [eos_ids]
-        llm = LLM(
-            model,
-            modeling_v2=mode,
-            skip_tokenizer_init=True,
-            disable_mm_encoder=True,
-            max_batch_size=1,
-            cuda_graph_config={"batch_sizes": [1]},
-            max_seq_len=8192,
-            max_num_tokens=8192,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                max_tokens=8192,
-                host_cache_size=0,
-                mamba_ssm_cache_dtype="auto" if mode == "off" else "float32",
-            ),
-        )
-        try:
+
+        with ExitStack() as resources:
+            generator = _build_llm(model, mode, draft_len)
+            resources.callback(generator.shutdown)
+            scorer = generator
+            if draft_len:
+                # The one-model speculative sampler does not expose context logits.
+                scorer = _build_llm(model, mode, 0)
+                resources.callback(scorer.shutdown)
             print('{"ready": true}', file=protocol)
             for line in sys.stdin:
                 try:
@@ -128,7 +155,8 @@ def main(mode: Literal["require", "off"] = "require") -> None:
                     if request["op"] == "shutdown":
                         print('{"ok": true}', file=protocol)
                         break
-                    response = handle(llm, request, eos_ids)
+                    llm = scorer if request["op"] == "score" else generator
+                    response = handle(llm, request, eos_ids, vocab_size)
                 except (
                     AttributeError,
                     IndexError,
@@ -139,9 +167,7 @@ def main(mode: Literal["require", "off"] = "require") -> None:
                 ) as error:
                     response = {"error": str(error)}
                 print(json.dumps(response), file=protocol)
-        finally:
-            llm.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    main(draft_len=3)

@@ -148,3 +148,53 @@ The OpenAI token-ID check reproduced the batch-1 continuations at
 concurrency 1, 32 and 128. Across the three runs there were zero
 unaccepted first divergences against the development oracle and zero
 token-ID differences from the batch-1 V2 results.
+
+The non-speculative V2 serving sweep used the benchmark's default request
+counts with the same prompts as the stock server.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 16 | 100.79 | 66.70 |
+| 1024 | 1024 | 32 | 128 | 1835.41 | 984.97 |
+| 1024 | 1024 | 128 | 512 | 4062.14 | 1130.13 |
+
+## Checkpoint MTP
+
+The runtime's linear MTP-Eagle worker runs the checkpoint's single draft
+layer with shared embeddings and vocabulary weights. The verifier uses the
+full vocabulary. The draft uses its runtime-managed paged BF16 KV cache.
+The trunk and draft both use the overlap scheduler and decode CUDA graphs.
+
+The tentative convolution windows and recurrent replay kernels adapt
+`verify_conv_rolling.py` and `verify_replay.py` from the reference. The
+trunk keeps a durable FP32 state checkpoint, then records BF16 key, value,
+and gate inputs in the hybrid manager's two history banks. The kernel
+replays the accepted prefix in FP32. The cache manager promotes the
+accepted convolution window, updates each request's history length, and
+rotates the bank when the kernel commits a checkpoint. The shared runtime
+change is the opt-in `RuntimeHooks.gdn_fused_verify` flag, which tells the
+manager who owns that checkpoint update.
+
+The JSON-line runner uses a second non-speculative LLM instance for scoring
+because the speculative sampler rejects context-logit requests. Both
+instances are ready before the engine starts reading requests. The two
+workers used 65,162 MiB of GPU memory after warmup.
+
+The three-token draft passed all 32 development items through the JSON-line
+runner with KL 0.003288 and non-tie top-1 agreement of 99.909%. The 10 exact,
+21 near-tie, and one fragile continuation match the non-speculative result
+counts. Both EOS checks returned token 248044 and stopped at the expected
+position. The runner also rejected an out-of-vocabulary ID and continued
+processing subsequent requests. Seven new operation cases cover tentative
+convolution windows, replay rollover, the single-token path, and slot reset.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 50.21 | 4.638 | 215.61 |
+| 1 | 1024 | 1024 | 71.63 | 4.910 | 203.67 |
+| 1 | 4096 | 1024 | 209.90 | 5.431 | 184.12 |
+
+Serving uses three draft tokens through batch size 32 and one through
+batch size 128. The HTTP token-ID check matched every batch-1 continuation
+at concurrency 1, 32, and 128, including the fragile case. The server
+used 81,253 MiB of GPU memory after graph capture with 285,000 cache tokens.
