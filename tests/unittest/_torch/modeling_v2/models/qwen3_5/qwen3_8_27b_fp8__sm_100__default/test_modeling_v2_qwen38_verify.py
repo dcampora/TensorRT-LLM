@@ -7,6 +7,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.speculative import (  # noqa: E501
     ReplayHistory,
+    prepared_verify_delta,
     reset_replay,
     verify_convolution,
     verify_delta,
@@ -101,3 +102,97 @@ def test_reset_replay(cell, certifying):
     reset_replay(slots, actual[:, 0], actual[:, 1])
     reset_replay.reference(slots, expected[:, 0], expected[:, 1])
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("cell", prepared_verify_delta.CELLS, ids=lambda cell: cell.why)
+def test_prepared_verify(cell, certifying):
+    """Shared Q/K and gates preserve the accepted first row and both logs."""
+    torch.manual_seed(453)
+    seqs, width, accepted = (cell.spec[k] for k in ("seqs", "tokens", "accepted"))
+    slots = _int(list(range(seqs - 1, -1, -1)))
+    replacements = _int(list(range(seqs)))
+    projection = _rand(seqs * width, 16384)
+    ba = _rand(seqs * width, 96)
+    weight = _rand(10240, 1, 4)
+    a_log, dt = _rand(48, dtype=torch.float32), _rand(48)
+    conv = _rand(seqs * 2, 10240, 3)[::2]
+    windows = _rand(seqs * 2, width + 1, 10240, 3)[::2]
+    expected_windows = windows.clone()
+    separate_windows = windows.clone()
+    state = _rand(seqs * 2, 48, 128, 128, dtype=torch.float32)[::2].mul_(0.025)
+    expected_state = state.clone()
+    separate_state = state.clone()
+    meta = torch.zeros(seqs, 4, device="cuda", dtype=torch.int32)
+    meta[:, 0] = accepted
+    meta[::2, 1] = 1
+    history = ReplayHistory(
+        meta[:, 0],
+        meta[:, 1],
+        _rand(seqs, 2, 7, 48, 128, dtype=torch.float32)
+        .mul_(0.05)
+        .view(torch.bfloat16)
+        .view(seqs, 2, 14, 48, 128),
+        _rand(seqs, 2, 7, 16, 128, dtype=torch.float32)
+        .mul_(0.05)
+        .view(torch.bfloat16)
+        .view(seqs, 2, 14, 16, 128),
+        _rand(seqs, 2, 48, 14, dtype=torch.float32).sigmoid_(),
+    )
+    expected = ReplayHistory(*(tensor.clone() for tensor in history))
+    separate = ReplayHistory(*(tensor.clone() for tensor in history))
+    certifying(prepared_verify_delta)
+    y = prepared_verify_delta(
+        projection,
+        weight,
+        conv,
+        windows,
+        replacements,
+        ba,
+        a_log,
+        dt,
+        state,
+        slots,
+        replacements,
+        history,
+        width,
+    )
+    convolved = verify_convolution(
+        projection, weight, conv, separate_windows, slots, replacements, width
+    )
+    separate_out = verify_delta(
+        convolved, ba, a_log, dt, separate_state, slots, replacements, separate, width
+    )
+    for actual, want in zip(
+        (y, windows, state, *history),
+        (separate_out, separate_windows, separate_state, *separate),
+        strict=True,
+    ):
+        # The two history fields use BF16 storage for packed FP32 words.
+        if actual is history.value or actual is history.key:
+            actual, want = actual.view(torch.float32), want.view(torch.float32)
+        torch.testing.assert_close(actual, want, atol=0, rtol=0)
+    ref = prepared_verify_delta.reference(
+        projection,
+        weight,
+        conv,
+        expected_windows,
+        replacements,
+        ba,
+        a_log,
+        dt,
+        expected_state,
+        slots,
+        replacements,
+        expected,
+        width,
+    )
+    # The Torch reference's unfused convolution differs by one BF16
+    # value at one output (0.00510 of that row's peak).
+    assert_within_ulp(y, ref, 2.0, 0.5)
+    torch.testing.assert_close(windows, expected_windows, atol=0, rtol=0)
+    torch.testing.assert_close(state, expected_state, atol=3e-6, rtol=2e-5)
+    for a, b in zip(history[2:4], expected[2:4], strict=True):
+        torch.testing.assert_close(
+            a.view(torch.float32), b.view(torch.float32), atol=3e-6, rtol=2e-5
+        )
+    torch.testing.assert_close(history.decay, expected.decay, atol=3e-6, rtol=2e-5)

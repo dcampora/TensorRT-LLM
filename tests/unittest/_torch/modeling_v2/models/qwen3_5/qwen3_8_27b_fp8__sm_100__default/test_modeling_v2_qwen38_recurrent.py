@@ -11,6 +11,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp
     causal_convolution,
     delta_gates,
     gated_head_norm,
+    prefill_convolution_qkv,
     recurrent_delta,
     short_context_delta,
 )
@@ -124,3 +125,33 @@ def test_gated_head_norm(cell, certifying):
     args = (_rand(rows, 48, 128), _rand(rows, 16384), _rand(128))
     certifying(gated_head_norm)
     assert_within_ulp(gated_head_norm(*args), gated_head_norm.reference(*args), 1.0, 0.5)
+
+
+@pytest.mark.parametrize("cell", prefill_convolution_qkv.CELLS, ids=lambda cell: cell.why)
+def test_prefill_convolution_qkv(cell, certifying):
+    """Parallel temporal tiles keep request boundaries and old convolution taps."""
+    torch.manual_seed(398)
+    lengths = cell.spec["lengths"]
+    rows, sequences = sum(lengths), len(lengths)
+    device = "cuda"
+    offsets = torch.tensor(
+        [sum(lengths[:i]) for i in range(sequences + 1)], device=device, dtype=torch.int32
+    )
+    ids = torch.tensor(
+        [i for i, n in enumerate(lengths) for _ in range(n)], device=device, dtype=torch.int32
+    )
+    slots = torch.arange(sequences - 1, -1, -1, device=device, dtype=torch.int32)
+    has_initial = torch.arange(sequences, device=device).remainder(2).bool()
+    projection = torch.randn((rows, 16384), device=device, dtype=torch.bfloat16)
+    weight = torch.randn((10240, 1, 4), device=device, dtype=torch.bfloat16)
+    state = torch.randn((2 * sequences, 10240, 3), device=device, dtype=torch.bfloat16)[::2]
+    expected = state.clone()
+    certifying(prefill_convolution_qkv)
+    output = prefill_convolution_qkv(projection, weight, state, slots, offsets, ids, has_initial)
+    ref = prefill_convolution_qkv.reference(
+        projection, weight, expected, slots, offsets, ids, has_initial
+    )
+    for actual, want in zip(output, ref, strict=True):
+        assert actual.is_contiguous()
+        assert_within_ulp(actual, want, 1.0, 0.5)
+    torch.testing.assert_close(state, expected, atol=0, rtol=0)

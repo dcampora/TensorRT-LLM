@@ -42,10 +42,17 @@ from .ops.recurrent import (
     causal_convolution,
     delta_gates,
     gated_head_norm,
+    prefill_convolution_qkv,
     recurrent_delta,
     short_context_delta,
 )
-from .ops.speculative import ReplayHistory, reset_replay, verify_convolution, verify_delta
+from .ops.speculative import (
+    ReplayHistory,
+    prepared_verify_delta,
+    reset_replay,
+    verify_convolution,
+    verify_delta,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -296,23 +303,36 @@ class DecoderLayer(nn.Module):
             else:
                 ba = F.linear(x[:split], self.ba)
 
-            convolved = causal_convolution(
-                p[:split],
-                self.conv,
-                conv_state,
-                step.context_slots,
-                step.context_offsets,
-                mamba.seq_idx,
-                mamba.has_initial_states,
-            )
+            convolved = None
+            if short is not None:
+                convolved = causal_convolution(
+                    p[:split],
+                    self.conv,
+                    conv_state,
+                    step.context_slots,
+                    step.context_offsets,
+                    mamba.seq_idx,
+                    mamba.has_initial_states,
+                )
             decay, beta = delta_gates(ba, self.a_log, self.dt_bias)
-            assert step.context_lengths is not None
+            assert step.context_lengths is not None and step.context_offsets is not None
             max_length = max(step.context_lengths)
             if short is None or short.rows is not None:
-                q, k, v = (
-                    t.contiguous().view(split, -1, 128)
-                    for t in convolved.split((2048, 2048, 6144), dim=1)
-                )
+                if convolved is None:
+                    q, k, v = prefill_convolution_qkv(
+                        p[:split],
+                        self.conv,
+                        conv_state,
+                        step.context_slots,
+                        step.context_offsets,
+                        mamba.seq_idx,
+                        mamba.has_initial_states,
+                    )
+                else:
+                    q, k, v = (
+                        t.contiguous().view(split, -1, 128)
+                        for t in convolved.split((2048, 2048, 6144), dim=1)
+                    )
                 context, _ = chunk_gated_delta_rule(
                     q,
                     k,
@@ -333,6 +353,7 @@ class DecoderLayer(nn.Module):
                     gate_domain="log",
                 )
             if short is not None:
+                assert convolved is not None
                 short_out = short_context_delta(
                     short.select(convolved),
                     short.select(decay),
@@ -377,19 +398,6 @@ class DecoderLayer(nn.Module):
         cache = manager.mamba_layer_cache(self.index)
         slots = step.generation_slots
         replay_slots = mamba.replay_state_indices[context : step.metadata.num_seqs]
-        direct = step.predicted == 1
-        if direct:
-            qkv = causal_convolution(projection, self.conv, cache.conv, slots)
-        else:
-            qkv = verify_convolution(
-                projection,
-                self.conv,
-                cache.conv,
-                cache.intermediate_conv_window,
-                slots,
-                manager.intermediate_state_indices[: slots.numel()],
-                step.predicted,
-            )
         history = ReplayHistory(
             replay.prev_num_accepted_tokens,
             replay.cache_buf_idx,
@@ -397,6 +405,35 @@ class DecoderLayer(nn.Module):
             cache.old_B,
             cache.old_dt,
         )
+        if step.predicted == 1:
+            qkv = causal_convolution(projection, self.conv, cache.conv, slots)
+        else:
+            temporary_slots = manager.intermediate_state_indices[: slots.numel()]
+            if slots.numel() >= 16:
+                return prepared_verify_delta(
+                    projection,
+                    self.conv,
+                    cache.conv,
+                    cache.intermediate_conv_window,
+                    temporary_slots,
+                    ba,
+                    self.a_log,
+                    self.dt_bias,
+                    cache.temporal,
+                    slots,
+                    replay_slots,
+                    history,
+                    step.predicted,
+                )
+            qkv = verify_convolution(
+                projection,
+                self.conv,
+                cache.conv,
+                cache.intermediate_conv_window,
+                slots,
+                temporary_slots,
+                step.predicted,
+            )
         return verify_delta(
             qkv,
             ba,

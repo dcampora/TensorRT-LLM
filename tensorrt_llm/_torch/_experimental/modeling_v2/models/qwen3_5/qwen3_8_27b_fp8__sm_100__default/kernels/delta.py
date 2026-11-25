@@ -294,3 +294,104 @@ def convolution(
             block,
         )
     return output
+
+
+@tr.jit(do_not_specialize=["ROWS"])
+def _prefill_conv_tiled(
+    X,
+    W,
+    CONV,
+    SLOTS,
+    START,
+    ROW_TO_SEQ,
+    HAS_INITIAL,
+    Q,
+    K,
+    V,
+    ROWS,
+    XS: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    TOKENS: tl.constexpr,
+    CHANNELS: tl.constexpr,
+):
+    row = tl.program_id(0) * TOKENS + tl.arange(0, TOKENS)
+    first = tl.program_id(1) * CHANNELS
+    col = first + tl.arange(0, CHANNELS)
+    valid = row < ROWS
+    seq = tl.load(ROW_TO_SEQ + row, valid, 0)
+    slot = tl.load(SLOTS + seq, valid, -1).to(tl.int64)
+    begin = tl.load(START + seq, valid, 0)
+    has_initial = tl.load(HAS_INITIAL + seq, valid, 0)
+    history = CONV + slot[:, None] * SLOT_STRIDE + col[None, :] * 3
+    accum = tl.full((TOKENS, CHANNELS), 0, tl.float32)
+    for tap in tl.static_range(4):
+        source = row + tap - 3
+        within = source >= begin
+        value = tl.load(X + source[:, None] * XS + col[None, :], (valid & within)[:, None], 0).to(
+            tl.float32
+        )
+        if tap < 3:
+            carry = tl.load(
+                history + (source - begin + 3)[:, None],
+                (valid & ~within & (slot >= 0) & has_initial)[:, None],
+                0,
+            ).to(tl.float32)
+            value = value + carry
+        weight = tl.load(W + col * 4 + tap).to(tl.float32)
+        accum = tl.fma(value, weight[None, :], accum)
+    out = tl.div_rn(accum, 1 + libdevice.exp(-accum))
+    if first < 2048:
+        tl.store(Q + row[:, None] * 2048 + col[None, :], out, valid[:, None])
+    elif first < 4096:
+        tl.store(K + row[:, None] * 2048 + col[None, :] - 2048, out, valid[:, None])
+    else:
+        tl.store(V + row[:, None] * 6144 + col[None, :] - 4096, out, valid[:, None])
+
+
+def prefill_convolution_qkv(
+    projection: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    slots: torch.Tensor,
+    offsets: torch.Tensor,
+    row_to_seq: torch.Tensor,
+    has_initial: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply a temporal convolution tile and write separate Q, K and V heads.
+
+    Adapted from aegis-engines kernels.py (114cf57c911e). Publish history
+    separately so a tile reading the initial window always sees the old state.
+    """
+    rows = projection.shape[0]
+    q, k = (projection.new_empty((rows, 16, 128)) for _ in range(2))
+    v = projection.new_empty((rows, 48, 128))
+    _prefill_conv_tiled[(tr.cdiv(rows, 16), 80)](
+        projection,
+        weight,
+        state,
+        slots,
+        offsets,
+        row_to_seq,
+        has_initial,
+        q,
+        k,
+        v,
+        rows,
+        projection.stride(0),
+        state.stride(0),
+        16,
+        128,
+        num_warps=4,
+    )
+    _commit_conv[(slots.numel(), 80)](
+        projection,
+        state,
+        slots,
+        offsets,
+        has_initial,
+        10240,
+        projection.stride(0),
+        state.stride(0),
+        128,
+    )
+    return q, k, v

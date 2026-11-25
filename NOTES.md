@@ -404,3 +404,75 @@ and 128.
 | 1 | 128 | 1024 | 61.56 | 3.709 | 269.58 |
 | 1 | 1024 | 1024 | 65.92 | 3.505 | 285.33 |
 | 1 | 4096 | 1024 | 141.69 | 3.825 | 261.46 |
+
+The mixed HTTP checks at concurrency 4, 32, and 128 matched every
+isolated short continuation. The packed-QKV streaming sweep measured
+289.34, 3881.50 and 6593.92 output tokens/s at concurrency 1, 32 and 128
+with ISL 1024 and OSL 1024.
+
+## Batched recurrent inputs and temporal convolution
+
+The batched verifier follows aegis-engines' rolling convolution and
+prepared GDN recurrence. Each Q/K head is normalized once per input row,
+and each value head writes its FP32 beta and decay once. The physical
+convolution windows and the manager's double-buffered history keep the
+same layouts. The isolated four-row verifier at batch 32 went from 117
+to 103 us. The two-row verifier at batch 128 went from 235 to 216 us.
+Outputs, FP32 states, and tentative histories matched exactly. Wider
+Gluon CTA layouts raised the batch-128 latency. The earlier verifier is
+used for small batches, where shared preparation lowered throughput.
+
+Long prefill uses the temporal convolution tile from aegis-engines
+`kernels.py`, writing Q, K and V directly into FlashInfer's three input
+tensors. A separate pass commits the convolution taps so every tile
+reads the prior window when a context chunk continues an existing
+request. The isolated layer took 33.81 us for 1,024 rows, 122.95 us
+for 4,096 rows, and 239.15 us for eight 1,024-token sequences. The prior
+path took 101.26, 395.58, and 781.20 us. Every output and convolution
+state entry matched. The B200 accuracy test list follows the target directory.
+The mixed-prompt regression can run with the checkpoint alone. The
+protocol test also uses the supplied development oracle.
+
+All 70 operation tests and all 32 development oracle items passed.
+The score metrics stayed at KL 0.003288 and 99.909% non-tie top-1
+agreement.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 58.87 | 3.697 | 270.52 |
+| 1 | 1024 | 1024 | 48.58 | 3.539 | 282.57 |
+| 1 | 4096 | 1024 | 137.84 | 3.809 | 262.55 |
+
+The OpenAI endpoint matched isolated development continuations at
+concurrency 1, 32, and 128, including short requests in mixed batches.
+Among the nine additional 64-output chats, a 1,024-input prompt returned
+a different token at concurrency 32 where solo scoring separated the
+leading logits by 0.625 nats. The other first differences in that mixed
+HTTP sweep were below 0.5 nats.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 292.52 | 62.00 |
+| 1024 | 1024 | 32 | 32 | 3993.39 | 831.84 |
+| 1024 | 1024 | 128 | 128 | 6797.90 | 2538.36 |
+
+Changing only `modeling_v2` to `'off'` in the serving YAML reached
+the Modeling V1 CUDA-graph capture and raised `GDN replay does not
+support dynamic draft length yet: 2 != 4`. The earlier Modeling V1
+results use its non-speculative configuration.
+
+## Batch-1 draft-width pilot
+
+The pilot used the packed-QKV build, the production generate handler,
+and one LLM executor. Each run used the same prompt for a given ISL and
+measured output tokens 33 through 1024. The suffix automaton trial used
+a four-token minimum match. Its lookup overhead and draft choices
+lowered throughput at all three lengths.
+
+| Draft tokens | Suffix automaton | OSL | ISL 128 tokens/s | ISL 1024 tokens/s | ISL 4096 tokens/s |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 3 | Disabled | 1024 | 269.74 | 284.64 | 262.77 |
+| 4 | Disabled | 1024 | 288.96 | 288.78 | 273.47 |
+| 5 | Disabled | 1024 | 296.49 | 292.91 | 264.87 |
+| 6 | Disabled | 1024 | 310.97 | 289.36 | 248.87 |
+| 5 | Minimum match 4 | 1024 | 274.17 | 283.66 | 255.81 |

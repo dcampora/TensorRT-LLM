@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from .....catalog._op import Arch, Cell, OpWrapper
-from ..kernels import verify
+from ..kernels import prepared_verify, verify
 
 
 class ReplayHistory(NamedTuple):
@@ -182,3 +182,73 @@ class ResetReplay(OpWrapper):
 verify_convolution = VerifyConvolution()
 verify_delta = VerifyDelta()
 reset_replay = ResetReplay()
+
+
+class PreparedVerifyDelta(OpWrapper):
+    """Convolve a draft chain while sharing normalized heads across state tiles."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("Four-row verifier across both replay banks", dict(seqs=16, tokens=4, accepted=4)),
+        Cell("Two-row verifier across strided physical slots", dict(seqs=64, tokens=2, accepted=2)),
+    )
+
+    def __call__(
+        self,
+        projection,
+        weight,
+        conv,
+        windows,
+        temporary_slots,
+        ba,
+        a_log,
+        dt,
+        state,
+        slots,
+        replay_slots,
+        history,
+        tokens,
+    ) -> torch.Tensor:
+        query_key, value, gates = prepared_verify.prepare_convolution(
+            projection, weight, conv, windows, slots, temporary_slots, ba, a_log, dt, tokens
+        )
+        return prepared_verify.replay_prepared(
+            query_key,
+            value,
+            gates,
+            state,
+            slots,
+            replay_slots,
+            history.count,
+            history.bank,
+            history.value,
+            history.key,
+            history.decay,
+            tokens,
+        )
+
+    def reference(
+        self,
+        projection,
+        weight,
+        conv,
+        windows,
+        temporary_slots,
+        ba,
+        a_log,
+        dt,
+        state,
+        slots,
+        replay_slots,
+        history,
+        tokens,
+    ) -> torch.Tensor:
+        convolved = verify_convolution.reference(
+            projection, weight, conv, windows, slots, temporary_slots, tokens
+        )
+        return verify_delta.reference(
+            convolved, ba, a_log, dt, state, slots, replay_slots, history, tokens
+        )
+
+
+prepared_verify_delta = PreparedVerifyDelta()

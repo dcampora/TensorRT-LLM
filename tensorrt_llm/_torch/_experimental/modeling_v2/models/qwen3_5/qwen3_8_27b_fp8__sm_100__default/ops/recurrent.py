@@ -57,6 +57,31 @@ class CausalConvolution(OpWrapper):
         return torch.cat(parts)
 
 
+class PrefillConvolutionQkv(OpWrapper):
+    """Convolve prefill rows directly into FlashInfer's three attention inputs."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("Fresh and continued contexts in overlapping time tiles", dict(lengths=(3, 100, 33))),
+        Cell("Long prefill with independent cache slots", dict(lengths=(1024, 27))),
+    )
+
+    def __call__(self, projection, weight, state, slots, offsets, row_to_seq, has_initial):
+        return delta.prefill_convolution_qkv(
+            projection, weight, state, slots, offsets, row_to_seq, has_initial
+        )
+
+    def reference(self, projection, weight, state, slots, offsets, row_to_seq, has_initial):
+        packed = causal_convolution.reference(
+            projection, weight, state, slots, offsets, row_to_seq, has_initial
+        )
+        rows = projection.shape[0]
+        return tuple(
+            head.contiguous().view(rows, -1, 128)
+            for head in packed.split((2048, 2048, 6144), dim=1)
+        )
+
+
 class DeltaGates(OpWrapper):
     """Compute log decay and BF16-rounded beta from contiguous [beta, decay] logits."""
 
@@ -218,6 +243,7 @@ class GatedHeadNorm(OpWrapper):
 
 
 causal_convolution = CausalConvolution()
+prefill_convolution_qkv = PrefillConvolutionQkv()
 delta_gates = DeltaGates()
 recurrent_delta = RecurrentDelta()
 short_context_delta = ShortContextDelta()

@@ -26,20 +26,28 @@ def _kl(row: list[list[int | float]], logprobs: list[float]) -> float:
 
 
 @pytest.fixture(scope="module")
-def model_and_oracle() -> tuple[Path, dict]:
+def model_path() -> Path:
+    root = os.environ.get("LLM_MODELS_ROOT")
+    if not root:
+        pytest.skip("Set LLM_MODELS_ROOT to the directory containing the FP8 checkpoint")
+    model = Path(root) / os.environ.get("QWEN38_FP8_MODEL_DIR", "Qwen3.8-27B-FP8")
+    if not (model / "config.json").is_file():
+        pytest.skip(f"Qwen3.8-27B FP8 checkpoint unavailable at {model}")
+    return model
+
+
+@pytest.fixture(scope="module")
+def dev_oracle() -> dict:
     oracle_path = os.environ.get("QWEN38_DEV_ORACLE")
     if not oracle_path:
         pytest.skip("Set QWEN38_DEV_ORACLE to the development oracle JSON")
-    model = Path(os.environ["LLM_MODELS_ROOT"]) / os.environ.get(
-        "QWEN38_FP8_MODEL_DIR", "Qwen3.8-27B-FP8"
-    )
-    return model, json.loads(Path(oracle_path).read_text())
+    return json.loads(Path(oracle_path).read_text())
 
 
-def test_qwen38_fp8_dev_oracle(model_and_oracle: tuple[Path, dict]) -> None:
+def test_qwen38_fp8_dev_oracle(model_path: Path, dev_oracle: dict) -> None:
     """Check normalized scores and every first greedy divergence."""
-    model, oracle = model_and_oracle
-    root = Path(__file__).resolve().parents[6]
+    model, oracle = model_path, dev_oracle
+    root = Path(__file__).resolve().parents[7]
     eos = json.loads((model / "generation_config.json").read_text())["eos_token_id"]
     eos_ids = {eos} if isinstance(eos, int) else set(eos)
     vocab_size = json.loads((model / "config.json").read_text())["text_config"]["vocab_size"]
@@ -124,16 +132,25 @@ def test_qwen38_fp8_dev_oracle(model_and_oracle: tuple[Path, dict]) -> None:
     assert not failures
 
 
-def test_qwen38_fp8_mixed_prefill(model_and_oracle: tuple[Path, dict]) -> None:
+def test_qwen38_fp8_mixed_prefill(model_path: Path) -> None:
     """Keep short prompt arithmetic when a long request shares the step."""
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import KvCacheConfig
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
-    model, oracle = model_and_oracle
-    short = oracle["items"][28]["prompt_ids"]
-    long_a = (oracle["items"][0]["seq_ids"] * 32)[:1024]
-    long_b = (oracle["items"][1]["seq_ids"] * 32)[:1024]
+    model = model_path
+    if oracle_path := os.environ.get("QWEN38_DEV_ORACLE"):
+        oracle = json.loads(Path(oracle_path).read_text())["items"]
+        short = oracle[28]["prompt_ids"]
+        long_a = (oracle[0]["seq_ids"] * 32)[:1024]
+        long_b = (oracle[1]["seq_ids"] * 32)[:1024]
+    else:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model)
+        short = tokenizer.encode("Explain how a paged KV cache reuses memory across requests.")
+        long_a = tokenizer.encode("Compare cache latency and memory bandwidth. " * 256)[:1024]
+        long_b = tokenizer.encode("Describe one advantage of a streaming scheduler. " * 256)[:1024]
     llm = LLM(
         model,
         modeling_v2="require",
