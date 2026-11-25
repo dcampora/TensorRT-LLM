@@ -96,6 +96,7 @@ def attention(
     NS: tl.constexpr,
     PROB_SCALE: tl.constexpr,
     WIDTH: tl.constexpr = 1,
+    SHORT_LIMIT: tl.constexpr = 0,
 ):
     block, h, request = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     qrow = tl.arange(0, BQ)
@@ -127,6 +128,8 @@ def attention(
             qpos = tl.load(Pos + first + token, token < WIDTH, 0)
             qidx = (first + token) * 16 + h * 8 + (qrow % 8)
         active = start < length
+        if SHORT_LIMIT:
+            active &= length <= SHORT_LIMIT
     if active:
         if PREFILL:
             valid = qoffset < length
@@ -199,3 +202,34 @@ def attn_reduce(
         fp8 = output.to(tl.bfloat16).to(tl.float32) * (1.0 / tl.load(Scale))
         output = tl.minimum(tl.maximum(fp8, -448.0), 448.0)
     tl.store(Y + row * 256 + d, output)
+
+
+@tr.jit
+def mixed_decode_gate(
+    Part,
+    Stats,
+    Native,
+    Pos,
+    Gate,
+    Scale,
+    Y,
+    WIDTH: tl.constexpr,
+    SHORT_LIMIT: tl.constexpr,
+    QUANT: tl.constexpr,
+):
+    block = tl.program_id(0)
+    row = block // 4
+    last = (row // WIDTH + 1) * WIDTH - 1
+    col = block % 4 * 1024 + tl.arange(0, 1024)
+    offset = row * 4096 + col
+    if tl.load(Pos + last) + 1 <= SHORT_LIMIT:
+        total = tl.load(Stats + (row * 16 + col // 256) * 2 + 1)
+        value = (tl.load(Part + offset) / total).to(tl.bfloat16).to(tl.float32)
+    else:
+        value = tl.load(Native + offset).to(tl.float32)
+    gate = tl.load(Gate + offset).to(tl.float32)
+    output = value * tl.sigmoid(gate)
+    if QUANT:
+        scaled = output.to(tl.bfloat16).to(tl.float32) * (1.0 / tl.load(Scale))
+        output = tl.minimum(tl.maximum(scaled, -448.0), 448.0)
+    tl.store(Y + offset, output)

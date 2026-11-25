@@ -281,12 +281,17 @@ def test_gated_attention(cell, certifying):
     native = cell.spec.get("native", False)
     ctx = (128 if native else 3) if cell.spec["context"] else 0
     width = cell.spec["width"]
+    batch = cell.spec.get("batch", 2)
     if ctx:
         positions = list(range(40, 40 + ctx)) + [303]
         requests = [0] * ctx + [1]
     else:
-        positions = list(range(166 - width, 166)) + list(range(304 - width, 304))
-        requests = [0] * width + [1] * width
+        ends = (166, 304)
+        positions = [
+            pos for row in range(batch) for pos in range(ends[row % 2] - width, ends[row % 2])
+        ]
+        requests = [row for row in range(batch) for _ in range(width)]
+        table = table.repeat((batch // 2, 1, 1))
     q = fixture_rand((len(positions), 16, 256), FP8)
     gate = fixture_rand((len(positions), 4096))
     step = SimpleNamespace(
@@ -294,7 +299,7 @@ def test_gated_attention(cell, certifying):
         request_rows=torch.tensor(requests, device=DEV, dtype=torch.int32),
         context_tokens=ctx,
         contexts=int(bool(ctx)),
-        batch=2,
+        batch=batch,
         max_context=ctx,
         cu=torch.tensor([0, ctx], device=DEV) if ctx else None,
         capacity=512,
@@ -309,8 +314,17 @@ def test_gated_attention(cell, certifying):
     )
     context = attention.paged_context_inputs(step) if native else None
     decode = step.positions[width - 1 :: width] + 1 if native_decode else None
-    args = (q, gate, storage, table, step, scale, workspace, context, decode)
+    short_local = cell.spec.get("keep_short_local", False)
+    base = (q, gate, storage, table, step, scale, workspace, context)
+    args = (*base, decode, short_local)
     output, reference = op(*args).float(), op.reference(*args).float()
+    if short_local:
+        local = op(*base)
+        native_result = op(*base, decode)
+        ids = torch.arange(batch * width, device=DEV) // width
+        short = ids % 2 == 0
+        torch.testing.assert_close(output[short], local.float()[short], rtol=0, atol=0)
+        torch.testing.assert_close(output[~short], native_result.float()[~short], rtol=0, atol=0)
     relative_l2 = (output - reference).norm() / reference.norm()
     # Quantizing the online softmax probabilities and then the gated output
     # adds two E4M3 roundings. A missing sigmoid exceeds this tolerance by

@@ -600,3 +600,109 @@ at 128. The combined change was set aside for isolated retesting.
 | 1024 | 1024 | 1 | 667.9 |
 | 1024 | 1024 | 32 | 6427.8 |
 | 1024 | 1024 | 128 | 10400.4 |
+
+## Modeling V1 with matched speculative settings
+
+The initial V1 baseline used ordinary greedy decode. I repeated the
+full HTTP sweep with `modeling_v2=off`, three MTP proposals, the same
+generation CUDA graph sizes, the same breakable prefill graph settings,
+and the same scheduler and cache settings used by V2. V1 ran the
+checkpoint with its stock CUTLASS NVFP4 expert path. The first MTP
+autotune took 285 seconds to populate the tactic cache. The table
+includes only the externally timed requests.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 16 | 456.9 | 36.02 | 2.169 |
+| 1024 | 1024 | 2 | 16 | 795.0 | 54.06 | 2.395 |
+| 1024 | 1024 | 4 | 16 | 1440.4 | 72.44 | 2.658 |
+| 1024 | 1024 | 8 | 32 | 2260.4 | 84.55 | 3.269 |
+| 1024 | 1024 | 16 | 64 | 3495.3 | 95.64 | 4.335 |
+| 1024 | 1024 | 32 | 128 | 5622.7 | 109.82 | 5.293 |
+| 1024 | 1024 | 64 | 256 | 9045.9 | 130.79 | 6.753 |
+| 1024 | 1024 | 128 | 512 | 12371.3 | 189.07 | 9.773 |
+| 4096 | 1024 | 1 | 16 | 446.6 | 68.24 | 2.154 |
+| 4096 | 1024 | 8 | 32 | 2116.3 | 130.38 | 3.501 |
+| 4096 | 1024 | 32 | 128 | 4620.5 | 226.99 | 6.284 |
+
+The prompt corpus is the concatenation of the checkout's
+`CODING_GUIDELINES.md`, developer-guide `overview.md`,
+`perf-benchmarking.md`, and `perf-analysis.md`, and feature guides
+`quantization.md`, `kvcache.md`, and `parallel-strategy.md`, in that
+order. I passed it to `/task/bench_serving.py --passage`, with 16
+minimum requests and four requests per concurrent client.
+
+## Split-K router and FlashInfer ring trials
+
+A tensor-core router accumulated sixteen 128-column BF16 partials
+and fused their final reduction with expert selection. The four-row
+probe found six BF16 differences in 41,120 scores compared with
+cuBLAS and no top-eight expert ID differences. The engine passed all
+32 oracle items and HTTP passed both comparisons at concurrency 1,
+32, and 128. The external sweep also found a strict difference at
+96 that the preceding run had passed. Across the two chat seeds,
+batch-1 throughput varied with the generated continuation.
+
+FlashInfer's native GDN ring took 6.36, 19.85, and 62.73 microseconds
+at batches 1, 32, and 128 at verification width four on a strided
+pool. The trial used BF16 recurrent anchors and the runtime manager's
+32-row key and update rings. Scoring metrics stayed unchanged.
+One engine continuation diverged at the 0.5-nat boundary and broad
+HTTP parity regressed. The native wrapper specializes in the number
+of requests for the runtime's strided pools. The serving trial also
+had substantially higher tail latency during the measured sweep.
+
+| ISL | OSL | HTTP concurrency | Split-K router (output tokens/s) | Native GDN ring (output tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 680.7 | 657.0 |
+| 1024 | 1024 | 32 | 6688.3 | 4485.5 |
+| 1024 | 1024 | 128 | 10586.8 | 6121.4 |
+
+## Recurrent anchor precision and proposal depth
+
+Storing the recurrent anchors in FP16 while retaining the local replay
+kernels left the scoring metrics unchanged. It produced three strict
+engine generation differences with reference margins of 0.75, 0.50,
+and 0.625 nats. HTTP throughput was 686.9, 6204.8, and 10350.3 output
+tokens/s at concurrency 1, 32, and 128 on ISL 1024 and OSL 1024. The
+target retains the FP32 recurrent anchors.
+
+Fixed MTP depths two, four, and five each had one strict generation
+difference at the same 0.5-nat margin in the 32-item engine oracle.
+Depth six passed, but the two chat seeds traded throughput across
+input lengths. The batch-1 default remains three proposals.
+
+| ISL | OSL | Chat seed | Three proposals (decode tokens/s) | Six proposals (decode tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 100 | 666.9 | 641.2 |
+| 1024 | 1024 | 100 | 760.6 | 813.6 |
+| 4096 | 1024 | 100 | 677.3 | 701.0 |
+| 128 | 1024 | 133 | 714.4 | 622.4 |
+| 1024 | 1024 | 133 | 628.8 | 708.9 |
+| 4096 | 1024 | 133 | 698.6 | 703.7 |
+
+Both depth columns used the same experimental split-K router. In the
+three-proposal, seed-133, ISL-1024 cell, one repeat was slow while worktree
+files were being prepared. Both repeats produced the same continuation.
+
+## Native paged attention for wide decode
+
+Wide CUDA graphs use FlashInfer's FP8 paged decode for long prefixes.
+The local FP8 split kernel still evaluates prefixes of up to 256 tokens.
+One epilogue selects each request's attention output and folds the sigmoid
+gate and checkpoint-scale FP8 cast into the same launch. The MTP layer
+enables the wide path from batch 48. A mixed-prefix operation fixture
+checks the local values bitwise and compares the full result to direct
+attention.
+
+All 32 engine prompts passed with mean KL 0.005972 and confident top-1
+agreement of 99.726%. The server started and passed both greedy checks at
+concurrency 1, 2, 4, 32, 96, and 128. Strict differences also appeared in
+some intermediate-concurrency tests. The quick sweep used 4, 64, and 256
+measured requests for concurrency 1, 32, and 128 respectively.
+
+| ISL | OSL | HTTP concurrency | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 669.8 | 24.87 |
+| 1024 | 1024 | 32 | 6427.1 | 222.00 |
+| 1024 | 1024 | 128 | 10707.4 | 311.76 |

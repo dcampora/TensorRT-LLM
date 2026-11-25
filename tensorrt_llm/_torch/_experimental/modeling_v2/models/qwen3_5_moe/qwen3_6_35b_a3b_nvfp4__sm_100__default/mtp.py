@@ -18,7 +18,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_tail_kernels import strict_accept
 
-from .ops.attention import gated_attention, prepare_qkv
+from .ops.attention import gated_attention, paged_decode_lengths, prepare_qkv
 from .ops.draft import draft_input_norm, draft_moe
 from .ops.moe import residual_rms_norm
 from .weights import EXPERT_WIDTH, HIDDEN, NUM_EXPERTS, VOCAB, parameter
@@ -43,7 +43,7 @@ class DraftLayer(nn.Module):
         self.shared_gate = parameter((2 * EXPERT_WIDTH, HIDDEN))
         self.shared_down = parameter((HIDDEN, EXPERT_WIDTH))
 
-    def forward(self, ids, hidden, step, rows, embedding, kv, table, rope, bins, side):
+    def forward(self, ids, hidden, step, rows, embedding, kv, table, rope, bins, side, workspace):
         prepared = draft_input_norm(ids, embedding, hidden, self.embedding_norm, self.hidden_norm)
         x = torch.mm(prepared, self.fc.T)
         residual = torch.empty_like(x)
@@ -73,7 +73,8 @@ class DraftLayer(nn.Module):
                 max_context=0,
                 cu=None,
             )
-        attention = gated_attention(q, gate, kv, table, step, None)
+        lengths = paged_decode_lengths(step, min_batch=48)
+        attention = gated_attention(q, gate, kv, table, step, None, workspace, paged_decode=lengths)
         x = torch.mm(attention, self.output.T)
         x = residual_rms_norm(x, residual, self.before_moe, True, True)
         x = draft_moe(
@@ -199,7 +200,15 @@ def draft_chain(input_ids, hidden, step, md, spec, draft_layer, head, decoder, a
     table = (md.draft_kv_cache_block_offsets if separate else md.kv_cache_block_offsets)[pool]
     drafts = []
     vocab = min(VOCAB, 65536 if step.batch >= 96 else 131072)
-    args = (decoder.embed_tokens.weight, kv, table, decoder.rope, decoder.bins, decoder.side)
+    args = (
+        decoder.embed_tokens.weight,
+        kv,
+        table,
+        decoder.rope,
+        decoder.bins,
+        decoder.side,
+        decoder.attention_workspace,
+    )
     hidden = draft_layer(ids, hidden, step, rows, *args)
     tokens = head.projector.top1(hidden, vocab).int()
     drafts.append(tokens)

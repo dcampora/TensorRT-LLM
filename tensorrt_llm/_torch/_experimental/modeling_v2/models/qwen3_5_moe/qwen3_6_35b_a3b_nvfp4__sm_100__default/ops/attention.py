@@ -87,9 +87,9 @@ class PrepareQkv(OpWrapper):
 prepare_qkv = PrepareQkv()
 
 
-def paged_decode_lengths(step) -> torch.Tensor | None:
+def paged_decode_lengths(step, *, min_batch=16) -> torch.Tensor | None:
     batch = step.batch - step.contexts
-    if not 16 <= batch <= 32:
+    if batch < min_batch or step.width > 4:
         return None
     tails = step.positions[step.context_tokens + step.width - 1 :: step.width]
     return tails.to(torch.int32) + 1
@@ -176,6 +176,16 @@ class GatedAttention(OpWrapper):
             "native FP8 decode with independent K and V pages",
             {"context": False, "width": 3, "native_decode": True},
         ),
+        Cell(
+            "local attention for a short prefix and native FMHA for a long prefix",
+            {
+                "context": False,
+                "width": 4,
+                "native_decode": True,
+                "keep_short_local": True,
+                "batch": 10,
+            },
+        ),
     )
 
     def __call__(
@@ -189,6 +199,7 @@ class GatedAttention(OpWrapper):
         workspace=None,
         paged_context=None,
         paged_decode=None,
+        keep_short_local=False,
     ):
         ctx = step.context_tokens
         m = q.shape[0]
@@ -232,12 +243,14 @@ class GatedAttention(OpWrapper):
             )
         if m > ctx:
             q, gate = q[ctx:], gate[ctx:]
+            native = None
             if paged_decode is not None and kv.shape[-2] == 32:
-                y = _native_decode(q, kv, table, step, workspace, paged_decode)
-                k.attn_gate[(triton.cdiv(y.numel(), 1024),)](
-                    y, gate, attention[ctx:], y.numel(), 1024, output_scale, quantized
-                )
-                return attention
+                native = _native_decode(q, kv, table, step, workspace, paged_decode)
+                if step.batch - step.contexts <= 32 and not keep_short_local:
+                    k.attn_gate[(triton.cdiv(native.numel(), 1024),)](
+                        native, gate, attention[ctx:], native.numel(), 1024, output_scale, quantized
+                    )
+                    return attention
             positions, requests = step.positions[ctx:], step.request_rows[ctx:]
             rows = m - ctx
             width = step.width
@@ -247,7 +260,10 @@ class GatedAttention(OpWrapper):
             else:
                 split = max(256, triton.next_power_of_2(step.capacity) // 32)
                 block, warps = 128, 8
-            splits = triton.cdiv(step.capacity, split)
+            # Keep the same local reduction for short prefixes after a request
+            # moves into a larger decode graph. Long prefixes use native FMHA.
+            local_limit = 256 if native is not None else 0
+            splits = triton.cdiv(min(step.capacity, local_limit or step.capacity), split)
             part = torch.empty((rows, 16, splits, 256), dtype=torch.float32, device=q.device)
             stats = torch.empty((rows, 16, splits, 2), dtype=torch.float32, device=q.device)
             query_tile = max(16, triton.next_power_of_2(width * 8))
@@ -268,9 +284,25 @@ class GatedAttention(OpWrapper):
                 splits,
                 448.0,
                 width,
+                local_limit,
                 num_warps=warps,
                 num_stages=2,
             )
+            if local_limit:
+                k.mixed_decode_gate[(rows * 4,)](
+                    part,
+                    stats,
+                    native,
+                    positions,
+                    gate,
+                    output_scale,
+                    attention[ctx:],
+                    width,
+                    local_limit,
+                    quantized,
+                    num_warps=4,
+                )
+                return attention
             k.attn_reduce[(rows * 16,)](
                 part,
                 stats,
@@ -297,6 +329,7 @@ class GatedAttention(OpWrapper):
         workspace=None,
         paged_context=None,
         paged_decode=None,
+        keep_short_local=False,
     ):
         rows = []
         page_size = kv.shape[-2]
