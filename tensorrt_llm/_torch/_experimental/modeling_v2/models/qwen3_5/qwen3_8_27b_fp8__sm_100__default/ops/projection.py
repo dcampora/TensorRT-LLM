@@ -4,9 +4,10 @@
 
 import torch
 from flashinfer.gemm import gemm_fp8_nt_groupwise
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from ..kernels import fp8
+from ..kernels import fp8, wide_projection
 from ..kernels.tiled_gemm import tiled_gemm
 
 
@@ -108,13 +109,49 @@ class BlockMatmul(OpWrapper):
         split_k: bool,
         workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        lhs = a[:rows].float() * sa.T[:rows].repeat_interleave(128, dim=-1)
-        rhs = w.float() * sw.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
-        with true_fp32_matmul():
-            return (lhs @ rhs.T).bfloat16()
+        return _reference_matmul(a, sa, w, sw, rows)
+
+
+def _reference_matmul(a, sa, w, sw, rows):
+    lhs = a[:rows].float() * sa.T[:rows].repeat_interleave(128, dim=-1)
+    rhs = w.float() * sw.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    with true_fp32_matmul():
+        return (lhs @ rhs.T).bfloat16()
+
+
+class WideBlockMatmul(OpWrapper):
+    """Project a narrow verifier into the wide SwiGLU layer using row-major FP8 weights."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("Single row with three FP8 padding rows", dict(rows=1)),
+        Cell("Five verifier rows and partially occupied tensor-core tiles", dict(rows=5)),
+        Cell("Eight live verifier rows", dict(rows=8)),
+    )
+
+    def __call__(
+        self,
+        a: torch.Tensor,
+        sa: torch.Tensor,
+        weight: TensorDescriptor,
+        sw: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        return wide_projection.project(a, sa, weight, sw)[:rows]
+
+    def reference(
+        self,
+        a: torch.Tensor,
+        sa: torch.Tensor,
+        weight: TensorDescriptor,
+        sw: torch.Tensor,
+        rows: int,
+    ) -> torch.Tensor:
+        return _reference_matmul(a, sa, weight.base, sw, rows)
 
 
 block_quantize = BlockQuantize()
 block_matmul = BlockMatmul()
+wide_block_matmul = WideBlockMatmul()
 
 block_requantize = BlockRequantize()

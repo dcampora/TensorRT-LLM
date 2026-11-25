@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from flashinfer import gemma_fused_add_rmsnorm, gemma_rmsnorm, silu_and_mul
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from torch import nn
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
@@ -38,7 +39,7 @@ from .ops.attention import (
 from .ops.gates import fixed_gate_projection
 from .ops.matmul_accelerated import accelerated_block_matmul
 from .ops.paged_attention import attention_arguments, paged_attention, paged_kv_view
-from .ops.projection import block_matmul, block_quantize
+from .ops.projection import block_matmul, block_quantize, wide_block_matmul
 from .ops.recurrent import (
     causal_convolution,
     delta_gates,
@@ -79,6 +80,7 @@ class BlockProjection(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.wide_weight: TensorDescriptor | None = None
         for name in (
             "weight",
             "scales",
@@ -102,8 +104,9 @@ class BlockProjection(nn.Module):
     ) -> torch.Tensor:
         """Dispatch the measured SM100 tile for this packed activation shape."""
         n, k = self.weight.shape
-        wide_tile = decode and rows <= 8 and n == 34816
-        if accelerate and not wide_tile:
+        if decode and rows <= 8 and self.wide_weight is not None:
+            return wide_block_matmul(a, scales, self.wide_weight, self.scales, rows)
+        if accelerate:
             return accelerated_block_matmul(
                 a,
                 scales,
@@ -269,10 +272,13 @@ def residual_norm(
 class DecoderLayer(nn.Module):
     """Gated DeltaNet or full attention followed by a dense SwiGLU block."""
 
-    def __init__(self, index: int, is_linear: bool) -> None:
+    def __init__(
+        self, index: int, is_linear: bool, gate_stream: torch.cuda.Stream | None = None
+    ) -> None:
         super().__init__()
         self.index = index
         self.is_linear = is_linear
+        self.gate_stream = gate_stream
         self.input_proj = BlockProjection()
         self.output_proj = BlockProjection()
         self.gate_up = BlockProjection()
@@ -290,6 +296,7 @@ class DecoderLayer(nn.Module):
         x: torch.Tensor,
         p: torch.Tensor,
         step: Step,
+        decode_gates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         manager = step.metadata.kv_cache_manager
         state = manager.get_ssm_states(self.index)
@@ -378,11 +385,12 @@ class DecoderLayer(nn.Module):
             parts.append(context)
         if split < x.shape[0]:
             gen = x[split:]
-            ba = (
-                fixed_gate_projection(gen, self.ba, step.gate_workspace)
-                if gen.shape[0] <= 512
-                else F.linear(gen, self.ba)
-            )
+            if decode_gates is not None:
+                ba = decode_gates
+            elif gen.shape[0] <= 512:
+                ba = fixed_gate_projection(gen, self.ba, step.gate_workspace)
+            else:
+                ba = F.linear(gen, self.ba)
             if step.speculative:
                 parts.append(self._verify_delta(p[split:], ba, step))
             else:
@@ -540,16 +548,29 @@ class DecoderLayer(nn.Module):
         fused = step.short_contexts is None
         rows = x.shape[0]
         accelerate = not step.short_generation and (decode or (fused and rows > 128))
+        normalized = None
         if fused and residual is not None:
             normalized = residual_norm_quantize(
                 x, residual, self.pre_norm, self.is_linear, decode and rows <= 8
             )
-            projection = self.input_proj.quantized(*normalized, rows, decode, accelerate)
         else:
             x, residual = residual_norm(x, residual, self.pre_norm)
-            projection = self.input_proj(x, decode, accelerate)
+        gate_stream = self.gate_stream if decode and rows <= 512 else None
+        ba = None
+        if gate_stream is not None:
+            ba = x.new_empty((rows, 96))
+            gate_stream.wait_stream(torch.cuda.current_stream(x.device))
+            with torch.cuda.stream(gate_stream):
+                fixed_gate_projection(x, self.ba, step.gate_workspace, ba)
+        projection = (
+            self.input_proj.quantized(*normalized, rows, decode, accelerate)
+            if normalized is not None
+            else self.input_proj(x, decode, accelerate)
+        )
+        if gate_stream is not None:
+            torch.cuda.current_stream(x.device).wait_stream(gate_stream)
         if self.is_linear:
-            hidden = self._linear_attention(x, projection, step)
+            hidden = self._linear_attention(x, projection, step, ba)
             if fused:
                 activation = gdn_norm_quantize(hidden, projection, self.gdn_norm)
             else:
@@ -595,9 +616,14 @@ class Qwen38TextModel(DecoderModel):
             from .draft import DraftLayer
 
             self.mtp_layer_cls = DraftLayer
+        gate_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(index, layer_type == "linear_attention")
+                DecoderLayer(
+                    index,
+                    layer_type == "linear_attention",
+                    gate_stream if layer_type == "linear_attention" else None,
+                )
                 for index, layer_type in enumerate(self.config.layer_types)
             ]
         )

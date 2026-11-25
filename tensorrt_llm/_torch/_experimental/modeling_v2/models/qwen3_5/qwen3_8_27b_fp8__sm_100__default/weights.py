@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .kernels.packed_scales import pack_weight
 from .ops.projection import block_requantize
@@ -48,6 +49,8 @@ def load_projection(
     module.scales_mn = module.scales.T.float().contiguous()
     if module.weight.shape[0] == 5120:
         module.narrow_scales = module.scales_mn.repeat_interleave(2, dim=1)
+    if module.weight.shape[0] == 34816:
+        module.wide_weight = TensorDescriptor.from_tensor(module.weight, [128, 128])
     module.packed_scales = pack_weight(module.scales, *module.weight.shape)
     module.workspace = workspace
 

@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.kernels.packed_scales import (  # noqa: E501
     pack_weight,
@@ -18,6 +19,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp
     block_matmul,
     block_quantize,
     block_requantize,
+    wide_block_matmul,
 )
 
 __extra_import_path__ = ["../../.."]
@@ -88,7 +90,10 @@ def test_gate_projection(cell, certifying):
     w = torch.randn(96, 5120, device="cuda", dtype=torch.bfloat16)
     workspace = torch.empty(16 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     certifying(fixed_gate_projection)
-    output = fixed_gate_projection(x, w, workspace)
+    supplied = x.new_empty((rows, 96)) if cell.spec.get("supplied") else None
+    output = fixed_gate_projection(x, w, workspace, supplied)
+    if supplied is not None:
+        assert output is supplied
     expect = fixed_gate_projection.reference(x, w, workspace)
     assert_within_ulp(output, expect, 1.0, 0.5)
     torch.testing.assert_close(
@@ -115,3 +120,24 @@ def test_accelerated_matmul(cell, certifying):
     assert_within_ulp(
         accelerated_block_matmul(*args), accelerated_block_matmul.reference(*args), 2.0, 0.1
     )
+
+
+@pytest.mark.parametrize("cell", wide_block_matmul.CELLS, ids=lambda cell: cell.why)
+def test_wide_matmul(cell, certifying):
+    """The direct TMA tile preserves the projection with no extra weight layout."""
+    rows, n, k = cell.spec["rows"], 34816, 5120
+    generator = torch.Generator(device="cuda").manual_seed(59)
+    x = torch.randn(rows, k, device="cuda", generator=generator).bfloat16()
+    w = (torch.randn(n, k, device="cuda", generator=generator) * 48).to(torch.float8_e4m3fn)
+    sw = torch.exp2(
+        torch.randint(-8, -1, (n // 128, k // 128), device="cuda", generator=generator).float()
+    )
+    a, sa = block_quantize(x)
+    descriptor = TensorDescriptor.from_tensor(w, [128, 128])
+    certifying(wide_block_matmul)
+    args = (a, sa, descriptor, sw, rows)
+    result = wide_block_matmul(*args)
+    assert_within_ulp(result, wide_block_matmul.reference(*args), 1.0, 0.5)
+    workspace = torch.empty(16 << 20, device="cuda", dtype=torch.uint8)
+    tiled = block_matmul(a, sa, w, sw, sw.T.contiguous(), rows, False, workspace)
+    torch.testing.assert_close(result, tiled, atol=0, rtol=0)

@@ -14,18 +14,30 @@ class FixedGateProjection(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = tuple(
         Cell(f"{rows} request-major decode rows", dict(rows=rows)) for rows in (1, 32, 128, 256)
-    )
+    ) + (Cell("Write into the execution stream's output buffer", dict(rows=5, supplied=True)),)
 
     def __call__(
-        self, x: torch.Tensor, weight: torch.Tensor, workspace: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        workspace: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return gate_projection(x, weight, workspace)
+        return gate_projection(x, weight, workspace, out)
 
     def reference(
-        self, x: torch.Tensor, weight: torch.Tensor, workspace: torch.Tensor
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        workspace: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with true_fp32_matmul():
-            return (x.float() @ weight.float().T).bfloat16()
+            projected = (x.float() @ weight.float().T).bfloat16()
+        if out is not None:
+            out.copy_(projected)
+            return out
+        return projected
 
 
 fixed_gate_projection = FixedGateProjection()

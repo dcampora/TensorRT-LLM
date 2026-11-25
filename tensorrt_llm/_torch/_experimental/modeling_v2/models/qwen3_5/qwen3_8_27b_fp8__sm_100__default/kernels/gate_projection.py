@@ -29,10 +29,13 @@ def _operation() -> ctypes._CFuncPtr:
     return function
 
 
-def gate_projection(x: torch.Tensor, weight: torch.Tensor, workspace: torch.Tensor) -> torch.Tensor:
+def gate_projection(
+    x: torch.Tensor, weight: torch.Tensor, workspace: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """Execute the same split-K BF16 reduction at each decode batch size."""
     rows = x.shape[0]
-    out = x.new_empty((rows, 96))
+    if out is None:
+        out = x.new_empty((rows, 96))
     stream = torch.cuda.current_stream(x.device).cuda_stream
     status = _operation()(
         x.data_ptr(),

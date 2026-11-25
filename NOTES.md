@@ -526,3 +526,84 @@ two-draft schedule applies above 32 requests.
 The 16,384-token step budget produced 2,760.30 output tokens/s in the
 concurrency-32 pilot with ISL 4,096 and OSL 1,024. The smaller budget
 served the 1,024-token workload faster at concurrency 128.
+
+## Full prepared-GDN serving sweep
+
+The sweep used the default request counts in `/task/bench_serving.py`,
+with the checkout's README as the passage source. Each concurrency ran
+against the same server and included the benchmark's warm-up request.
+The benchmark measured streamed content and checked the exact input
+and output token counts.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 16 | 278.80 | 65.55 |
+| 1024 | 1024 | 2 | 16 | 511.31 | 85.45 |
+| 1024 | 1024 | 4 | 16 | 923.30 | 92.65 |
+| 1024 | 1024 | 8 | 32 | 1618.18 | 98.13 |
+| 1024 | 1024 | 16 | 64 | 2612.22 | 97.59 |
+| 1024 | 1024 | 32 | 128 | 4017.40 | 143.91 |
+| 1024 | 1024 | 64 | 256 | 5236.03 | 202.63 |
+| 1024 | 1024 | 128 | 512 | 6941.87 | 390.08 |
+| 4096 | 1024 | 1 | 16 | 273.67 | 138.01 |
+| 4096 | 1024 | 8 | 32 | 1466.84 | 154.37 |
+| 4096 | 1024 | 32 | 128 | 2937.32 | 294.45 |
+
+The endpoint preserved the isolated development continuations at
+concurrency 1, 32, and 128 and the short prompts in mixed batches.
+On the additional nine 64-output chats, all first HTTP differences
+from isolated generation had gaps of 0.125 nats or less at concurrency
+4, 32, and 128. The two isolated differences from the standalone
+reference persisted.
+
+The exact-bucket regression at the launcher capacity replayed each
+of the three configured lengths and matched eager generation on
+all seven requests, including neighboring lengths and a repeated
+128-token request.
+
+The recurrent verifier layout sweep tried 4 to 64 values per CTA,
+multiple warp counts, three CTA orders, and L1-bypassing state loads.
+The two-row batch-128 state update took 192.14 us per layer in the
+existing layout, which remained the fastest exact case. At batch 32,
+the four-row update took 90.60 us and the best alternative took
+90.29 us. Grouping convolution heads into CTAs made the fastest
+batch-128 preparation 19.89 us instead of 23.90 us but changed the
+FP32 normalization reduction. Layouts that reproduced the original
+normalization were slower.
+
+## Row-major TMA and overlapping gate projections
+
+The wide FFN decode projection streams 128-channel E4M3 tiles from the
+existing row-major weight. It uses the accumulation order from
+aegis-engines `fp8_wide.py` and leaves the loader with one FP8 weight
+allocation per projection. The isolated eight-row projection produced
+the same BF16 result as the tiled CUTLASS path in 32.86 us versus
+34.95 us. A second tile-major weight would have taken 31.28 us at the
+cost of a second allocation. The narrower projection favored the
+existing tiled kernel.
+
+The BF16 GDN gate projection uses one auxiliary stream while the FP8
+QKVZ projection runs. It retains the pinned five-way split-K reduction.
+The execution stream joins the gate stream before the recurrence
+reads the gates. All 79 target tests passed, including the FP32 GEMM
+reference and caller-owned gate output buffer checks. The token
+protocol passed all 32 development items and both EOS checks.
+
+| Batch | ISL | OSL | Prompt | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 1 | 28.44 | 3.222 | 310.37 |
+| 1 | 128 | 1024 | 2 | 29.21 | 3.297 | 303.30 |
+| 1 | 1024 | 1024 | 1 | 44.37 | 3.235 | 309.07 |
+| 1 | 1024 | 1024 | 2 | 44.37 | 3.138 | 318.68 |
+| 1 | 4096 | 1024 | 1 | 132.33 | 3.442 | 290.51 |
+| 1 | 4096 | 1024 | 2 | 135.21 | 3.223 | 310.31 |
+
+The HTTP parity checks passed at concurrency 1, 32, and 128 and
+on the mixed short and long batches. The nine additional chats
+first differed from solo at gaps of at most 0.375 nats.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 307.32 | 66.39 |
+| 1024 | 1024 | 32 | 32 | 4056.53 | 811.44 |
+| 1024 | 1024 | 128 | 128 | 6866.35 | 2518.10 |
