@@ -44,6 +44,7 @@ def deployment():
             use_kv_cache_manager_v2=True,
             mamba_ssm_cache_dtype="float32",
             enable_block_reuse=False,
+            enable_kv_pool_rebalance=False,
             max_attention_window=None,
         ),
         max_beam_width=1,

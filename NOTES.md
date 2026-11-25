@@ -74,6 +74,29 @@ V1 with FP32 recurrent state completed the same 32-item oracle. Mean KL was
 missed the allowed tie or fragile checks. The V1 run uses the shipped kernels
 and checkpoint loader with `modeling_v2="off"`.
 
+The Modeling V1 batch-1 runs used the same JSON-lines launcher.
+
+| ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 65.42 | 5.071 | 197.2 |
+| 1024 | 1024 | 61.60 | 5.070 | 197.2 |
+| 4096 | 1024 | 69.31 | 5.063 | 197.5 |
+
+Modeling V1 through `serve.sh` with `AEGIS_MODELING_V2=off` and the same
+cache, scheduler and CUDA graph configuration. The first sweep completed
+through concurrency 64. `bench_serving.py` used prose from the TensorRT-LLM
+developer guide because its default source paths were absent.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 179.6 | 86.19 | 5.092 |
+| 1024 | 1024 | 2 | 380.9 | 159.42 | 5.078 |
+| 1024 | 1024 | 4 | 711.0 | 136.68 | 5.495 |
+| 1024 | 1024 | 8 | 1285.5 | 153.11 | 6.079 |
+| 1024 | 1024 | 16 | 1229.7 | 283.73 | 12.807 |
+| 1024 | 1024 | 32 | 3022.8 | 270.22 | 10.388 |
+| 1024 | 1024 | 64 | 5111.8 | 271.81 | 12.342 |
+
 ## Standalone comparison
 
 I ran `/ref-engine/engine.sh` from a writable archive of the read-only
@@ -96,8 +119,8 @@ also passed all greedy checks against the development oracle.
 aegis-engines supplied the one-layer draft path, greedy verification and
 accepted-row draft dispatch. The target processes all candidate rows in the
 main decoder and projects them through the full NVFP4 vocabulary. It runs
-the draft head at the accepted row and uses a 131,072-entry draft vocabulary
-for the first proposal and 65,536 entries for the following proposals.
+the draft head at the accepted row and searches 131,072 draft vocabulary
+entries on batches below 96 and 65,536 at larger batch sizes.
 Attention shares each request's paged reads across its candidate rows. The
 draft layer writes its own runtime-managed KV pool.
 
@@ -131,3 +154,48 @@ requests, there were 1 and 0 respective failures against the launcher's
 teacher-forced margins. The former was a first divergence at a margin of
 exactly 0.5 nats. A one-draft server produced the same borderline divergence
 at concurrency 1 and passed the bursts at both higher concurrencies.
+
+## Exact FP8 scales and fused decode kernels
+
+Every shard in a fused attention input projection shares the checkpoint
+activation scale. Their weight scales can differ by up to 2.24×. The fused
+matrix now contains the original E4M3 bytes and uses each shard's FP32
+weight scale on its output channels. PyTorch's channel-scaled GEMM applies
+those scales before rounding to BF16. Attention output projections retain
+their original scalar scales.
+
+The narrow BF16 DeltaNet gate projection comes from `bf16_ba.py`. Single
+requests fuse verification convolution with recurrence, following
+`spec_kernels.py` and writing the runtime's existing convolution windows.
+Fresh context convolution and tiled head normalization come from
+`prefill_stencil.py`. Residual RMSNorm and the fused MoE epilogue also write
+the next layer's FP8 operand. Short decode batches use more splits of the
+same paged KV cache to distribute attention work across the GPU.
+
+Two faster candidates retained the standalone engine's FP8 requantization.
+They reached 754–759 and 748 decode tokens/s at ISL 1024 and OSL 1024. Each
+had one greedy failure on the development oracle. The version with the
+original checkpoint scales passed all 32 items with KL 0.005972 and
+non-tie top-1 agreement of 99.7264%. It matched 14 prompts exactly,
+diverged first at a near-tie on 17 and passed one fragile check.
+
+These batch-1 runs used the original checkpoint scales through `engine.sh`.
+
+| ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 76.33 | 1.458 | 685.7 |
+| 1024 | 1024 | 75.70 | 1.625 | 615.4 |
+| 4096 | 1024 | 65.55 | 1.564 | 639.6 |
+
+The server with three drafts matched the launcher on all 32 single-client
+requests. All 32 requests in the concurrency-32 burst and all 128 requests
+in the concurrency-128 burst passed the launcher's 0.5-nat tolerance.
+
+The first closed-loop run used two request rounds at each load, with
+at least four requests for concurrency 1.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 623.3 | 77.27 | 1.530 |
+| 1024 | 1024 | 32 | 4422.7 | 899.02 | 6.090 |
+| 1024 | 1024 | 128 | 7805.6 | 484.38 | 14.504 |

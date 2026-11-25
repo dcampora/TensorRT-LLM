@@ -136,7 +136,10 @@ def attention(
         m = tl.full((BQ,), -float("inf"), tl.float32)
         normalizer = tl.full((BQ,), 0.0, tl.float32)
         a = tl.full((BQ, 256), 0.0, tl.float32)
-        for lo in range(start, last, BK):
+        # A one-tile decode split does not need a device-side loop bound.
+        tiles = 1 if not PREFILL and BK == SPLIT else tl.cdiv(last - start, BK)
+        for tile in range(tiles):
+            lo = start + tile * BK
             kpos = lo + key_col
             table = Table + seq * TS + kpos // PAGE
             kpage = tl.load(table, kpos < last, 0).to(tl.int64)

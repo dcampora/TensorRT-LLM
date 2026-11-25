@@ -4,10 +4,8 @@
 """Checkpoint packing and ModelOpt-scale preparation for Qwen3.6."""
 
 import torch
-import triton
 from torch import nn
 
-from .kernels import quantized
 from .kernels.fused_gate import interleave
 
 BF16 = torch.bfloat16
@@ -25,36 +23,42 @@ def parameter(shape, dtype=BF16):
 
 
 class Fp8Weights(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features: int, out_features: int, *, fused: bool = False):
         super().__init__()
         self.weight = parameter((out_features, in_features), FP8)
         self.input_scale = parameter((), torch.float32)
-        self.weight_scale = parameter((), torch.float32)
+        self.weight_scale = parameter((1, out_features) if fused else (), torch.float32)
 
     def load(self, checkpoint, names):
-        input_scales = torch.stack([checkpoint[f"{name}.input_scale"] for name in names])
-        weight_scales = torch.stack([checkpoint[f"{name}.weight_scale"] for name in names])
-        self.input_scale.copy_(input_scales.max())
-        self.weight_scale.copy_(weight_scales.max())
-        if len(names) == 1:
-            self.weight.copy_(checkpoint[f"{names[0]}.weight"])
+        root = names[0]
+        self.input_scale.copy_(checkpoint[f"{root}.input_scale"].reshape(()))
+        if self.weight_scale.ndim == 0:
+            self.weight.copy_(checkpoint[f"{root}.weight"])
+            self.weight_scale.copy_(checkpoint[f"{root}.weight_scale"].reshape(()))
             return
 
-        # Calibrate the fused GEMM at the largest scale among its shards.
-        # FP16 rounding occurs in registers before writing the fused E4M3 tensor.
+        # Every shard of a fused projection shares its activation scale. Its
+        # checkpoint weight scale applies to exactly its own output channels.
         offset = 0
-        for name, scale in zip(names, weight_scales.to(self.weight.device)):
-            weight = checkpoint[f"{name}.weight"].to(self.weight.device)
-            rows = weight.shape[0]
-            quantized.requant_fp8[(triton.cdiv(weight.numel(), 4096),)](
-                weight,
-                scale,
-                self.weight_scale,
-                self.weight[offset : offset + rows],
-                weight.numel(),
-                4096,
-            )
-            offset += rows
+        for name in names:
+            if not torch.equal(
+                checkpoint[f"{name}.input_scale"], checkpoint[f"{root}.input_scale"]
+            ):
+                raise ValueError(f"{name} has a different activation scale from {root}")
+            weight = checkpoint[f"{name}.weight"]
+            end = offset + weight.shape[0]
+            self.weight[offset:end].copy_(weight)
+            self.weight_scale[:, offset:end].copy_(checkpoint[f"{name}.weight_scale"])
+            offset = end
+
+    def prepare(self) -> None:
+        if self.weight_scale.ndim:
+            self.activation_scales = self.input_scale.repeat(8192).view(-1, 1)
+
+    def scales_for_rows(self, rows: int) -> torch.Tensor:
+        if rows <= self.activation_scales.shape[0]:
+            return self.activation_scales[:rows]
+        return self.input_scale.repeat(rows).view(-1, 1)
 
 
 class PackedWeights(nn.Module):

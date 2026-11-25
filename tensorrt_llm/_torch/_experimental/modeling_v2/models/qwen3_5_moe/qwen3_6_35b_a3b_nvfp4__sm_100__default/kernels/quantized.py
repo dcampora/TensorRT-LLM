@@ -18,17 +18,27 @@ def fp8_cast(X, Scale, Y, T, INV: tl.constexpr, BLOCK: tl.constexpr):
 
 
 @tr.jit
-def requant_fp8(X, From, To, Y, SIZE: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    s = tl.load(From).to(tl.float16).to(tl.float32)
-    inv = 1.0 / tl.load(To)
-    x = tl.load(X + i, i < SIZE, 0.0).to(tl.float32)
-    y = (x * s).to(tl.float16).to(tl.float32) * inv
-    tl.store(Y + i, tl.minimum(tl.maximum(y, -448.0), 448.0), i < SIZE)
+def _store_normalized(Y, Q, Scale, offset, x, inv, norm, QUANT: tl.constexpr):
+    result = ((x * inv) * (1.0 + norm)).to(tl.bfloat16)
+    tl.store(Y + offset, result)
+    if QUANT:
+        value = result.to(tl.float32) * (1.0 / tl.load(Scale))
+        tl.store(Q + offset, tl.minimum(tl.maximum(value, -448.0), 448.0))
 
 
 @tr.jit
-def norm(X, Residual, W, Y, NEW: tl.constexpr, ADD: tl.constexpr, D: tl.constexpr):
+def norm(
+    X,
+    Residual,
+    W,
+    Y,
+    NEW: tl.constexpr,
+    ADD: tl.constexpr,
+    D: tl.constexpr,
+    Q=None,
+    Scale=None,
+    QUANT: tl.constexpr = False,
+):
     row = tl.program_id(0)
     d = tl.arange(0, D)
     x = tl.load(X + row * D + d).to(tl.float32)
@@ -38,7 +48,7 @@ def norm(X, Residual, W, Y, NEW: tl.constexpr, ADD: tl.constexpr, D: tl.constexp
         tl.store(Residual + row * D + d, x)
     w = tl.load(W + d).to(tl.float32)
     r = tl.rsqrt(tl.sum(x * x, 0) / D + 1e-6)
-    tl.store(Y + row * D + d, (x * r) * (1.0 + w))
+    _store_normalized(Y, Q, Scale, row * D + d, x, r, w, QUANT)
 
 
 @tr.jit

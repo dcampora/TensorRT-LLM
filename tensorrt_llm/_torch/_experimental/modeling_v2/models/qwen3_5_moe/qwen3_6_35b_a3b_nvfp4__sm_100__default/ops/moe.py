@@ -3,13 +3,16 @@
 
 """ModelOpt MoE routing and expert epilogues from aegis-engines (a6c09c6502)."""
 
+from typing import NamedTuple
+
 import torch
 import triton
 from torch import nn
 
 from .....catalog._op import Arch, Cell, OpWrapper
 from ..kernels import quantized as k
-from ..kernels.cute_moe import PackedExperts, mix_experts_norm
+from ..kernels.cute_moe import PackedExperts
+from ..kernels.cute_moe import mix_experts_norm as _mix_experts_norm
 from ..kernels.dense_vectors import shared_down
 from ..kernels.shared_corrected import RoundedShared
 from ..weights import BF16, EXPERT_WIDTH, HIDDEN, NUM_EXPERTS, TOP_K, PackedWeights, parameter
@@ -22,19 +25,37 @@ class ResidualRmsNorm(OpWrapper):
         Cell("first layer, record residual", {"rows": 1, "add": False, "save": True}),
         Cell("after attention", {"rows": 128, "add": True, "save": True}),
         Cell("final norm", {"rows": 32, "add": True, "save": False}),
+        Cell(
+            "emit the next attention operand", {"rows": 32, "add": True, "save": True, "fp8": True}
+        ),
     )
 
-    def __call__(self, x, residual, weight, add, save):
+    def __call__(self, x, residual, weight, add, save, fp8=None, scale=None):
         out = torch.empty_like(x)
-        k.norm[(x.shape[0],)](x, residual, weight, out, save, add, x.shape[-1], num_warps=4)
+        k.norm[(x.shape[0],)](
+            x,
+            residual,
+            weight,
+            out,
+            save,
+            add,
+            x.shape[-1],
+            fp8,
+            scale,
+            fp8 is not None,
+            num_warps=4,
+        )
         return out
 
-    def reference(self, x, residual, weight, add, save):
+    def reference(self, x, residual, weight, add, save, fp8=None, scale=None):
         value = x.float() + residual.float() if add else x.float()
         if save:
             residual.copy_(value)
         inverse = (value.square().mean(-1, keepdim=True) + 1e-6).rsqrt()
-        return (value * inverse * (1 + weight.float())).to(BF16)
+        out = (value * inverse * (1 + weight.float())).to(BF16)
+        if fp8 is not None:
+            fp8.copy_((out.float() / scale).clamp(-448, 448))
+        return out
 
 
 class RouteTopK(OpWrapper):
@@ -78,6 +99,60 @@ def swiglu(x):
     return out
 
 
+class ExpertEpilogue(NamedTuple):
+    residual: torch.Tensor
+    norm: torch.Tensor
+    save: bool
+    fp8: torch.Tensor | None
+    scale: torch.Tensor | None
+
+
+class MixExpertsNorm(OpWrapper):
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("weighted experts and FP8 attention input", {"rows": 4, "weighted": True}),
+        Cell("unweighted experts and final norm", {"rows": 7, "weighted": False}),
+    )
+
+    def __call__(self, raw, alpha, ids, probs, slots, shared, gate, weighted, epilogue):
+        residual, weight, save, fp8, scale = epilogue
+        out = torch.empty_like(shared)
+        _mix_experts_norm[(shared.shape[0],)](
+            raw,
+            alpha,
+            ids,
+            probs,
+            slots,
+            shared,
+            gate,
+            residual,
+            weight,
+            out,
+            0 if weighted else gate.stride(0),
+            save,
+            weighted,
+            fp8,
+            scale,
+            fp8 is not None,
+            num_warps=4,
+        )
+        return out
+
+    def reference(self, raw, alpha, ids, probs, slots, shared, gate, weighted, epilogue):
+        if not weighted:
+            probs = (alpha[ids.long()].float() * probs.to(BF16).float()).to(BF16)
+            gate = gate[:, NUM_EXPERTS].float().sigmoid().to(BF16)
+        routed = (raw[slots.long()].float() * probs.float()[:, :, None]).to(BF16).float()
+        routed = routed.sum(dim=1).to(BF16).float()
+        shared = (shared.float() * gate.float()[:, None]).to(BF16).float()
+        mixed = (routed + shared).to(BF16)
+        residual, weight, save, fp8, scale = epilogue
+        return residual_rms_norm.reference(mixed, residual, weight, True, save, fp8, scale)
+
+
+mix_experts_norm = MixExpertsNorm()
+
+
 class Experts(nn.Module):
     def __init__(self):
         super().__init__()
@@ -107,7 +182,7 @@ class Experts(nn.Module):
             return shared_down(mid, self.shared_down)
         return gemv(mid, self.shared_down)
 
-    def forward(self, x, bins, side, contexts, batch, epilogue):
+    def forward(self, x, bins, side, contexts, batch, epilogue, width):
         rows = x.shape[0]
         cutoff = (128 if batch == 1 else 1024) if contexts else 1
         grouped = rows >= cutoff
@@ -124,12 +199,15 @@ class Experts(nn.Module):
         router = (
             self.router if grouped and (contexts or batch > 1) else self.router[: NUM_EXPERTS + 1]
         )
+        verifying = not contexts and width > 1
         logits = torch.mm(x, router.T)
         weighted = grouped and epilogue is not None
         ids, probs, shared_gate = route_topk(logits, self.down.alpha if weighted else None)
-        out = torch.empty_like(x)
         if grouped:
-            tile = 8 if rows < 64 else 16 if rows <= 128 else 64
+            tokens = batch if verifying else rows
+            tile = 8 if tokens < 64 else 16 if tokens <= 128 else 64
+            if verifying and batch >= 128:
+                tile = 32
             wide = contexts and rows >= 4096
             if wide:
                 tile = 128
@@ -144,6 +222,7 @@ class Experts(nn.Module):
             )
             main.wait_stream(side)
             if epilogue is None:
+                out = torch.empty_like(x)
                 alpha = self.shared_down.alpha if packed_prefill else None
                 k.add_shared[(rows, 4)](
                     routed,
@@ -156,26 +235,11 @@ class Experts(nn.Module):
                     alpha,
                     packed_prefill,
                 )
-            else:
-                raw, slots = routed
-                residual, weight, save = epilogue
-                mix_experts_norm[(rows,)](
-                    raw,
-                    self.down.alpha,
-                    ids,
-                    probs,
-                    slots,
-                    shared,
-                    shared_gate,
-                    residual,
-                    weight,
-                    out,
-                    logits.stride(0),
-                    save,
-                    weighted,
-                    num_warps=4,
-                )
-            return out
+                return out
+            raw, slots = routed
+            return mix_experts_norm(
+                raw, self.down.alpha, ids, probs, slots, shared, shared_gate, weighted, epilogue
+            )
 
         if use_gemv:
             mid = gemv(x, self.gate_up, 1, ids, probs)
@@ -191,5 +255,6 @@ class Experts(nn.Module):
             mid = swiglu(packed_matmul(x, self.gate_up, 1, routing, tile))
             experts = packed_matmul(mid, self.down, 2, routing, tile)
             shared = packed_matmul(swiglu(packed_matmul(x, self.shared_gate_up)), self.shared_down)
+        out = torch.empty_like(x)
         k.combine[(rows, 4)](experts, shared, logits, out, HIDDEN, HIDDEN // 4)
         return out

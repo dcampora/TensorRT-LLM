@@ -13,7 +13,7 @@ from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16_prepare import moe_permut
 from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_permuted_tokens
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait, libdevice
 
-from .quantized import _silu
+from .quantized import _silu, _store_normalized
 
 CUTE_PDL = int(os.getenv("ENGINE_CUTE_PDL", "2"))
 ROUTE_HIST = int(os.getenv("ENGINE_ROUTE_HIST", "8"))
@@ -394,6 +394,9 @@ def mix_experts_norm(
     STRIDE: tl.constexpr,
     SAVE: tl.constexpr,
     WEIGHTED: tl.constexpr = False,
+    Q=None,
+    Scale=None,
+    QUANT: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     d = tl.arange(0, 2048)
@@ -411,7 +414,7 @@ def mix_experts_norm(
         tl.store(Residual + offset, x)
     w = tl.load(Norm + d).to(tl.float32)
     inv = tl.rsqrt(tl.sum(x * x, 0) / 2048.0 + 1e-6)
-    tl.store(Y + offset, (x * inv) * (1.0 + w))
+    _store_normalized(Y, Q, Scale, offset, x, inv, w, QUANT)
 
 
 class PackedExperts:

@@ -16,12 +16,13 @@ from ..routing import LAYER_TYPES
 from .kernels.cute_moe import PackedVocabulary
 from .mtp import DraftLayer, mtp_step
 from .ops.attention import gated_attention, prepare_qkv
-from .ops.moe import Experts, residual_rms_norm
-from .ops.projections import fp8_linear
+from .ops.moe import ExpertEpilogue, Experts, residual_rms_norm
+from .ops.projections import delta_gate_projection, fp8_linear
 from .ops.recurrent import convolution_decode, delta_decode, delta_norm, delta_prefill
 from .ops.verify import convolution_verify, delta_verify
 from .weights import (
     BF16,
+    FP8,
     HIDDEN,
     NUM_EXPERTS,
     VOCAB,
@@ -95,13 +96,17 @@ class Step:
 class FullAttention(nn.Module):
     def __init__(self):
         super().__init__()
-        self.qkv = Fp8Weights(HIDDEN, 9216)
+        self.qkv = Fp8Weights(HIDDEN, 9216, fused=True)
         self.output = Fp8Weights(4096, HIDDEN)
         self.qnorm = parameter((256,))
         self.knorm = parameter((256,))
 
-    def forward(self, x, step, kv, table, rope):
-        qkv = fp8_linear(x, self.qkv)
+    @property
+    def input_scale(self) -> torch.Tensor:
+        return self.qkv.input_scale
+
+    def forward(self, x8, step, kv, table, rope):
+        qkv = fp8_linear(x8, self.qkv)
         q, gate = prepare_qkv(
             qkv, self.qnorm, self.knorm, rope, step.positions, step.request_rows, kv, table
         )
@@ -112,7 +117,7 @@ class FullAttention(nn.Module):
 class LinearAttention(nn.Module):
     def __init__(self):
         super().__init__()
-        self.qkvz = Fp8Weights(HIDDEN, 12288)
+        self.qkvz = Fp8Weights(HIDDEN, 12288, fused=True)
         self.output = Fp8Weights(4096, HIDDEN)
         self.ba = parameter((64, HIDDEN))
         self.conv = parameter((8192, 4))
@@ -120,17 +125,25 @@ class LinearAttention(nn.Module):
         self.a_log = parameter((32,), torch.float32)
         self.dt = parameter((32,))
 
-    def forward(self, x, step, cache, side):
+    @property
+    def input_scale(self) -> torch.Tensor:
+        return self.qkvz.input_scale
+
+    def forward(self, x, x8, step, cache, side):
         history, state = cache.conv, cache.temporal
         if step.contexts:
             ba = torch.mm(x, self.ba.T)
-            qkvz = fp8_linear(x, self.qkvz)
+            qkvz = fp8_linear(x8, self.qkvz)
         else:
             main = torch.cuda.current_stream()
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                ba = torch.mm(x, self.ba.T)
-            qkvz = fp8_linear(x, self.qkvz)
+                ba = (
+                    delta_gate_projection(x, self.ba)
+                    if step.batch == 1 and step.width > 1
+                    else torch.mm(x, self.ba.T)
+                )
+            qkvz = fp8_linear(x8, self.qkvz)
             main.wait_stream(side)
 
         ctx = step.context_tokens
@@ -144,14 +157,11 @@ class LinearAttention(nn.Module):
                 qkv = convolution_decode(qkvz[ctx:], self.conv, slots, history)
                 decode = delta_decode(qkv, ba[ctx:], self.a_log, self.dt, slots, state)
             else:
-                qkv = convolution_verify(
-                    qkvz[ctx:],
-                    self.conv,
-                    slots,
-                    history,
-                    cache.intermediate_conv_window,
-                    step.width,
-                )
+                conv = self.conv, history, cache.intermediate_conv_window
+                qkv = qkvz[ctx:]
+                if step.batch > 1:
+                    qkv = convolution_verify(qkv, self.conv, slots, *conv[1:], step.width)
+                    conv = None
                 decode = delta_verify(
                     qkv,
                     ba[ctx:],
@@ -167,6 +177,7 @@ class LinearAttention(nn.Module):
                     cache.cache_buf_idx,
                     step.width,
                     step.replay_width,
+                    conv,
                 )
             y = torch.cat((y, decode)) if ctx else decode
         scale = self.output.input_scale if ctx or step.batch == 1 else None
@@ -269,21 +280,31 @@ class QwenDecoder(DecoderModel):
         else:
             x = inputs_embeds[: attn_metadata.num_tokens]
         residual = torch.empty_like(x)
-        x = residual_rms_norm(x, residual, self.layers[0].before, False, True)
+        first = self.layers[0]
+        x8 = torch.empty_like(x, dtype=FP8)
+        x = residual_rms_norm(
+            x, residual, first.before, False, True, x8, first.attention.input_scale
+        )
         for i, (layer, cache) in enumerate(zip(self.layers, self._layer_caches)):
             if layer.full_attention:
                 kv, pool = cache
                 table = attn_metadata.kv_cache_block_offsets[pool]
-                x = layer.attention(x, step, kv, table, self.rope)
+                x = layer.attention(x8, step, kv, table, self.rope)
             else:
-                x = layer.attention(x, step, cache, self.side)
+                x = layer.attention(x, x8, step, cache, self.side)
             x = residual_rms_norm(x, residual, layer.after, True, True)
             save = i + 1 < len(self.layers)
-            weight = self.layers[i + 1].before if save else self.final_norm
-            epilogue = None if step.contexts else (residual, weight, save)
-            x = layer.moe(x, self.bins, self.side, step.contexts, step.batch, epilogue)
+            if save:
+                next_layer = self.layers[i + 1]
+                weight = next_layer.before
+                scale = next_layer.attention.input_scale
+                x8 = torch.empty_like(x, dtype=FP8)
+            else:
+                weight, scale, x8 = self.final_norm, None, None
+            epilogue = None if step.contexts else ExpertEpilogue(residual, weight, save, x8, scale)
+            x = layer.moe(x, self.bins, self.side, step.contexts, step.batch, epilogue, step.width)
             if epilogue is None:
-                x = residual_rms_norm(x, residual, weight, True, save)
+                x = residual_rms_norm(x, residual, weight, True, save, x8, scale)
         return x, step
 
 
@@ -333,7 +354,7 @@ class ModelingV2Qwen36Nvfp4Sm100Default(DecoderModelForCausalLM):
 
     def post_load_weights(self):
         for module in self.modules():
-            if isinstance(module, PackedWeights) and module is not self.lm_head:
+            if isinstance(module, (PackedWeights, Fp8Weights)) and module is not self.lm_head:
                 module.prepare()
         self.lm_head.prepare()
         self.model.prepare(self.config)

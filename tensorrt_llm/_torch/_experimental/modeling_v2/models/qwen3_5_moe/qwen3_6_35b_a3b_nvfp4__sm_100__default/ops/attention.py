@@ -126,11 +126,16 @@ class GatedAttention(OpWrapper):
             q, gate = q[ctx:], gate[ctx:]
             positions, requests = step.positions[ctx:], step.request_rows[ctx:]
             rows = m - ctx
-            split = max(256, triton.next_power_of_2(step.capacity) // 32)
+            width = step.width
+            short_tile = rows <= width * 4
+            if short_tile:
+                split, block, warps = 64, 64, 4
+            else:
+                split = max(256, triton.next_power_of_2(step.capacity) // 32)
+                block, warps = 128, 8
             splits = triton.cdiv(step.capacity, split)
             part = torch.empty((rows, 16, splits, 256), dtype=torch.float32, device=q.device)
             stats = torch.empty((rows, 16, splits, 2), dtype=torch.float32, device=q.device)
-            width = step.width
             query_tile = max(16, triton.next_power_of_2(width * 8))
             k.attention[(splits, 2, rows // width)](
                 q,
@@ -144,12 +149,12 @@ class GatedAttention(OpWrapper):
                 *strides,
                 False,
                 query_tile,
-                128,
+                block,
                 split,
                 splits,
                 448.0,
                 width,
-                num_warps=8,
+                num_warps=warps,
                 num_stages=2,
             )
             k.attn_reduce[(rows * 16,)](

@@ -4,10 +4,12 @@
 """Gated DeltaNet operations over runtime-owned recurrent slots."""
 
 import torch
+import triton
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 from .....catalog._op import Arch, Cell, OpWrapper
 from ..kernels import gated_delta as k
+from ..kernels import prefill_stencil
 from ..weights import BF16, FP8
 
 
@@ -88,6 +90,9 @@ class ConvolutionPrefill(OpWrapper):
     CELLS = (
         Cell("fresh contexts including a one-token prompt", {"lengths": (1, 7), "initial": False}),
         Cell("a short continuation and a fresh request", {"lengths": (2, 6), "initial": True}),
+        Cell(
+            "tiled fresh prefill with a one-token request", {"lengths": (1, 137), "initial": False}
+        ),
     )
 
     def __call__(self, x, weight, rows, cu, slots, history, initial_history):
@@ -96,22 +101,41 @@ class ConvolutionPrefill(OpWrapper):
         q = torch.empty((count, 16, 128), **opts)
         key = torch.empty_like(q)
         value = torch.empty((count, 32, 128), **opts)
-        k.conv_prefill[(count, 32)](
-            x,
-            weight,
-            rows,
-            cu,
-            slots,
-            initial_history,
-            history,
-            q,
-            key,
-            value,
-            *history.stride(),
-            256,
-            initial_history is not None,
-            num_warps=4,
-        )
+        if count >= 64 and initial_history is None:
+            tile = 4 if count <= 128 else 8
+            prefill_stencil.conv[(triton.cdiv(count, tile), 16)](
+                x,
+                weight,
+                rows,
+                cu,
+                slots,
+                history,
+                q,
+                key,
+                value,
+                count,
+                history.stride(),
+                tile,
+                512,
+                num_warps=4,
+            )
+        else:
+            k.conv_prefill[(count, 32)](
+                x,
+                weight,
+                rows,
+                cu,
+                slots,
+                initial_history,
+                history,
+                q,
+                key,
+                value,
+                *history.stride(),
+                256,
+                initial_history is not None,
+                num_warps=4,
+            )
         return q, key, value
 
     def reference(self, x, weight, rows, cu, slots, history, initial_history):
@@ -198,13 +222,18 @@ class DeltaNorm(OpWrapper):
     CELLS = (
         Cell("BF16 output before FP8 casting", {"rows": 3, "quantized": False}),
         Cell("fused FP8 output", {"rows": 32, "quantized": True}),
+        Cell("tiled FP8 output on a large context", {"rows": 513, "quantized": True}),
     )
 
     def __call__(self, x, qkvz, weight, scale):
         rows = x.shape[0]
         quant = scale is not None
         out = torch.empty((rows, 4096), device=x.device, dtype=FP8 if quant else BF16)
-        k.gdn_norm[(rows, 32)](x, qkvz, weight, out, qkvz.stride(0), scale, quant, num_warps=4)
+        if rows >= 96:
+            tile, warps = (4 if rows < 2048 else 8, 2) if rows >= 512 else (8, 4)
+            prefill_stencil.warp_norm(x, qkvz, weight, out, scale, tile, warps)
+        else:
+            k.gdn_norm[(rows, 32)](x, qkvz, weight, out, qkvz.stride(0), scale, quant, num_warps=4)
         return out
 
     def reference(self, x, qkvz, weight, scale):

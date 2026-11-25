@@ -9,6 +9,7 @@ from flashinfer.gemm import bmm_fp8
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import quantized as k
+from ..kernels.bf16_gate import gate_project
 from ..weights import BF16, FP8, NUM_EXPERTS
 
 
@@ -31,9 +32,55 @@ class Fp8Cast(OpWrapper):
 fp8_cast = Fp8Cast()
 
 
+class DeltaGateProjection(OpWrapper):
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("one token", {"rows": 1}),
+        Cell("verification with three draft tokens", {"rows": 4}),
+    )
+
+    def __call__(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        out = torch.empty((x.shape[0], 64), dtype=BF16, device=x.device)
+        gate_project[(4, x.shape[0])](x, weight, out, num_warps=4, num_stages=2)
+        return out
+
+    def reference(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        with true_fp32_matmul():
+            return (x.float() @ weight.float().T).to(BF16)
+
+
+delta_gate_projection = DeltaGateProjection()
+
+
+class ChannelFp8Linear(OpWrapper):
+    """Fused FP8 projection with independent scales per output channel."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("linear-attention projection on a decode step", {"rows": 4, "width": 12288}),
+        Cell("full-attention projection on a prefill", {"rows": 128, "width": 9216}),
+    )
+
+    def __call__(self, x, weight, activation_scales, weight_scales):
+        return torch._scaled_mm(
+            x, weight.T, activation_scales, weight_scales, out_dtype=BF16, use_fast_accum=True
+        )
+
+    def reference(self, x, weight, activation_scales, weight_scales):
+        with true_fp32_matmul():
+            return ((x.float() @ weight.float().T) * activation_scales * weight_scales).to(BF16)
+
+
+channel_fp8_linear = ChannelFp8Linear()
+
+
 def fp8_linear(x, weights):
     if x.dtype != FP8:
         x = fp8_cast(x, weights.input_scale)
+    if weights.weight_scale.ndim:
+        return channel_fp8_linear(
+            x, weights.weight, weights.scales_for_rows(x.shape[0]), weights.weight_scale
+        )
     return bmm_fp8(
         x[None],
         weights.weight.T[None],

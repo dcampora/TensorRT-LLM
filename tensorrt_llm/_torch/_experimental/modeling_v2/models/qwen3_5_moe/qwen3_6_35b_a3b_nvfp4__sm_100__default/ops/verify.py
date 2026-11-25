@@ -53,6 +53,10 @@ class DeltaVerify(OpWrapper):
             "mixed replay, rollover, and a fresh slot",
             {"batch": 3, "width": 2, "previous": (3, 15, 0)},
         ),
+        Cell(
+            "fused convolution with an anchor rollover",
+            {"batch": 1, "width": 4, "previous": (15,), "fused": True},
+        ),
     )
 
     def __call__(
@@ -71,10 +75,12 @@ class DeltaVerify(OpWrapper):
         buffer,
         width,
         max_width,
+        conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ):
         rows = qkv.shape[0]
         out = torch.empty((rows, 32, 128), dtype=BF16, device=qkv.device)
         tile = 8 if rows <= 4 else 32
+        weight, history, windows = conv if conv else (None, None, None)
         k.delta_verify[(rows // width, 32, 128 // tile)](
             qkv,
             ba,
@@ -99,6 +105,12 @@ class DeltaVerify(OpWrapper):
             max_width,
             width,
             tile,
+            weight,
+            history,
+            windows,
+            history.stride() if history is not None else (),
+            windows.stride() if windows is not None else (),
+            conv is not None,
             num_warps=4,
         )
         return out
@@ -119,7 +131,11 @@ class DeltaVerify(OpWrapper):
         buffer,
         width,
         max_width,
+        conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ):
+        if conv is not None:
+            weight, history, windows = conv
+            qkv = convolution_verify.reference(qkv, weight, slots, history, windows, width)
         q, k_new, value = qkv.float().split((2048, 2048, 4096), dim=-1)
         q = q.reshape(-1, 16, 128)
         k_new = k_new.reshape(-1, 16, 128)

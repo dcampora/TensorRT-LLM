@@ -51,7 +51,8 @@ def test_delta_verify(cell, certifying):
     op = verify.delta_verify
     certifying(op)
     batch, width = cell.spec["batch"], cell.spec["width"]
-    qkv = rand((batch * width, 8192))
+    fused = cell.spec.get("fused", False)
+    qkv = rand((batch * width, 12288 if fused else 8192))
     ba = rand((batch * width, 64))
     a_log, dt = rand((32,), torch.float32), rand((32,))
     nslots = batch + 7
@@ -69,9 +70,20 @@ def test_delta_verify(cell, certifying):
     buffer = torch.ones((nslots, 4), device=DEV, dtype=torch.int32)[:, 2]
     expected_buffers = delta.clone(), key.clone(), decay.clone()
     args = qkv, ba, a_log, dt, slots, replay_slots
-    actual = op(*args, state, delta, key, decay, accepted, buffer, width, 4)
-    expected = op.reference(*args, ref_state, *expected_buffers, accepted, buffer, width, 4)
+    conv = ref_conv = None
+    if fused:
+        weight = rand((8192, 4))
+        history = rand((nslots, 2, 3, 8192))[:, 1].transpose(-1, -2)
+        windows = torch.zeros((batch + 2, 4, 8192, 3), dtype=BF16, device=DEV)
+        conv = weight, history, windows
+        ref_conv = weight, history, windows.clone()
+    actual = op(*args, state, delta, key, decay, accepted, buffer, width, 4, conv)
+    expected = op.reference(
+        *args, ref_state, *expected_buffers, accepted, buffer, width, 4, ref_conv
+    )
     assert_within_ulp(actual, expected, 1, 1)
+    if conv is not None:
+        torch.testing.assert_close(conv[-1], ref_conv[-1], atol=0, rtol=0)
     torch.testing.assert_close(state, ref_state, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(decay, expected_buffers[2], atol=1e-4, rtol=1e-5)
     torch.testing.assert_close(delta, expected_buffers[0], atol=1e-4, rtol=0.008)

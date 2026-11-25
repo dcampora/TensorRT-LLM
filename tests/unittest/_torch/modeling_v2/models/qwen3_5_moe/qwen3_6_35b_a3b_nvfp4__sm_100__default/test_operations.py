@@ -42,6 +42,30 @@ def test_fp8_cast(cell, certifying):
     torch.testing.assert_close(op(x, scale).float(), op.reference(x, scale).float(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("cell", projections.delta_gate_projection.CELLS)
+def test_delta_gate_projection(cell, certifying):
+    op = projections.delta_gate_projection
+    certifying(op)
+    x = fixture_rand((cell.spec["rows"], 2048), factor=0.25)
+    weight = fixture_rand((64, 2048), factor=0.25)
+    assert_within_ulp(op(x, weight), op.reference(x, weight), 1, 0)
+
+
+@pytest.mark.parametrize("cell", projections.channel_fp8_linear.CELLS)
+def test_channel_fp8_linear(cell, certifying):
+    op = projections.channel_fp8_linear
+    certifying(op)
+    rows, width = cell.spec["rows"], cell.spec["width"]
+    x = fixture_rand((rows, 2048), FP8, 0.5)
+    weight = fixture_rand((width, 2048), FP8, 0.5)
+    activation_scales = torch.full((rows, 1), 0.0037, device=DEV)
+    weight_scales = torch.linspace(0.001, 0.002, width, device=DEV)[None, :]
+    args = x, weight, activation_scales, weight_scales
+    # One BF16 rounding at a few FP32 accumulation boundaries. The
+    # 128-row cell measured relative RMS error of about 1.05e-5.
+    assert_within_ulp(op(*args), op.reference(*args), 1, 0.01)
+
+
 @pytest.mark.parametrize("cell", moe.residual_rms_norm.CELLS)
 def test_residual_rms_norm(cell, certifying):
     op = moe.residual_rms_norm
@@ -50,11 +74,17 @@ def test_residual_rms_norm(cell, certifying):
     x, residual = fixture_rand(shape), fixture_rand(shape)
     weight = fixture_rand((2048,), factor=0.15)
     reference_residual = residual.clone()
+    quantized = cell.spec.get("fp8", False)
+    fp8 = torch.empty_like(x, dtype=FP8) if quantized else None
+    reference_fp8 = torch.empty_like(x, dtype=FP8) if quantized else None
+    scale = torch.tensor(0.037, dtype=torch.float32, device=DEV) if quantized else None
     args = (weight, cell.spec["add"], cell.spec["save"])
-    actual = op(x, residual, *args)
-    reference = op.reference(x, reference_residual, *args)
+    actual = op(x, residual, *args, fp8, scale)
+    reference = op.reference(x, reference_residual, *args, reference_fp8, scale)
     assert_within_ulp(actual, reference, 1, 1)
     torch.testing.assert_close(residual, reference_residual, rtol=0, atol=0)
+    if quantized:
+        torch.testing.assert_close(fp8.float(), reference_fp8.float(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cell", moe.route_topk.CELLS)
@@ -69,6 +99,38 @@ def test_route_topk(cell, certifying):
     torch.testing.assert_close(actual_ids, ids, rtol=0, atol=0)
     torch.testing.assert_close(actual_weights, weights)
     torch.testing.assert_close(actual_gate, gate)
+
+
+@pytest.mark.parametrize("cell", moe.mix_experts_norm.CELLS)
+def test_mix_experts_norm(cell, certifying):
+    op = moe.mix_experts_norm
+    certifying(op)
+    rows, weighted = cell.spec["rows"], cell.spec["weighted"]
+    shape = (rows, 2048)
+    raw = fixture_rand((rows * 8 * 2, 2048), dtype=torch.float32, factor=0.1)
+    alpha = fixture_rand((256,), factor=0.1).abs()
+    ids = torch.randint(256, (rows, 8), device=DEV, dtype=torch.int32)
+    probs = torch.rand((rows, 8), device=DEV).softmax(-1).to(BF16)
+    slots = torch.randperm(rows * 8 * 2, device=DEV, dtype=torch.int32)[: rows * 8].reshape(rows, 8)
+    shared = fixture_rand(shape)
+    gate = fixture_rand((rows, 272))
+    if weighted:
+        gate = gate[:, 256].float().sigmoid().to(BF16)
+    residual = fixture_rand(shape)
+    weight = fixture_rand((2048,), factor=0.15)
+    ref_residual = residual.clone()
+    fp8 = torch.empty(shape, dtype=FP8, device=DEV) if weighted else None
+    scale = torch.tensor(0.0037, dtype=torch.float32, device=DEV) if weighted else None
+    args = raw, alpha, ids, probs, slots, shared, gate, weighted
+    actual = op(*args, moe.ExpertEpilogue(residual, weight, weighted, fp8, scale))
+    expected = op.reference(*args, moe.ExpertEpilogue(ref_residual, weight, weighted, None, None))
+    # Accumulation and RMSNorm can each move the result across a BF16 midpoint.
+    assert_within_ulp(actual, expected, 2, 1)
+    assert_within_ulp(residual, ref_residual, 2, 1)
+    if weighted:
+        torch.testing.assert_close(
+            fp8.float(), projections.fp8_cast.reference(actual, scale).float(), atol=0, rtol=0
+        )
 
 
 @pytest.mark.parametrize("cell", projections.packed_gemv.CELLS)

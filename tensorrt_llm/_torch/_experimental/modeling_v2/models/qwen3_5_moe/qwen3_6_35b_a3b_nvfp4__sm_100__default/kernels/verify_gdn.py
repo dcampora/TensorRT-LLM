@@ -51,6 +51,35 @@ def convolution_verify(
 
 
 @tr.jit
+def _conv_history(Conv, W, slot, channels, CS: tl.constexpr):
+    frame = Conv + slot * CS[0] + channels * CS[1]
+    x0 = tl.load(frame).to(tl.float32)
+    x1 = tl.load(frame + CS[2]).to(tl.float32)
+    x2 = tl.load(frame + 2 * CS[2]).to(tl.float32)
+    base = W + channels * 4
+    weights = (
+        tl.load(base).to(tl.float32),
+        tl.load(base + 1).to(tl.float32),
+        tl.load(base + 2).to(tl.float32),
+        tl.load(base + 3).to(tl.float32),
+    )
+    return (x0, x1, x2), weights
+
+
+@tr.jit
+def _conv_token(X, window, frame, weights, save, WS: tl.constexpr):
+    x0, x1, x2 = frame
+    w0, w1, w2, w3 = weights
+    x3 = tl.load(X).to(tl.float32)
+    value = ((x0 * w0 + x1 * w1) + x2 * w2) + x3 * w3
+    if save:
+        tl.store(window, x1)
+        tl.store(window + WS[3], x2)
+        tl.store(window + 2 * WS[3], x3)
+    return _silu(value).to(tl.bfloat16).to(tl.float32), (x1, x2, x3)
+
+
+@tr.jit
 def delta_verify(
     QKV,
     BA,
@@ -75,6 +104,12 @@ def delta_verify(
     MAX_WIDTH: tl.constexpr,
     WIDTH: tl.constexpr,
     BV: tl.constexpr,
+    ConvWeight=None,
+    Conv=None,
+    ConvWindows=None,
+    CS: tl.constexpr = (),
+    WS: tl.constexpr = (),
+    FUSE_CONV: tl.constexpr = False,
 ):
     request, head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     state_slot = tl.load(Slots + request).to(tl.int64)
@@ -105,12 +140,36 @@ def delta_verify(
         tl.store(state_ptr, s, cache_modifier=".cs")
         previous = tl.full((), 0.0, tl.float32)
 
+    query_channel = (head // 2) * 128 + k
+    key_channel = query_channel + 2048
+    value_channel = 4096 + head * 128 + v
+    # As in aegis-engines spec_kernels.py, each state tile computes the Q/K
+    # stencil locally. Only one tile writes each persistent convolution channel.
+    if FUSE_CONV:
+        conv_q, wq = _conv_history(Conv, ConvWeight, state_slot, query_channel, CS)
+        conv_k, wk = _conv_history(Conv, ConvWeight, state_slot, key_channel, CS)
+        conv_v, wv = _conv_history(Conv, ConvWeight, state_slot, value_channel, CS)
+        save_qk = (tile == 0) & (head % 2 == 0)
+
     for token in tl.static_range(WIDTH):
         row = request * WIDTH + token
-        qkv = QKV + row * 8192
-        q = tl.load(qkv + (head // 2) * 128 + k).to(tl.float32)
-        key = tl.load(qkv + 2048 + (head // 2) * 128 + k).to(tl.float32)
-        value = tl.load(qkv + 4096 + head * 128 + v).to(tl.float32)
+        if FUSE_CONV:
+            qkv = QKV + row * 12288
+            window = ConvWindows + request * WS[0] + token * WS[1]
+            q, conv_q = _conv_token(
+                qkv + query_channel, window + query_channel * WS[2], conv_q, wq, save_qk, WS
+            )
+            key, conv_k = _conv_token(
+                qkv + key_channel, window + key_channel * WS[2], conv_k, wk, save_qk, WS
+            )
+            value, conv_v = _conv_token(
+                qkv + value_channel, window + value_channel * WS[2], conv_v, wv, True, WS
+            )
+        else:
+            qkv = QKV + row * 8192
+            q = tl.load(qkv + query_channel).to(tl.float32)
+            key = tl.load(qkv + key_channel).to(tl.float32)
+            value = tl.load(qkv + value_channel).to(tl.float32)
 
         q = (q / tl.sqrt(tl.sum(q * q, 0) + 1.0e-6)) * 0.08838834764831845
         key = key / tl.sqrt(tl.sum(key * key, 0) + 1.0e-6)

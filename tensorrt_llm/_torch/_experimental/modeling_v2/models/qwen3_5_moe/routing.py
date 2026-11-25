@@ -97,8 +97,10 @@ def route(model_config, llm_args, compute_capability):
     kv = llm_args.kv_cache_config
     if kv.use_kv_cache_manager_v2 is False or kv.mamba_ssm_cache_dtype != "float32":
         raise NoTarget("the target requires KV cache manager V2 with FP32 recurrent state")
-    if kv.enable_block_reuse or kv.max_attention_window is not None:
-        raise NoTarget("the target requires full KV history with prefix block reuse disabled")
+    if kv.enable_block_reuse or kv.max_attention_window is not None or kv.enable_kv_pool_rebalance:
+        raise NoTarget(
+            "the target requires full KV history in fixed pools with prefix reuse disabled"
+        )
     if llm_args.cache_transceiver_config is not None:
         raise NoTarget("the target is for colocated prefill and decoding")
     if llm_args.max_beam_width not in (None, 1):
@@ -127,9 +129,13 @@ def route(model_config, llm_args, compute_capability):
             or spec.draft_lm_head_dtype != "auto"
             or spec.draft_moe_dtype != "auto"
             or llm_args.guided_decoding_backend is not None
+            or (spec.acceptance_rate_window_size and spec.acceptance_rate_threshold)
             or not is_gdn_replay_enabled()
         ):
             raise NoTarget("the target supports linear one-model MTP-Eagle with GDN replay")
+        schedule = spec.draft_len_schedule
+        if schedule and (0 in schedule.values() or max(schedule) < llm_args.max_batch_size):
+            raise NoTarget("MTP must retain draft KV history throughout the request")
 
     from .qwen3_6_35b_a3b_nvfp4__sm_100__default.modeling import ModelingV2Qwen36Nvfp4Sm100Default
 
