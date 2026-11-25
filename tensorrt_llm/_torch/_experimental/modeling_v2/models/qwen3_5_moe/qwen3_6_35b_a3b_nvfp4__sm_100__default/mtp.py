@@ -114,7 +114,10 @@ def sample_verified(hidden, head, spec):
 
 def mtp_step(input_ids, hidden, step, md, spec, draft_layer, head, decoder):
     """Accept the prior proposals and draft from the accepted hidden rows."""
-    target = sample_verified(hidden[spec.gather_ids], head, spec)
+    # On a generation-only step every row is a verification position,
+    # in the same order as the runtime's gather indices.
+    selected = hidden[spec.gather_ids] if step.contexts else hidden
+    target = sample_verified(selected, head, spec)
     depth = spec.runtime_draft_len
     batch = step.batch
     num_gens = batch - step.contexts
@@ -174,14 +177,14 @@ def draft_chain(input_ids, hidden, step, md, spec, draft_layer, head, decoder, a
             lookahead = lookahead[:contexts]
             tail = torch.where(lookahead != INVALID_PROMPT_LOOKAHEAD_TOKEN, lookahead, tail)
         shifted[gathered] = tail
-        ids = torch.cat((shifted, ids))
+        ids = torch.cat((shifted, ids)) if gens else shifted
 
     gen_rows = (
         context_tokens + spec.batch_indices_cuda[:gens] * (depth + 1) + lengths[contexts:] - 1
     )
-    rows = torch.cat((gathered, gen_rows))
+    rows = torch.cat((gathered, gen_rows)) if contexts else gen_rows
     positions = step.positions[rows] + 1
-    requests = step.request_rows[rows]
+    requests = decoder.requests[: step.batch]
     next_step = replace(
         step,
         positions=positions,

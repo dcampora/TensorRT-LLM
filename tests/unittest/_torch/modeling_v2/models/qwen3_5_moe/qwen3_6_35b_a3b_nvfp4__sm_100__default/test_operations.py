@@ -294,18 +294,22 @@ def test_gated_attention(cell, certifying):
         request_rows=torch.tensor(requests, device=DEV, dtype=torch.int32),
         context_tokens=ctx,
         contexts=int(bool(ctx)),
+        batch=2,
         max_context=ctx,
         cu=torch.tensor([0, ctx], device=DEV) if ctx else None,
         capacity=512,
         width=width,
     )
     scale = torch.tensor(0.01, device=DEV)
-    if native:
-        workspace = torch.zeros(128 * 1024**2, device=DEV, dtype=torch.uint8)
-        context = attention.paged_context_inputs(step)
-    else:
-        workspace = context = None
-    args = (q, gate, storage, table, step, scale, workspace, context)
+    native_decode = cell.spec.get("native_decode")
+    workspace = (
+        torch.zeros(128 * 1024**2, device=DEV, dtype=torch.uint8)
+        if native or native_decode
+        else None
+    )
+    context = attention.paged_context_inputs(step) if native else None
+    decode = step.positions[width - 1 :: width] + 1 if native_decode else None
+    args = (q, gate, storage, table, step, scale, workspace, context, decode)
     output, reference = op(*args).float(), op.reference(*args).float()
     relative_l2 = (output - reference).norm() / reference.norm()
     # Quantizing the online softmax probabilities and then the gated output

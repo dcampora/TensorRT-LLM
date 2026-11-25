@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import torch
 import triton
+from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
@@ -86,6 +87,14 @@ class PrepareQkv(OpWrapper):
 prepare_qkv = PrepareQkv()
 
 
+def paged_decode_lengths(step) -> torch.Tensor | None:
+    batch = step.batch - step.contexts
+    if not 16 <= batch <= 32:
+        return None
+    tails = step.positions[step.context_tokens + step.width - 1 :: step.width]
+    return tails.to(torch.int32) + 1
+
+
 class PagedContextInputs(NamedTuple):
     query_offsets: torch.Tensor
     kv_lengths: torch.Tensor
@@ -133,6 +142,23 @@ def _native_context(q, kv, table, step, workspace, metadata):
     ).reshape(step.context_tokens, 4096)
 
 
+def _native_decode(q, kv, table, step, workspace, lengths):
+    pages = _role_pages(kv)
+    return trtllm_batch_decode_with_kv_cache(
+        q,
+        (pages, pages),
+        workspace,
+        table[step.contexts : step.batch],
+        lengths,
+        step.capacity,
+        bmm1_scale=0.0625,
+        out_dtype=BF16,
+        backend="trtllm-gen",
+        q_len_per_req=step.width,
+        uses_shared_paged_kv_idx=False,
+    ).reshape(-1, 4096)
+
+
 class GatedAttention(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
@@ -146,9 +172,24 @@ class GatedAttention(OpWrapper):
         ),
         Cell("split-KV decode across nonconsecutive cache pages", {"context": False, "width": 1}),
         Cell("multi-token verification grouped by request", {"context": False, "width": 3}),
+        Cell(
+            "native FP8 decode with independent K and V pages",
+            {"context": False, "width": 3, "native_decode": True},
+        ),
     )
 
-    def __call__(self, q, gate, kv, table, step, output_scale, workspace=None, paged_context=None):
+    def __call__(
+        self,
+        q,
+        gate,
+        kv,
+        table,
+        step,
+        output_scale,
+        workspace=None,
+        paged_context=None,
+        paged_decode=None,
+    ):
         ctx = step.context_tokens
         m = q.shape[0]
         quantized = output_scale is not None
@@ -191,6 +232,12 @@ class GatedAttention(OpWrapper):
             )
         if m > ctx:
             q, gate = q[ctx:], gate[ctx:]
+            if paged_decode is not None and kv.shape[-2] == 32:
+                y = _native_decode(q, kv, table, step, workspace, paged_decode)
+                k.attn_gate[(triton.cdiv(y.numel(), 1024),)](
+                    y, gate, attention[ctx:], y.numel(), 1024, output_scale, quantized
+                )
+                return attention
             positions, requests = step.positions[ctx:], step.request_rows[ctx:]
             rows = m - ctx
             width = step.width
@@ -239,7 +286,18 @@ class GatedAttention(OpWrapper):
             )
         return attention
 
-    def reference(self, q, gate, kv, table, step, output_scale, workspace=None, paged_context=None):
+    def reference(
+        self,
+        q,
+        gate,
+        kv,
+        table,
+        step,
+        output_scale,
+        workspace=None,
+        paged_context=None,
+        paged_decode=None,
+    ):
         rows = []
         page_size = kv.shape[-2]
         pages = _role_pages(kv).float()

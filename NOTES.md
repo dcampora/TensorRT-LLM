@@ -413,3 +413,104 @@ The two ISL 1024 decode trials had TPOT of 1.378 and 1.887 ms.
 | 1024 | 1024 | 1 | 666.1 | 25.97 | 1.471 |
 | 1024 | 1024 | 32 | 6359.9 | 221.70 | 4.663 |
 | 1024 | 1024 | 128 | 10491.3 | 281.77 | 11.107 |
+
+## Draft scheduling trials
+
+The native server tested three drafts at every batch size, a schedule
+with three drafts through batch 32 and one above it, and a schedule
+with three through 8, two through 32, and one above 32. Both schedules
+passed all short HTTP oracle comparisons. They reduced concurrency-128
+p99 TTFT from 2.38 seconds to 1.47 and 1.52 seconds, respectively.
+The fixed three-draft setting had the highest aggregate throughput in
+this sweep.
+
+| ISL | OSL | Concurrency | Fixed three drafts (output tokens/s) | Scheduled three or one (output tokens/s) | Scheduled three, two or one (output tokens/s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 666.1 | 669.7 | 668.7 |
+| 1024 | 1024 | 32 | 6359.9 | 6352.5 | 6040.3 |
+| 1024 | 1024 | 128 | 10491.3 | 10457.7 | 10206.4 |
+
+An Nsight Systems trace of the earlier fixed-depth verifier showed a
+median batch-1 graph span of 4.13 ms, with 63 microseconds between
+graph replays. At batch 128 and width two the median graph span was
+20.76 ms, with a 59-microsecond gap. This directed subsequent work
+toward in-graph kernel costs.
+
+A short BF16 router GEMV with one FP32 reduction reached 730 output
+tokens/s at batch 1, ISL 1024, OSL 1024. It changed two development
+continuations at reference margins of 0.75 and 0.5 nats. A trace of the
+existing four-row router identified 16 split-K partials stored in BF16
+before the final reduction. The FP32-only version was excluded.
+
+## Four-row BF16 router trial and single-token launch
+
+The narrow router trial rounded each of the sixteen 128-product partial
+sums to BF16 before reducing in FP32. On the checkpoint router probe it
+matched the cuBLAS output for all four rows and their 257 channels.
+The isolated launch took 2.55 microseconds versus 9.50 for the cuBLAS
+multiply, before the latter's separate reduction. The trial used it
+on four-row, single-request verification steps. The separate change to
+generation-only input staging passes rows in the order supplied by the
+runtime and avoids redundant gathers.
+
+The launcher sends one-output requests to the already loaded ordinary
+decoder. Both decoders capture the same eligible prefill buckets.
+This skips MTP proposals when the request has already reached its
+token limit. The first token agreed exactly with a 35-output request
+on 35 chats covering ISL 128, 173, 256, 640, 1024, 2048, and 4096.
+Score requests still return the ordinary decoder's full-context logits.
+The launcher protocol checks passed, including EOS inclusion.
+
+The oracle passed all 32 items with mean KL 0.005972 and confident
+top-1 agreement 99.726%. The test suite passed all 54 target unit and
+routing tests. The table reports two-run medians for each chat seed.
+
+| ISL | OSL | Chat seed | Batch-1 TTFT (ms) | Batch-1 TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 100 | 10.33 | 1.383 | 723.0 |
+| 1024 | 1024 | 100 | 18.69 | 1.244 | 803.6 |
+| 4096 | 1024 | 100 | 43.15 | 1.375 | 727.3 |
+| 128 | 1024 | 133 | 9.98 | 1.387 | 720.8 |
+| 1024 | 1024 | 133 | 18.12 | 1.417 | 705.9 |
+| 4096 | 1024 | 133 | 42.78 | 1.437 | 696.0 |
+
+The rounded-router trial changed one distinct HTTP continuation at
+concurrency 32 and 128. The batch-1 teacher-forced gap at the first
+difference rounded to 0.5 nats, so this router variant was removed.
+The table above records the trial's batch-1 measurements.
+
+## Native decode attention trials
+
+The native FlashInfer decode kernel uses the same FP8 HND paged cache
+as context attention. Its independent K and V tables refer to the
+runtime's physical role pages. The FP8-query and BF16-query trials
+passed the batch-1 comparison at concurrency 32. At concurrency 128
+the FP8 trial had one distinct strict-margin disagreement, and the
+BF16-query trial had two. These trials used native decode starting
+at batch 16.
+
+| ISL | OSL | Concurrency | Native FP8 queries (output tokens/s) | Native BF16 queries on FP8 KV (output tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 669.6 | 669.9 |
+| 1024 | 1024 | 32 | 6693.8 | 6672.7 |
+| 1024 | 1024 | 128 | 10826.6 | 10949.0 |
+
+The scoped FP8 path uses native decode for 16 to 32 generation rows
+per step, with a context-length array shared across the ten layers.
+It passed the full 32-item engine oracle and the native HTTP checks
+at concurrency 1, 32 and 128. A broader sweep also passed at 4 and 96.
+It found strict-margin differences from the batch-1 teacher scores
+at concurrency 2, 8, 16, 24, 48 and 64. Concurrency 2 and 8 use
+the local Triton attention path throughout.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 670.9 | 24.89 | 1.463 |
+| 1024 | 1024 | 32 | 6402.6 | 208.46 | 4.601 |
+| 1024 | 1024 | 128 | 10618.6 | 288.41 | 10.950 |
+
+| ISL | OSL | Batch-1 median TTFT (ms) | Batch-1 median TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 10.92 | 1.495 | 668.9 |
+| 1024 | 1024 | 18.41 | 1.379 | 725.0 |
+| 4096 | 1024 | 44.35 | 1.521 | 657.5 |

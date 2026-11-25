@@ -18,7 +18,7 @@ from .... import disable_v2_by_default
 from ..routing import LAYER_TYPES
 from .kernels.cute_moe import PackedVocabulary
 from .mtp import DraftLayer, mtp_step
-from .ops.attention import gated_attention, paged_context_inputs, prepare_qkv
+from .ops.attention import gated_attention, paged_context_inputs, paged_decode_lengths, prepare_qkv
 from .ops.moe import ExpertEpilogue, Experts, residual_rms_norm
 from .ops.projections import delta_gate_projection, fp8_linear
 from .ops.recurrent import convolution_decode, delta_decode, delta_norm, delta_prefill
@@ -108,13 +108,21 @@ class FullAttention(nn.Module):
     def input_scale(self) -> torch.Tensor:
         return self.qkv.input_scale
 
-    def forward(self, x8, step, kv, table, rope, workspace, context_inputs):
+    def forward(self, x8, step, kv, table, rope, workspace, context_inputs, decode_lengths):
         qkv = fp8_linear(x8, self.qkv)
         q, gate = prepare_qkv(
             qkv, self.qnorm, self.knorm, rope, step.positions, step.request_rows, kv, table
         )
         y = gated_attention(
-            q, gate, kv, table, step, self.output.input_scale, workspace, context_inputs
+            q,
+            gate,
+            kv,
+            table,
+            step,
+            self.output.input_scale,
+            workspace,
+            context_inputs,
+            decode_lengths,
         )
         return fp8_linear(y, self.output)
 
@@ -323,6 +331,7 @@ class QwenDecoder(DecoderModel):
             x = inputs_embeds[: step.positions.numel()]
         side = None if prefill_graph else self.side
         context_inputs = paged_context_inputs(step)
+        decode_lengths = paged_decode_lengths(step)
         residual = torch.empty_like(x)
         first = self.layers[0]
         x8 = torch.empty_like(x, dtype=FP8)
@@ -334,7 +343,14 @@ class QwenDecoder(DecoderModel):
                 kv, pool = cache
                 table = block_offsets[pool]
                 x = layer.attention(
-                    x8, step, kv, table, self.rope, self.attention_workspace, context_inputs
+                    x8,
+                    step,
+                    kv,
+                    table,
+                    self.rope,
+                    self.attention_workspace,
+                    context_inputs,
+                    decode_lengths,
                 )
             else:
                 x = layer.attention(x, x8, step, cache, side)
@@ -445,7 +461,7 @@ class ModelingV2Qwen36Nvfp4Sm100Default(DecoderModelForCausalLM):
                 self.lm_head,
                 self.model,
             )
-        if not return_context_logits:
+        if step.contexts and not return_context_logits:
             last = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             hidden = hidden[last]
         return self.lm_head(hidden).float()

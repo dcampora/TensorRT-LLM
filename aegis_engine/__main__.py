@@ -18,7 +18,7 @@ def token_ids(values, vocab_size, *, allow_empty=False):
     return values
 
 
-def handle(generator, scorer, request, vocab_size, eos):
+def handle(generator, scorer, request, vocab_size, eos, single_token_scorer):
     import torch
 
     from tensorrt_llm import SamplingParams
@@ -43,7 +43,8 @@ def handle(generator, scorer, request, vocab_size, eos):
             include_stop_str_in_output=True,
             **common,
         )
-        output = generator.generate(ids, params, use_tqdm=False)
+        engine = scorer if count == 1 and single_token_scorer else generator
+        output = engine.generate(ids, params, use_tqdm=False)
         return {"ids": list(output.outputs[0].token_ids)}
 
     rows = len(ids) - 1
@@ -110,6 +111,7 @@ def main():
             max_tokens=16384 if drafts else None,
         ),
     )
+    single_token_scorer = mode == "require" and bool(drafts)
     prefill_graph_options = {}
     if mode == "require" and os.environ.get("AEGIS_PREFILL_GRAPHS", "1") == "1":
         prefill_graph_options.update(
@@ -121,8 +123,7 @@ def main():
         print(json.dumps(value, separators=(",", ":")), file=reply, flush=True)
 
     with ExitStack() as stack:
-        scorer_options = {**options, **({} if drafts else prefill_graph_options)}
-        scorer = stack.enter_context(LLM(str(model), **scorer_options))
+        scorer = stack.enter_context(LLM(str(model), **options, **prefill_graph_options))
         generator = scorer
         if drafts:
             # The speculative sampler needs a separate ordinary decoder for
@@ -142,7 +143,7 @@ def main():
                 if request["op"] == "shutdown":
                     send({"ok": True})
                     break
-                send(handle(generator, scorer, request, vocab_size, eos))
+                send(handle(generator, scorer, request, vocab_size, eos, single_token_scorer))
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                 send({"error": str(exc)})
 
