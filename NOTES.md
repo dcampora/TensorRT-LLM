@@ -1011,3 +1011,28 @@ All 384 development serving comparisons passed, with two zero-gap
 differences from batch 1. The 208 OSL 128 and 160 OSL 1024 long-prompt
 responses matched batch 1 token for token. A sampled completion
 returned at temperature 0.8.
+
+## Final matched serving sweep
+
+### Modeling V1 and V2, ISL 1024 and 4096, OSL 1024
+
+The V2 server ran through `serve.sh`. Both sweeps used
+`/task/bench_serving.py` defaults with a 16-token warmup wave, a
+minimum of 16 measured requests, and four measured requests per
+concurrency slot. Prompt hashes, request counts, and token counts match
+for all 11 cells. V1 used the same launcher YAML with `modeling_v2: "off"`
+and `TRTLLM_USE_GDN_REPLAY=0` to enable its full-state checkpoint path.
+
+| ISL | Concurrency | Requests | V1 output tokens/s | V2 output tokens/s | V2 throughput gain | V2 median TTFT (ms) | V2 median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1 | 16 | 215.44 | 369.68 | +71.6% | 76.47 | 2.628 |
+| 1024 | 2 | 16 | 374.71 | 550.64 | +47.0% | 129.97 | 3.350 |
+| 1024 | 4 | 16 | 617.53 | 899.43 | +45.6% | 124.82 | 4.233 |
+| 1024 | 8 | 32 | 1252.58 | 1787.31 | +42.7% | 129.85 | 4.221 |
+| 1024 | 16 | 64 | 2340.17 | 2694.57 | +15.1% | 138.89 | 5.561 |
+| 1024 | 32 | 128 | 3416.93 | 3674.80 | +7.5% | 234.47 | 8.391 |
+| 1024 | 64 | 256 | 3625.85 | 4974.30 | +37.2% | 297.85 | 12.353 |
+| 1024 | 128 | 512 | 4612.22 | 5568.02 | +20.7% | 451.70 | 22.747 |
+| 4096 | 1 | 16 | 202.11 | 330.06 | +63.3% | 131.16 | 2.963 |
+| 4096 | 8 | 32 | 1227.94 | 1519.18 | +23.7% | 163.81 | 4.805 |
+| 4096 | 32 | 128 | 2558.43 | 2900.53 | +13.4% | 287.30 | 10.166 |
