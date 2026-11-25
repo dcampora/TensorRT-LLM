@@ -510,7 +510,8 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
                 self.model_config,
                 self.model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
-                spec_decode_fast_paths=self.spec_decode_fast_paths,
+                # The row-picking draft layer replaces the full-row epilogue.
+                spec_decode_fast_paths=False,
             )
             self.spec_worker.set_draft_model(self.draft_model)
 
@@ -564,7 +565,12 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
             input_ids = input_ids[:live]
             position_ids = position_ids[..., :live]
         if speculative:
-            logits = self.lm_head(hidden.index_select(0, spec_metadata.gather_ids)).float()
+            logits = self.lm_head(hidden.index_select(0, spec_metadata.gather_ids))
+            if (
+                not spec_metadata.is_all_greedy_sample
+                or self.spec_worker.guided_decoder is not None
+            ):
+                logits = logits.float()
             return self.spec_worker(
                 input_ids=input_ids,
                 position_ids=position_ids,

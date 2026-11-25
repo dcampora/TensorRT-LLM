@@ -607,3 +607,64 @@ same score metrics. All 384 development serving checks passed and all
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 4197.19 | 934.87 | 6.265 |
 | 128 | 128 | 6423.66 | 2496.88 | 16.977 |
+
+## Additional decode controls
+
+Periodic exact GDN checkpoints stored fewer state rows, with a longer
+replay at the following step. All tested buffers and outputs matched the
+existing deferred-replay reference bitwise. At batch 128, the best
+periodic kernel took 205.90 microseconds per layer, compared with 202.29
+for committing the first verifier row. At batch 32 the best periodic
+kernel took 90.20 microseconds, compared with 89.11. The first-row
+commit remains the default.
+
+A four-query paged attention kernel reused the same K/V loads across
+both query pairs. It matched the pair kernel bit for bit and improved
+an isolated 2048-token-capacity batch-32 case from 98.59 to 96.74
+microseconds. The gain was smaller after adopting pipelined page loads,
+so the target continues to use the pair kernel.
+
+The draft MLP kept the original BF16 GEMMs. PyTorch's BF16 linear
+projection took 60.08 microseconds for gate and up and 32.95 for down
+at one row. Alternate CuTe, cuBLASLt, and cuDNN tactics gave no
+consistent gain over the one-, five-, 32-, and 128-row controls.
+
+### Batch-1 draft-depth sweep, ISL 128, 1024, 4096 and OSL 1024
+
+Both diagnostics passed all 32 oracle cases. The engine uses four drafts
+for all three lengths. Timings below use the same paired contract requests.
+
+| ISL | Four drafts (decode tokens/s) | Five drafts (decode tokens/s) | Six drafts (decode tokens/s) |
+| ---: | ---: | ---: | ---: |
+| 128 | 432.80 | 430.23 | 439.43 |
+| 1024 | 392.56 | 389.72 | 386.27 |
+| 4096 | 358.62 | 348.61 | 344.71 |
+
+## Selected first-draft rows
+
+The split MTP worker supplies one selected output row per request to its
+first draft pass. The draft layer writes every candidate K/V row before it
+computes attention and the feed-forward path on the selected rows. In
+pure decode, it reuses the target's fused rotary and paged-write operation.
+The greedy target sampler reads the BF16 head output directly. Advanced
+sampling and guided decoding still receive FP32 target logits.
+
+The 44 operation cells, 32 contract cases, and 384 development serving
+checks passed. All 208 long-prompt serving responses matched batch 1.
+Removing the full-row draft epilogue reduced serving TTFT and slightly
+increased throughput. Batch-1 decode decreased by about 1% in this trial.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 13.41 | 2.334 | 428.37 |
+| 1024 | 1024 | 35.91 | 2.572 | 388.81 |
+| 4096 | 1024 | 125.64 | 2.813 | 355.54 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4234.40 | 883.80 | 6.242 |
+| 128 | 128 | 6541.41 | 2372.53 | 16.741 |

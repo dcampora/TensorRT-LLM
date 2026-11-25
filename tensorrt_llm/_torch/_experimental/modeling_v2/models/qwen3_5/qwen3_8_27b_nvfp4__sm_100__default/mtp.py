@@ -75,10 +75,6 @@ class MtpLayer(nn.Module):
         residual = _draft_linear(features, self.fc)
         x = fi.gemma_rmsnorm(residual, self.input_norm, self.eps)
         projection = _draft_linear(x, self.qkv)
-        q, k, v, gate = prepare_qkv(
-            projection, self.q_norm, self.k_norm, self.rope, positions, self.eps
-        )
-
         manager = md.kv_cache_manager
         if manager is not self._manager:
             # A shared-cache draft view addresses the MTP layer at local index zero.
@@ -89,40 +85,74 @@ class MtpLayer(nn.Module):
         table = md.kv_cache_block_offsets[cache.group, :, 0]
         contexts = md.num_contexts
         ctx_rows = md.num_ctx_tokens if contexts else 0
-        outputs = []
-        if contexts:
-            lengths = md.seq_lens[:contexts].tolist()
-            chunks = torch.tensor(
-                [
-                    (i, tile)
-                    for i, length in enumerate(lengths)
-                    for tile in range(tr.cdiv(length, 64))
-                ],
-                device=q.device,
-                dtype=torch.int32,
+        generations = md.num_seqs - contexts
+        width = (rows - ctx_rows) // generations if generations else 1
+        if not contexts:
+            q, _, _, gate = prepare_qkv(
+                projection,
+                self.q_norm,
+                self.k_norm,
+                self.rope,
+                positions,
+                self.eps,
+                cache=cache,
+                table=table,
+                rows_per_seq=width,
+            )
+        else:
+            q, k, v, gate = prepare_qkv(
+                projection, self.q_norm, self.k_norm, self.rope, positions, self.eps
             )
             mamba = md.mamba_metadata
             req = mamba.seq_idx.reshape(-1)[:ctx_rows]
-            starts = mamba.cu_seqlens[: contexts + 1]
             append_kv(k[:ctx_rows], v[:ctx_rows], positions[:ctx_rows], cache, table, req)
+            if generations:
+                append_kv(
+                    k[ctx_rows:],
+                    v[ctx_rows:],
+                    positions[ctx_rows:],
+                    cache,
+                    table,
+                    None,
+                    width,
+                    contexts,
+                )
+        if pick_rows is not None:
+            # All keys and values are already staged. The worker consumes one
+            # hidden row per request after this first draft pass.
+            x = decode_attention(
+                q.index_select(0, pick_rows),
+                gate.index_select(0, pick_rows),
+                positions.index_select(0, pick_rows),
+                cache,
+                table,
+            )
+            residual = residual.index_select(0, pick_rows)
+        elif not contexts:
+            x = decode_attention(q, gate, positions, cache, table, rows_per_seq=width)
+        else:
+            lengths = md.seq_lens[:contexts].tolist()
+            chunks = torch.tensor(
+                [(i, tile) for i, n in enumerate(lengths) for tile in range(tr.cdiv(n, 64))],
+                device=q.device,
+                dtype=torch.int32,
+            )
+            starts = md.mamba_metadata.cu_seqlens[: contexts + 1]
             output = paged_context_attention(
                 q[:ctx_rows], starts, chunks, positions[:ctx_rows], cache, table
             )
-            outputs.append(apply_gate(output, gate[:ctx_rows]))
-        if ctx_rows < rows:
-            width = (rows - ctx_rows) // (md.num_seqs - contexts)
-            qd, gd, kd, vd = (x[ctx_rows:] for x in (q, gate, k, v))
-            pd = positions[ctx_rows:]
-            append_kv(kd, vd, pd, cache, table, None, width, contexts)
-            outputs.append(
-                decode_attention(
-                    qd, gd, pd, cache, table, rows_per_seq=width, request_start=contexts
+            x = apply_gate(output, gate[:ctx_rows])
+            if generations:
+                decoded = decode_attention(
+                    q[ctx_rows:],
+                    gate[ctx_rows:],
+                    positions[ctx_rows:],
+                    cache,
+                    table,
+                    rows_per_seq=width,
+                    request_start=contexts,
                 )
-            )
-        x = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
-        if pick_rows is not None:
-            x = x.index_select(0, pick_rows)
-            residual = residual.index_select(0, pick_rows)
+                x = torch.cat((x, decoded))
         x = _draft_linear(x, self.out)
         fi.gemma_fused_add_rmsnorm(x, residual, self.post_norm, self.eps)
         x = F.linear(fi.silu_and_mul(F.linear(x, self.gate_up)), self.down)
