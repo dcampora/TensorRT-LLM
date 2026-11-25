@@ -6,6 +6,7 @@ import torch
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import attention
+from ..kernels.short_paged import short_paged
 
 
 class PrepareQkv(OpWrapper):
@@ -125,3 +126,63 @@ class ShortCausalAttention(OpWrapper):
 prepare_qkv = PrepareQkv()
 attention_gate = AttentionGate()
 short_causal_attention = ShortCausalAttention()
+
+
+class ShortPagedAttention(OpWrapper):
+    """Replace short generation rows with the target's stable split-softmax reduction."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell(
+            "Nonconsecutive BF16 KV pages with a mixed-batch table offset",
+            dict(rows=3, contexts=2, tokens=1),
+        ),
+        Cell(
+            "Linear verification rows and a long-history row left intact",
+            dict(rows=4, contexts=0, tokens=2),
+        ),
+    )
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        pages: torch.Tensor,
+        table: torch.Tensor,
+        positions: torch.Tensor,
+        result: torch.Tensor,
+        index_divisor: int,
+        contexts: int,
+        tokens: int,
+    ) -> torch.Tensor:
+        return short_paged(q, pages, table, positions, result, index_divisor, contexts, tokens)
+
+    def reference(
+        self,
+        q: torch.Tensor,
+        pages: torch.Tensor,
+        table: torch.Tensor,
+        positions: torch.Tensor,
+        result: torch.Tensor,
+        index_divisor: int,
+        contexts: int,
+        tokens: int,
+    ) -> torch.Tensor:
+        page_size = pages.shape[-2]
+        with true_fp32_matmul():
+            for row, position in enumerate(positions.tolist()):
+                if not 0 <= position < 256:
+                    continue
+                seq = contexts + row // tokens
+                offsets = torch.arange(position + 1, device=q.device)
+                slots = table[seq, offsets // page_size] // index_divisor
+                kv = pages[slots, :, :, offsets % page_size, :].float()
+                key = kv[:, 0].transpose(0, 1).repeat_interleave(6, dim=0)
+                value = kv[:, 1].transpose(0, 1).repeat_interleave(6, dim=0)
+                scores = torch.einsum("hd,htd->ht", q[row].float(), key) * 0.0625
+                result[row].copy_(
+                    torch.einsum("ht,htd->hd", scores.softmax(-1), value).flatten().bfloat16()
+                )
+        return result
+
+
+short_paged_attention = ShortPagedAttention()

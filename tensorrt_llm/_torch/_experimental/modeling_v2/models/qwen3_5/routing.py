@@ -64,9 +64,14 @@ def route(
     ):
         raise NoTarget("Qwen3.8-27B requires dynamic E4M3 with 128 x 128 weight blocks")
 
+    if llm_args.dtype not in ("auto", "bfloat16"):
+        raise NoTarget("Qwen3.8-27B FP8 expects BF16 activations")
+
     kv = llm_args.kv_cache_config
     if kv.dtype != "auto" or kv.max_attention_window is not None:
         raise NoTarget("Qwen3.8-27B FP8 uses a BF16 KV cache with full history")
+    if kv.use_kv_cache_manager_v2 is False:
+        raise NoTarget("Qwen3.8-27B FP8 uses the V2 hybrid cache manager")
     if kv.enable_block_reuse:
         raise NoTarget("Qwen3.8-27B FP8 requires enable_block_reuse=False")
     if llm_args.attn_backend != "TRTLLM" or llm_args.max_beam_width != 1:

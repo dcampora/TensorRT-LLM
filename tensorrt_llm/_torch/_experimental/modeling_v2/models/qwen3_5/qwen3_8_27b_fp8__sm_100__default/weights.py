@@ -99,3 +99,4 @@ def load_model(
         inv_freq,
     )
     decoder.rope = torch.cat((phase.cos(), phase.sin()), dim=1)
+    decoder.gate_workspace = torch.empty(16 * 1024 * 1024, device=device, dtype=torch.uint8)

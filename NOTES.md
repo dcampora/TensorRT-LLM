@@ -39,6 +39,9 @@ so a matched, isolated comparison is needed for final speedups.
 | 1024 | 1024 | 32 | 2763.88 | 705.88 |
 | 1024 | 1024 | 64 | 3597.54 | 945.20 |
 | 1024 | 1024 | 128 | 4972.34 | 955.82 |
+| 4096 | 1024 | 1 | 83.05 | 226.16 |
+| 4096 | 1024 | 8 | 796.49 | 904.99 |
+| 4096 | 1024 | 32 | 1917.37 | 1107.32 |
 
 ## Modeling V2 implementation
 
@@ -84,3 +87,64 @@ development item 28. It passed at concurrency 1 and first diverged at
 token 4, at the 0.5-nat cutoff, at concurrency 32 and 128. The reference
 engine also found that short contexts and the BF16 GDN gate projection were
 sensitive to batching. This remained open in the initial bring-up.
+
+## Standalone reference rerun
+
+I ran a copy of the reference branch's `engine.sh` against the same
+checkpoint and development oracle. The cache and native build went under
+`/tmp` and the home directory. The run used the installed CUTLASS headers
+from FlashInfer and quoted passages from the TensorRT-LLM documentation.
+
+The reference passed all B1, B32 and B128 greedy checks. B1 mean KL was
+0.003288 and non-tie top-1 agreement was 99.909%. B1/B32 each had 11 exact,
+20 near-tie and one fragile continuation. B128 had 44 exact, 80 near-tie and
+four fragile continuations. The reference evaluation reports a memory-gate
+failure. The local run also allocated over 120 GiB during startup.
+
+Each row reports the median of two external measurements. TTFT uses OSL 1.
+Decode measures output tokens 33 through 1024 and sums TPS across the static
+batch. The B1/ISL 1024 measurements overlapped a V2 diagnostic and are
+included for completeness.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 15.71 | 3.670 | 272.47 |
+| 1 | 1024 | 1024 | 55.24 | 4.904 | 203.94 |
+| 1 | 4096 | 1024 | 181.62 | 4.342 | 230.31 |
+| 32 | 1024 | 1024 | 1356.26 | 7.677 | 4168.22 |
+| 128 | 1024 | 1024 | 5545.52 | 17.196 | 7443.61 |
+
+## Batch stability
+
+Isolating short prefill GEMMs left the item 28 divergence in place.
+Pinning the BF16 GDN gate GEMM alone also left it in place. I retained
+the gate kernel for the consistent split-K schedule and added the
+reference engine's split-softmax decode reduction for histories up to
+256 tokens. The adapted kernel reads TensorRT-LLM's strided BF16 pages.
+Native attention appends KV and handles longer histories. The short-history
+reduction restored the expected output on the item 28 reproduction at both
+B1 and B32.
+
+All 32 batch-1 oracle items still passed with mean KL 0.003288 and 99.909%
+non-tie top-1 agreement. The result included 10 exact, 21 near-tie and one
+accepted fragile continuation. All 33 target operation tests passed on GB200.
+
+Batch-1 external times for the non-speculative V2 build follow. TTFT uses
+OSL 1 and TPOT covers tokens 33 through 1024. This path uses the runtime's
+decode graphs and overlap scheduler.
+
+| ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 65.24 | 9.867 | 101.34 |
+| 1024 | 1024 | 68.49 | 9.873 | 101.29 |
+| 4096 | 1024 | 196.38 | 9.929 | 100.71 |
+
+The CUDA toolkit build for the fixed GDN gate projection comes
+from reference `ba_lt.cpp` and `ba_lt.py`. Its shared library caches under
+`~/.cache/tensorrt_llm/qwen38_fp8_sm100`. The C++ implementation would
+move to the target's `csrc/` in a source-built contribution.
+
+The OpenAI token-ID check reproduced the batch-1 continuations at
+concurrency 1, 32 and 128. Across the three runs there were zero
+unaccepted first divergences against the development oracle and zero
+token-ID differences from the batch-1 V2 results.

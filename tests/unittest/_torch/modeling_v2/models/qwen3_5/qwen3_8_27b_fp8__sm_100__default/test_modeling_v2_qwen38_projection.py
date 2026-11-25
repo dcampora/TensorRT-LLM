@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.gates import (  # noqa: E501
+    fixed_gate_projection,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.projection import (  # noqa: E501
     block_matmul,
     block_quantize,
@@ -61,3 +64,21 @@ def test_requantize(cell, certifying):
     expected, expected_scales = block_requantize.reference(w, scales)
     torch.testing.assert_close(converted_scales, expected_scales, atol=0, rtol=0)
     torch.testing.assert_close(converted.float(), expected.float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("cell", fixed_gate_projection.CELLS, ids=lambda cell: cell.why)
+def test_gate_projection(cell, certifying):
+    """The pinned BF16 kernel uses the same reduction on every tested width."""
+    assert torch.cuda.is_available()
+    torch.manual_seed(7)
+    rows = cell.spec["rows"]
+    x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(96, 5120, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(16 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    certifying(fixed_gate_projection)
+    output = fixed_gate_projection(x, w, workspace)
+    expect = fixed_gate_projection.reference(x, w, workspace)
+    assert_within_ulp(output, expect, 1.0, 0.5)
+    torch.testing.assert_close(
+        output[:1], fixed_gate_projection(x[:1], w, workspace), atol=0, rtol=0
+    )

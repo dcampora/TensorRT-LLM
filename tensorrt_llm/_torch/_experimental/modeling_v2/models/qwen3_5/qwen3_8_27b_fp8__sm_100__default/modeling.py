@@ -16,7 +16,13 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 
 from .... import disable_v2_by_default
 from . import weights
-from .ops.attention import attention_gate, prepare_qkv, short_causal_attention
+from .ops.attention import (
+    attention_gate,
+    prepare_qkv,
+    short_causal_attention,
+    short_paged_attention,
+)
+from .ops.gates import fixed_gate_projection
 from .ops.paged_attention import attention_arguments, paged_attention
 from .ops.projection import block_matmul, block_quantize
 from .ops.recurrent import (
@@ -65,6 +71,7 @@ class Step:
     context_rows: int
     context_slots: torch.Tensor
     generation_slots: torch.Tensor
+    gate_workspace: torch.Tensor
     context_offsets: torch.Tensor | None = None
     host_offsets: list[int] | None = None
     context_lengths: list[int] | None = None
@@ -73,7 +80,9 @@ class Step:
     short_starts: torch.Tensor | None = None
 
     @classmethod
-    def prepare(cls, md: "TrtllmAttentionMetadata", positions: torch.Tensor) -> "Step":
+    def prepare(
+        cls, md: "TrtllmAttentionMetadata", positions: torch.Tensor, gate_workspace: torch.Tensor
+    ) -> "Step":
         """Use only device metadata for the graph-captured decode path."""
         mamba = md.mamba_metadata
         contexts = md.num_contexts
@@ -84,6 +93,7 @@ class Step:
             md.num_ctx_tokens,
             mamba.state_indices[:contexts],
             mamba.state_indices[contexts : md.num_seqs],
+            gate_workspace,
         )
         if contexts:
             lengths = md.seq_lens[:contexts].tolist()
@@ -210,7 +220,12 @@ class DecoderLayer(nn.Module):
                 )
             parts.append(context)
         if split < x.shape[0]:
-            ba = F.linear(x[split:], self.ba)
+            gen = x[split:]
+            ba = (
+                fixed_gate_projection(gen, self.ba, step.gate_workspace)
+                if gen.shape[0] <= 512
+                else F.linear(gen, self.ba)
+            )
             convolved = causal_convolution(p[split:], self.conv, conv_state, step.generation_slots)
             parts.append(
                 recurrent_delta(
@@ -236,6 +251,26 @@ class DecoderLayer(nn.Module):
         )
         layer = step.metadata.kv_cache_manager.layer_offsets[self.index]
         out = paged_attention(q, k, v, layer, step.attention_args)
+        manager = step.metadata.kv_cache_manager
+        if step.context_rows < p.shape[0]:
+            pages = manager.get_buffers(self.index, kv_layout="HND")
+            offset_scale = manager.get_layer_page_index_scale(self.index)
+            # The V2 view is indexed by K/V pairs when every slot starts
+            # on a pair boundary. Otherwise its leading stride spans a slot.
+            divisor = 2 if offset_scale % 2 == 0 else offset_scale
+            pool = int(step.metadata.host_kv_cache_pool_mapping[layer, 0])
+            table = step.metadata.kv_cache_block_offsets[pool, :, 0, :]
+            split = step.context_rows
+            short_paged_attention(
+                q[split:],
+                pages,
+                table,
+                step.positions[split:],
+                out[split:],
+                divisor,
+                step.metadata.num_contexts,
+                1,
+            )
         if step.short_chunks is not None:
             split = step.context_rows
             context = short_causal_attention(
@@ -285,7 +320,7 @@ class Qwen38TextModel(DecoderModel):
                 for index, layer_type in enumerate(self.config.layer_types)
             ]
         )
-        for name in ("embedding", "final_norm", "rope"):
+        for name in ("embedding", "final_norm", "rope", "gate_workspace"):
             self.register_buffer(name, None)
 
     def forward(
@@ -299,7 +334,7 @@ class Qwen38TextModel(DecoderModel):
         """Generate hidden rows in the same packed order supplied by the executor."""
         assert position_ids is not None
         positions = position_ids.reshape(-1, position_ids.shape[-1])[0]
-        step = Step.prepare(attn_metadata, positions)
+        step = Step.prepare(attn_metadata, positions, self.gate_workspace)
         x = F.embedding(input_ids, self.embedding) if inputs_embeds is None else inputs_embeds
         residual = None
         for layer in self.layers:

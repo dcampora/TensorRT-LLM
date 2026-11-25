@@ -11,6 +11,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp
     attention_gate,
     prepare_qkv,
     short_causal_attention,
+    short_paged_attention,
 )
 
 __extra_import_path__ = ["../../.."]
@@ -77,3 +78,29 @@ def test_short_attention(cell, certifying):
     assert_within_ulp(
         short_causal_attention(*args), short_causal_attention.reference(*args), 1.0, 0.5
     )
+
+
+@pytest.mark.parametrize("cell", short_paged_attention.CELLS, ids=lambda cell: cell.why)
+def test_short_paged_attention(cell, certifying):
+    """Read layer-specific addresses and preserve unmodified long rows."""
+    assert torch.cuda.is_available()
+    torch.manual_seed(32)
+    rows, contexts, tokens = (cell.spec[name] for name in ("rows", "contexts", "tokens"))
+    q = _rand(rows, 24, 256)
+    pages = _rand(40, 2, 4, 32, 256)[::2]
+    table = torch.stack(
+        [
+            torch.randperm(20, device="cuda", dtype=torch.int32) * 2
+            for _ in range(contexts + rows // tokens)
+        ]
+    )
+    pos = [31, 42, 81] if rows == 3 else [66, 67, 400, 401]
+    positions = torch.tensor(pos, dtype=torch.int32, device="cuda")
+    output = _rand(rows, 6144)
+    expect = output.clone()
+    certifying(short_paged_attention)
+    short_paged_attention(q, pages, table, positions, output, 2, contexts, tokens)
+    short_paged_attention.reference(q, pages, table, positions, expect, 2, contexts, tokens)
+    assert_within_ulp(output, expect, 2.0, 1.0)
+    if rows == 4:
+        torch.testing.assert_close(output[2:], expect[2:], atol=0, rtol=0)
