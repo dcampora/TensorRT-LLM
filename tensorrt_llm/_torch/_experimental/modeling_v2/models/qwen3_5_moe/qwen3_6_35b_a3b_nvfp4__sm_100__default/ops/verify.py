@@ -7,6 +7,7 @@ import torch
 
 from .....catalog._op import Arch, Cell, OpWrapper
 from ..kernels import verify_gdn as k
+from ..kernels import verify_gdn_tiled
 from ..weights import BF16
 
 
@@ -57,6 +58,10 @@ class DeltaVerify(OpWrapper):
             "fused convolution with an anchor rollover",
             {"batch": 1, "width": 4, "previous": (15,), "fused": True},
         ),
+        Cell(
+            "tiled wide verification with rollover",
+            {"batch": 64, "width": 2, "previous": (10, 15, 0, 1) * 16},
+        ),
     )
 
     def __call__(
@@ -79,6 +84,38 @@ class DeltaVerify(OpWrapper):
     ):
         rows = qkv.shape[0]
         out = torch.empty((rows, 32, 128), dtype=BF16, device=qkv.device)
+        batch = rows // width
+        if conv is None and batch >= 32:
+            qk = torch.empty((rows, 16, 256), dtype=torch.float32, device=qkv.device)
+            gates = torch.empty((rows, 32, 3), dtype=torch.float32, device=qkv.device)
+            verify_gdn_tiled.prepare[(rows, 16)](qkv, ba, a_log, dt, qk, gates, num_warps=4)
+            tile = 32
+            verify_gdn_tiled.verify[(128 // tile, 32, batch)](
+                qkv,
+                qk,
+                gates,
+                slots,
+                replay_slots,
+                state,
+                delta,
+                key,
+                decay,
+                accepted,
+                buffer,
+                out,
+                state.stride(0),
+                delta.stride(),
+                key.stride(),
+                decay.stride(),
+                accepted.stride(0),
+                buffer.stride(0),
+                delta.shape[2],
+                max_width,
+                width,
+                tile,
+                num_warps=4,
+            )
+            return out
         tile = 8 if rows <= 4 else 32
         weight, history, windows = conv if conv else (None, None, None)
         k.delta_verify[(rows // width, 32, 128 // tile)](

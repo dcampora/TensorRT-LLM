@@ -93,6 +93,7 @@ class ConvolutionPrefill(OpWrapper):
         Cell(
             "tiled fresh prefill with a one-token request", {"lengths": (1, 137), "initial": False}
         ),
+        Cell("tiled prefill with continuation history", {"lengths": (2, 137), "initial": True}),
     )
 
     def __call__(self, x, weight, rows, cu, slots, history, initial_history):
@@ -101,7 +102,7 @@ class ConvolutionPrefill(OpWrapper):
         q = torch.empty((count, 16, 128), **opts)
         key = torch.empty_like(q)
         value = torch.empty((count, 32, 128), **opts)
-        if count >= 64 and initial_history is None:
+        if count >= 64:
             tile = 4 if count <= 128 else 8
             prefill_stencil.conv[(triton.cdiv(count, tile), 16)](
                 x,
@@ -109,14 +110,17 @@ class ConvolutionPrefill(OpWrapper):
                 rows,
                 cu,
                 slots,
+                initial_history,
                 history,
                 q,
                 key,
                 value,
                 count,
                 history.stride(),
+                initial_history.stride() if initial_history is not None else (),
                 tile,
                 512,
+                initial_history is not None,
                 num_warps=4,
             )
         else:

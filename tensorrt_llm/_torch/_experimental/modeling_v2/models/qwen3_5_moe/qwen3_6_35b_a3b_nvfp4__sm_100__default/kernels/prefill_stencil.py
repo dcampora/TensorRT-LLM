@@ -10,7 +10,22 @@ from triton.experimental.gluon.language import BlockedLayout, SliceLayout
 
 @gluon.jit
 def conv(
-    X, W, Rows, CU, Slots, History, Q, K, V, M, HS: gl.constexpr, R: gl.constexpr, C: gl.constexpr
+    X,
+    W,
+    Rows,
+    CU,
+    Slots,
+    Initial,
+    History,
+    Q,
+    K,
+    V,
+    M,
+    HS: gl.constexpr,
+    IS: gl.constexpr,
+    R: gl.constexpr,
+    C: gl.constexpr,
+    HAS_INITIAL: gl.constexpr,
 ):
     layout: gl.constexpr = BlockedLayout([1, 4], [1, 32], [1, 4], [1, 0])
     t = gl.program_id(0) * R + gl.arange(0, R, layout=SliceLayout(1, layout))
@@ -30,6 +45,15 @@ def conv(
             ((previous >= start) & (t < M))[:, None],
             0.0,
         )
+        if HAS_INITIAL and lag < 3:
+            frame = previous - start + 3
+            use_history = (previous < start) & (t < M)
+            cached = gl.load(
+                Initial + (row * IS[0] + frame * IS[2])[:, None] + channel[None, :] * IS[1],
+                use_history[:, None],
+                0.0,
+            )
+            x = gl.where(use_history[:, None], cached, x)
         w = gl.load(W + channel * 4 + lag).to(gl.float32)
         value = gl.fma(x.to(gl.float32), w[None, :], value)
         if lag > 0:

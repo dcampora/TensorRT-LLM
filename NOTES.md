@@ -99,9 +99,12 @@ developer guide because its default source paths were absent.
 | 1024 | 1024 | 128 | 8769.5 | 267.03 | 14.308 |
 | 4096 | 1024 | 1 | 193.5 | 89.74 | 5.083 |
 | 4096 | 1024 | 8 | 1220.7 | 337.52 | 6.203 |
+| 4096 | 1024 | 32 | 3075.4 | 340.40 | 10.045 |
 
-The retry completed the 1024-token prompt run at concurrency 128. The
-4096-token prompt sweep disconnected during warmup at concurrency 32.
+The retries completed the 1024-token concurrency-128 and 4096-token
+concurrency-32 measurements. The 4096-token sweep first disconnected
+during warmup at concurrency 32. A fresh benchmark client ran that level
+in isolation and completed 64 measured requests.
 
 ## Standalone comparison
 
@@ -307,3 +310,65 @@ and confident top-1 agreement 99.726%.
 The native server started and passed the batch-1 comparisons at
 concurrencies 1, 32 and 128. The launcher's protocol checks covered error
 recovery, requested log-probability order, and EOS inclusion.
+
+The first tiled rotary implementation specialized on the number of
+input rows. Continuous batching compiled 49 rotary variants after
+server startup during the first sweep. The compile stalls affected
+throughput and late-arriving prompts.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 655.7 | 25.41 |
+| 1024 | 1024 | 32 | 4301.2 | 1035.47 |
+| 1024 | 1024 | 128 | 6648.9 | 864.76 |
+
+## Tiled batched DeltaNet verification
+
+The Gluon verifier adapts the tiled state update from aegis-engines
+`verify_gdn.py`. It computes Q/K normalization and the decay gates
+once per token and head. State tiles then process consecutive value
+channels and use the runtime's original recurrent and replay slot
+strides. The FP32 anchors, BF16 replay keys and deltas, and cumulative
+FP32 decay logs use the existing cache layout.
+
+The isolated verifier, including its metadata preparation, took 55.3
+microseconds at batch 32 and width three versus 95.4 before tiling.
+At batch 128 and width two it took 196.5 microseconds versus 269.5 on
+strided pool views. A tensor-core experiment that projected the replay
+state into the query and key subspace took 304.1 microseconds at that
+same wide shape. The shared-expert rounding check spreads the gate/up
+recomputations across 32 workers. Tests on three checkpoint layers
+produced identical BF16 values with the previous and parallel checks.
+
+The continuation convolution uses the tiled prefill stencil with a
+separate input view of the previously committed frames. The rotary
+launch takes the row and block counts at runtime so mixed batches
+can reuse the compiled kernel.
+
+The first four-lane reduction improved serving throughput at concurrency
+32 to 6,379 output tokens/s (ISL 1024, OSL 1024). It had one distinct
+concurrency-128 divergence at a 0.5-nat margin from the batch-1 launcher.
+The full-warp contraction preserves the original reduction order. On
+the strided cache fixture, verification fell from 96.0 to 76.4
+microseconds at batch 32 and width three, and from 269.1 to 226.4
+microseconds at batch 128 and width two. Both outputs were bitwise
+identical to the original verifier. The wide operation tests cover
+active history, anchor rollover, and fresh slots.
+
+The full-warp version passed all 32 development items with mean KL
+0.005972 and confident top-1 agreement 99.726%. The native HTTP
+comparisons accepted all 32, 32, and 128 requests at concurrency 1, 32,
+and 128. Of these, 32, 12, and 72 matched the batch-1 continuation
+exactly in that run. The other requests diverged at eligible ties.
+
+| ISL | OSL | Batch-1 TTFT (ms) | Batch-1 TPOT (ms) | Batch-1 decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 11.18 | 1.434 | 697.4 |
+| 1024 | 1024 | 20.12 | 1.594 | 627.5 |
+| 4096 | 1024 | 47.95 | 1.532 | 652.7 |
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 655.0 | 26.06 | 1.501 |
+| 1024 | 1024 | 32 | 6072.7 | 199.19 | 4.861 |
+| 1024 | 1024 | 128 | 9694.2 | 301.15 | 12.022 |

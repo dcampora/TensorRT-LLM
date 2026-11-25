@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adapted from aegis-engines shared_corrected.py (a6c09c6502)."""
 
-import os
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -237,7 +235,7 @@ class RoundedShared:
         raw = self.raw(x)
         d = w.n // 2 if gate else w.n
         y = torch.empty((x.size(0), d), device=x.device, dtype=x.dtype)
-        workers = int(os.getenv("ENGINE_SHARED_WORKERS", "16" if gate and x.size(0) < 128 else "0"))
+        workers = 32 if gate else 0
         bn = 4 if gate else 8
         if workers:
             rows = x.size(0)

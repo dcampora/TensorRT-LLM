@@ -7,7 +7,7 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import BlockedLayout, SliceLayout
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["M", "QB", "KB"])
 def qkv_rope(
     X,
     QW,
@@ -23,11 +23,11 @@ def qkv_rope(
     RS: gl.constexpr,
     PAGE: gl.constexpr,
     PS: gl.constexpr,
-    M: gl.constexpr,
+    M,
     R: gl.constexpr,
     W: gl.constexpr,
-    QB: gl.constexpr,
-    KB: gl.constexpr,
+    QB,
+    KB,
 ):
     layout: gl.constexpr = BlockedLayout([1, 2], [1, 32], [W, 1], [1, 0])
     block = gl.program_id(0)
