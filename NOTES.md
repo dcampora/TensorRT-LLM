@@ -786,3 +786,38 @@ continuations at concurrency 1, 32 and 128.
 | 1 | 1024 | 1024 | 2 | 44.24 | 3.152 | 317.24 |
 | 1 | 4096 | 1024 | 1 | 138.45 | 3.405 | 293.65 |
 | 1 | 4096 | 1024 | 2 | 134.79 | 3.048 | 328.10 |
+
+The short mixed cases passed at concurrency 4, 32, and 128. The first
+differences in this supplemental mixed run had score gaps of at most
+0.375 nats. The intermittent 0.625-nat case from the earlier repeat
+remains an unresolved follow-up.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 303.32 | 64.28 |
+| 1024 | 1024 | 32 | 32 | 4119.65 | 790.53 |
+| 1024 | 1024 | 128 | 128 | 6909.88 | 2489.38 |
+| 4096 | 1024 | 32 | 32 | 2888.41 | 2593.00 |
+
+## Matched Modeling V1 and V2 serving sweep
+
+The tuned serving configuration uses a dynamic MTP draft width.
+The matched comparison used one draft on both servers because Modeling V1
+rejected dynamic widths during GDN CUDA graph capture. The fixed-width
+configurations differed only in their `modeling_v2` value. Each benchmark
+used two request waves with a minimum of eight chats and the same README
+passages. Every matched pair below had an identical input hash.
+
+9 of the 11 matched cases completed before the deadline.
+
+| ISL | OSL | Concurrency | Requests | V1 tokens/s | V2 tokens/s | V2/V1 | V1 median TTFT (ms) | V2 median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 8 | 202.18 | 207.55 | 1.03× | 84.09 | 61.49 |
+| 1024 | 1024 | 2 | 8 | 380.15 | 397.58 | 1.05× | 139.19 | 98.18 |
+| 1024 | 1024 | 4 | 8 | 712.31 | 748.79 | 1.05× | 139.80 | 87.59 |
+| 1024 | 1024 | 8 | 16 | 1264.50 | 1337.21 | 1.06× | 194.76 | 170.06 |
+| 1024 | 1024 | 16 | 32 | 2209.56 | 2415.32 | 1.09× | 202.14 | 134.51 |
+| 1024 | 1024 | 32 | 64 | 3286.87 | 3771.01 | 1.15× | 285.48 | 224.64 |
+| 1024 | 1024 | 64 | 128 | 4460.08 | 5311.89 | 1.19× | 397.66 | 347.26 |
+| 1024 | 1024 | 128 | 256 | 5460.22 | 6982.95 | 1.28× | 800.65 | 603.44 |
+| 4096 | 1024 | 32 | 64 | 2368.13 | 2646.47 | 1.12× | 1084.06 | 989.54 |
