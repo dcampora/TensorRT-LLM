@@ -9,7 +9,7 @@ import torch
 import triton
 from torch import nn
 
-from .....catalog._op import Arch, Cell, OpWrapper
+from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import quantized as k
 from ..kernels.cute_moe import PackedExperts
 from ..kernels.cute_moe import mix_experts_norm as _mix_experts_norm
@@ -63,9 +63,10 @@ class RouteTopK(OpWrapper):
     CELLS = (
         Cell("single request, including exact router ties", {"rows": 1, "weighted": False}),
         Cell("batch with scale folded into the routing weights", {"rows": 128, "weighted": True}),
+        Cell("split-K router and weighted top-k", {"rows": 20, "weighted": True, "split": True}),
     )
 
-    def __call__(self, router, scale):
+    def __call__(self, router, scale, weight=None):
         rows = router.shape[0]
         weighted = scale is not None
         probabilities = torch.empty(
@@ -73,12 +74,38 @@ class RouteTopK(OpWrapper):
         )
         ids = torch.empty((rows, TOP_K), dtype=torch.int32, device=router.device)
         shared_gate = torch.empty(rows, dtype=BF16, device=router.device) if weighted else None
+        if weight is not None:
+            partial = torch.empty((rows, 16, 272), dtype=BF16, device=router.device)
+            cols = 16 if rows <= 16 else 32
+            k.router_partials[(triton.cdiv(NUM_EXPERTS + 1, cols), 16, triton.cdiv(rows, 16))](
+                router, weight, partial, rows, cols, num_warps=4
+            )
+            router = partial
         k.router_topk[(rows,)](
-            router, probabilities, ids, router.stride(0), scale, shared_gate, weighted, num_warps=4
+            router,
+            probabilities,
+            ids,
+            router.stride(0),
+            scale,
+            shared_gate,
+            weighted,
+            weight is not None,
+            num_warps=4,
         )
         return ids, probabilities, shared_gate
 
-    def reference(self, router, scale):
+    def reference(self, router, scale, weight=None):
+        if weight is not None:
+            with true_fp32_matmul():
+                router = sum(
+                    (
+                        router[:, start : start + 128].float()
+                        @ weight[: NUM_EXPERTS + 1, start : start + 128].float().T
+                    )
+                    .to(BF16)
+                    .float()
+                    for start in range(0, HIDDEN, 128)
+                ).to(BF16)
         scores = router[:, :NUM_EXPERTS].float()
         ids = scores.argsort(descending=True, stable=True)[:, :TOP_K]
         scores = scores.gather(1, ids).softmax(dim=-1)
@@ -201,13 +228,18 @@ class Experts(nn.Module):
         router = (
             self.router if grouped and (contexts or batch > 1) else self.router[: NUM_EXPERTS + 1]
         )
-        if small_verify and batch > 1:
+        use_split = verifying and epilogue is not None and batch == 1 and width == 4
+        if use_split:
+            logits = x
+        elif small_verify and batch > 1:
             weight = self.router[: NUM_EXPERTS + 1].T
             logits = torch.cat([torch.mm(request, weight) for request in x.split(width)])
         else:
             logits = torch.mm(x, router.T)
         weighted = grouped and epilogue is not None
-        ids, probs, shared_gate = route_topk(logits, self.down.alpha if weighted else None)
+        ids, probs, shared_gate = route_topk(
+            logits, self.down.alpha if weighted else None, self.router if use_split else None
+        )
         if grouped:
             tokens = batch if verifying else rows
             tile = 8 if tokens < 64 else 16 if tokens <= 128 else 64

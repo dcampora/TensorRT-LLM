@@ -239,6 +239,27 @@ def combine(Experts, Shared, SG, Y, D: tl.constexpr, BLOCK: tl.constexpr):
 
 
 @tr.jit
+def router_partials(X, W, Partial, ROWS, BC: tl.constexpr):
+    tile, split, group = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row = group * 16 + tl.arange(0, 16)
+    col = tile * BC + tl.arange(0, BC)
+    k = split * 128 + tl.arange(0, 128)
+    a = tl.load(X + row[:, None] * 2048 + k[None, :], row[:, None] < ROWS, 0.0)
+    b = tl.load(W + col[:, None] * 2048 + k[None, :], col[:, None] < 257, 0.0)
+    dot = tl.dot(a, tl.trans(b))
+    out = Partial + (row[:, None] * 16 + split) * 272 + col[None, :]
+    tl.store(out, dot, (row[:, None] < ROWS) & (col[None, :] < 257))
+
+
+@tr.jit
+def _reduce_router(Partial, row, col):
+    total = tl.full(col.shape, 0.0, tl.float32)
+    for part in tl.static_range(16):
+        total += tl.load(Partial + (row * 16 + part) * 272 + col).to(tl.float32)
+    return total.to(tl.bfloat16)
+
+
+@tr.jit
 def router_topk(
     R,
     Weights,
@@ -247,10 +268,14 @@ def router_topk(
     Alpha=None,
     SharedGate=None,
     WEIGHTED: tl.constexpr = False,
+    SPLIT: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     e = tl.arange(0, 256)
-    raw = tl.load(R + row * STRIDE + e)
+    if SPLIT:
+        raw = _reduce_router(R, row, e)
+    else:
+        raw = tl.load(R + row * STRIDE + e)
     x = raw.to(tl.float32)
     raw_bits = tl.where(x == 0.0, 0, raw.to(tl.uint16, bitcast=True)).to(tl.uint32)
     order = tl.where(raw_bits >= 0x8000, raw_bits ^ 0xFFFF, raw_bits ^ 0x8000)
@@ -264,7 +289,10 @@ def router_topk(
     if WEIGHTED:
         a = tl.load(Alpha + ix).to(tl.float32)
         chosen = (chosen.to(tl.bfloat16).to(tl.float32) * a).to(tl.bfloat16)
-        shared = tl.load(R + row * STRIDE + 256).to(tl.float32)
+        if SPLIT:
+            shared = _reduce_router(R, row, tl.full((), 256, tl.int32)).to(tl.float32)
+        else:
+            shared = tl.load(R + row * STRIDE + 256).to(tl.float32)
         g = (1.0 / (1.0 + libdevice.exp(-shared))).to(tl.bfloat16)
         tl.store(SharedGate + row, g)
     slot = tl.arange(0, 8)

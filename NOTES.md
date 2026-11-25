@@ -750,3 +750,105 @@ concurrency levels.
 | 1024 | 1024 | 1 | 671.3 | 23.92 |
 | 1024 | 1024 | 32 | 6645.9 | 225.08 |
 | 1024 | 1024 | 128 | 11384.8 | 289.64 |
+
+## Short FP8 projections and narrow router
+
+The short-projection trial kept the original E4M3 operands and
+applied their checkpoint scales in the rotary, convolution, and
+gated-normalization kernels. The scaled convolution fixture matched
+the separate projection bitwise, including the state and convolution
+windows. The isolated fusion preserved the tested batch-1 continuation
+hashes. A second trial combined the fusion with a single-request BF16
+router that rounded 16 partial sums before reduction.
+
+Both versions passed all engine oracle items and the 28 first-token
+checks. The version with the narrow router introduced a strict
+batch-1 comparison failure at concurrency 128 with a margin of
+0.50000006 nats. Its HTTP sweep measured 6045.3 at concurrency 32
+and 11133.4 at 128 for ISL 1024 and OSL 1024, on the preceding
+packed-expert tactics. The SIMD router trial ended there.
+
+| ISL | OSL | Chat seed | Scale fusion (decode tokens/s) | Scale fusion and narrow router (decode tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 100 | 667.5 | 719.8 |
+| 1024 | 1024 | 100 | 724.1 | 799.8 |
+| 4096 | 1024 | 100 | 656.0 | 724.1 |
+| 128 | 1024 | 133 | 693.3 | 661.0 |
+| 1024 | 1024 | 133 | 678.7 | 703.1 |
+| 4096 | 1024 | 133 | 644.9 | 693.1 |
+
+The scale-only server reached 670.4, 6845.9, and 11356.5 output
+tokens/s at concurrency 1, 32, and 128 with ISL 1024 and OSL 1024.
+It produced additional strict differences in the intermediate
+concurrency checks. The performance result did not warrant the
+additional scale-fusion paths.
+
+## Serving scheduler trials
+
+Each trial used the packed-expert revision and the same prompt hashes.
+The three columns cover quick sweeps with 4, 64, and 256 measured
+requests. The two-draft schedule uses three drafts for batches up to
+32 and two drafts above 32. The sparse graph list was
+`[1, 2, 4, 8, 32, 128]`.
+
+| ISL | OSL | Setting | C1 output tokens/s | C32 output tokens/s | C128 output tokens/s |
+| ---: | ---: | :--- | ---: | ---: | ---: |
+| 1024 | 1024 | Three drafts, eleven graph sizes, 8192-token budget | 671.3 | 6645.9 | 11384.8 |
+| 1024 | 1024 | Two proposals for wide batches | 671.2 | 7049.5 | 11623.3 |
+| 1024 | 1024 | Sparse graph batches | 670.8 | 6956.4 | 11336.0 |
+| 1024 | 1024 | Stream interval four and early first-token response | 671.2 | 7117.4 | 11268.9 |
+| 1024 | 1024 | 4096-token scheduler budget | 669.8 | 6315.6 | 9512.8 |
+| 1024 | 1024 | 16384-token scheduler budget | 671.6 | 6974.9 | 11389.6 |
+| 1024 | 1024 | Four HTTP frontends | 671.2 | 7030.4 | 11217.4 |
+| 1024 | 1024 | Low-latency host dispatch and client I/O during GPU wait | 671.2 | 7165.5 | 10436.4 |
+
+The 8192-token budget kept the stronger balance across the primary
+concurrency levels. The C32 host-dispatch run cut median TTFT to
+157 ms. Its C128 run raised median TTFT to 408 ms and had the
+second-lowest throughput in the sweep.
+
+## Tensor-core recurrent history replay
+
+The wide replay trial collapsed previously accepted rank-one updates
+into one weighted contraction. It split the decay-weighted FP32
+accumulator inputs into two BF16 terms for tensor cores and retained
+the existing FP32 recurrence for newly verified rows. It also skipped
+recurrent state I/O for the runtime's CUDA graph padding lanes. The
+paired, synchronized probe took 57.8 versus 67.1 microseconds at
+batch 32 and width four, 161.0 versus 227.4 at batch 128 and width
+two, and 230.6 versus 283.6 at batch 128 and width four. Relative
+output error was below 0.000017 in all three probes.
+
+All 32 engine items passed. The server passed the batch-1 checks at
+concurrency 48, 64, and 128, but added a strict difference at 32.
+The independent oracle also found a strict difference at 128. The
+default keeps sequential FP32 replay of the recorded updates.
+
+| ISL | OSL | HTTP concurrency | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 670.7 | 24.63 |
+| 1024 | 1024 | 32 | 7067.7 | 212.87 |
+| 1024 | 1024 | 128 | 11954.0 | 308.46 |
+
+## Single-request tensor-core router
+
+The four-row verifier uses sixteen 128-channel BF16 partials from a
+tensor-core projection. The expert-selection kernel reduces the
+partials and applies the existing BF16 probability and shared-gate
+rounding. Other decode geometries keep their cuBLAS projections.
+
+The batch-1 engine passed all 32 oracle items and all 28 first-token
+checks. The HTTP sweeps repeated the previous strict-margin results
+at all 11 tested concurrency levels.
+
+| ISL | OSL | Chat seed | Median TTFT (ms) | Median decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 100 | 10.70 | 666.1 |
+| 1024 | 1024 | 100 | 18.22 | 759.9 |
+| 4096 | 1024 | 100 | 42.36 | 676.9 |
+| 128 | 1024 | 133 | 10.45 | 713.2 |
+| 1024 | 1024 | 133 | 18.33 | 677.3 |
+| 4096 | 1024 | 133 | 42.45 | 699.0 |
+
+The quick HTTP run at ISL 1024 and OSL 1024 produced 681.5,
+6655.4, and 11349.4 output tokens/s at concurrency 1, 32, and 128.

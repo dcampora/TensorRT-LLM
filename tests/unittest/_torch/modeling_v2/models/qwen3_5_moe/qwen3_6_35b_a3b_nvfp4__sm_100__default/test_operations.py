@@ -91,11 +91,16 @@ def test_residual_rms_norm(cell, certifying):
 def test_route_topk(cell, certifying):
     op = moe.route_topk
     certifying(op)
-    logits = fixture_rand((cell.spec["rows"], 272))
-    logits[0, :12] = 8.0
+    weight = None
+    if cell.spec.get("split"):
+        logits = fixture_rand((cell.spec["rows"], 2048))
+        weight = fixture_rand((272, 2048))
+    else:
+        logits = fixture_rand((cell.spec["rows"], 272))
+        logits[0, :12] = 8.0
     scale = fixture_rand((256,), factor=0.1).abs() if cell.spec["weighted"] else None
-    actual_ids, actual_weights, actual_gate = op(logits, scale)
-    ids, weights, gate = op.reference(logits, scale)
+    actual_ids, actual_weights, actual_gate = op(logits, scale, weight)
+    ids, weights, gate = op.reference(logits, scale, weight)
     torch.testing.assert_close(actual_ids, ids, rtol=0, atol=0)
     torch.testing.assert_close(actual_weights, weights)
     torch.testing.assert_close(actual_gate, gate)
