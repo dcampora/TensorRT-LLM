@@ -237,6 +237,10 @@ class PagedCausalDecode(OpWrapper):
             spec={"lengths": (261,), "width": 1},
         ),
         Cell(why="Mixed verify lanes", spec={"lengths": (31, 4096, 144), "width": 4}),
+        Cell(
+            why="Pairs straddle split boundaries and finish with an odd lane",
+            spec={"lengths": (31, 257, 260, 513, 777, 1024, 129, 33), "width": 3},
+        ),
     )
 
     def __call__(
@@ -255,29 +259,53 @@ class PagedCausalDecode(OpWrapper):
         # result through BF16 before applying the gate and static FP8 scale.
         partial = q.new_empty((rows, QUERY_HEADS, _DECODE_SPLITS, HEAD_SIZE), dtype=torch.float32)
         lse = q.new_empty((rows, QUERY_HEADS, _DECODE_SPLITS), dtype=torch.float32)
-        paged_attention.paged_decode_part[(rows, KV_HEADS, _DECODE_SPLITS)](
-            q,
-            cache.key,
-            cache.value,
-            partial,
-            lse,
-            positions,
-            table,
-            table.stride(0),
-            cache.key.shape[2],
-            cache.key.stride(0),
-            cache.index_divisor,
-            QUERY_HEADS,
-            6,
-            _DECODE_SPLITS,
-            _DECODE_SPLITS,
-            32,
-            16,
-            rows_per_seq,
-            request_start,
-            num_warps=4,
-            num_stages=2,
-        )
+        nseq = rows // rows_per_seq
+        if rows_per_seq > 1 and nseq >= 8:
+            pairs = tr.cdiv(rows_per_seq, 2)
+            paged_attention.paged_decode_pair[(nseq * pairs, KV_HEADS, _DECODE_SPLITS)](
+                q,
+                cache.key,
+                cache.value,
+                partial,
+                lse,
+                positions,
+                table,
+                table.stride(0),
+                cache.key.shape[2],
+                cache.key.stride(0),
+                cache.index_divisor,
+                QUERY_HEADS,
+                6,
+                _DECODE_SPLITS,
+                rows_per_seq,
+                request_start,
+                num_warps=4,
+                num_stages=2,
+            )
+        else:
+            paged_attention.paged_decode_part[(rows, KV_HEADS, _DECODE_SPLITS)](
+                q,
+                cache.key,
+                cache.value,
+                partial,
+                lse,
+                positions,
+                table,
+                table.stride(0),
+                cache.key.shape[2],
+                cache.key.stride(0),
+                cache.index_divisor,
+                QUERY_HEADS,
+                6,
+                _DECODE_SPLITS,
+                _DECODE_SPLITS,
+                32,
+                16,
+                rows_per_seq,
+                request_start,
+                num_warps=4,
+                num_stages=2,
+            )
         out = torch.empty_like(q, dtype=torch.float8_e4m3fn if scale is not None else q.dtype)
         pdl = rows <= 8
         paged_attention.decode_merge[(rows, QUERY_HEADS)](

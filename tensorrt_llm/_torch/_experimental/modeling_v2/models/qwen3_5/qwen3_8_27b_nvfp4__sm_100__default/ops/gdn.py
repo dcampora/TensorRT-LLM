@@ -286,8 +286,10 @@ class GatedDeltaVerify(OpWrapper):
             launch_pdl=pdl,
         )
         output = x.new_empty((rows, 6144))
+        value_tile = 4 if pdl else 32
+        grid = (128 // value_tile, batch * 48)
         if replay is None:
-            verify.verify_state[(4, batch * 48)](
+            verify.verify_state[grid](
                 convolved,
                 ba,
                 log_decay,
@@ -299,13 +301,13 @@ class GatedDeltaVerify(OpWrapper):
                 state.stride(0),
                 *intermediate_ssm.stride()[:2],
                 width,
-                32,
+                value_tile,
                 pdl,
                 num_warps=1,
                 launch_pdl=pdl,
             )
         else:
-            verify.verify_replay[(4, batch * 48)](
+            verify.verify_replay[grid](
                 convolved,
                 ba,
                 log_decay,
@@ -323,7 +325,7 @@ class GatedDeltaVerify(OpWrapper):
                 width,
                 intermediate_conv.shape[1],
                 replay.deltas.shape[2],
-                32,
+                value_tile,
                 pdl,
                 num_warps=1,
                 launch_pdl=pdl,

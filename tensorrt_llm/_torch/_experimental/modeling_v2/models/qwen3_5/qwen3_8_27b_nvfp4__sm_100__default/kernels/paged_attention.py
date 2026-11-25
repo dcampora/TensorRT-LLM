@@ -146,6 +146,160 @@ def paged_decode_part(
 
 
 @tr.jit
+def _paged_pair_partition(
+    Q,
+    K,
+    V,
+    Mid,
+    Lse,
+    Table,
+    first_row,
+    lane_count,
+    lengths,
+    req,
+    hk,
+    part,
+    begin,
+    end,
+    width,
+    TAB_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    PAGE_DIVISOR: tl.constexpr,
+    HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    if begin < end:
+        index = tl.arange(0, 16)
+        lane = index // 8
+        h = index % 8
+        row = first_row + lane
+        qh = hk * GROUP + h
+        bound = tl.minimum(lengths, begin + width)
+        valid = (lane < lane_count) & (h < GROUP) & (begin < bound)
+        d = tl.arange(0, 256)
+        columns = tl.arange(0, 32)
+        q = tl.load(Q + (row[:, None] * HEADS + qh[:, None]) * 256 + d[None, :], valid[:, None], 0)
+        pages = Table + req * TAB_STRIDE
+        mx = tl.full((16,), -float("inf"), tl.float32)
+        norm = tl.full((16,), 0, tl.float32)
+        acc = tl.full((16, 256), 0, tl.float32)
+        for offset in range(begin, end, 32):
+            t = offset + columns
+            page = tl.load(pages + t // PAGE_SIZE, t < end, 0)
+            kvbase = (page.to(tl.int64) // PAGE_DIVISOR) * PAGE_STRIDE
+            kvbase += (hk * PAGE_SIZE + t % PAGE_SIZE) * 256
+            key = tl.load(K + kvbase[None, :] + d[:, None], t[None, :] < end, 0)
+            val = tl.load(V + kvbase[:, None] + d[None, :], t[:, None] < end, 0)
+            score = tl.dot(q, key) * 0.0625
+            score = tl.where(t[None, :] < bound[:, None], score, -float("inf"))
+            nm = tl.maximum(tl.max(score, 1), mx)
+            p = tl.exp(score - nm[:, None])
+            a = tl.exp(mx - nm)
+            acc = acc * a[:, None] + tl.dot(p.to(tl.bfloat16), val)
+            norm = norm * a + tl.sum(p, 1)
+            mx = nm
+        index = (row * HEADS + qh) * SPLITS + part
+        tl.store(Mid + index[:, None] * 256 + d[None, :], acc / norm[:, None], valid[:, None])
+        tl.store(Lse + index, mx + tl.log(norm), valid)
+
+
+@tr.jit
+def paged_decode_pair(
+    Q,
+    K,
+    V,
+    Mid,
+    Lse,
+    Pos,
+    Table,
+    TAB_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    PAGE_DIVISOR: tl.constexpr,
+    HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    SPLITS: tl.constexpr,
+    ROWS_PER_SEQ: tl.constexpr,
+    REQ_START: tl.constexpr,
+):
+    # Adapted from aegis-engines cb6779a, batch_spec_kernels.py.
+    pairs: tl.constexpr = (ROWS_PER_SEQ + 1) // 2
+    work, hk, part = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    seq = work // pairs
+    within_seq = work % pairs * 2
+    first_row = seq * ROWS_PER_SEQ + within_seq
+    lane_count = tl.minimum(ROWS_PER_SEQ - within_seq, 2)
+    n0 = tl.load(Pos + first_row) + 1
+    n1 = tl.load(Pos + first_row + 1, lane_count == 2, n0 - 1) + 1
+    w0 = tl.cdiv(n0, SPLITS * 32) * 32
+    w1 = tl.cdiv(n1, SPLITS * 32) * 32
+    heads = tl.arange(0, 16)
+    req = seq + REQ_START
+    if w0 == w1:
+        begin = part * w0
+        end = tl.minimum(tl.maximum(n0, n1), begin + w0)
+        lens = tl.where(heads < 8, n0, n1)
+        _paged_pair_partition(
+            Q,
+            K,
+            V,
+            Mid,
+            Lse,
+            Table,
+            first_row,
+            lane_count,
+            lens,
+            req,
+            hk,
+            part,
+            begin,
+            end,
+            w0,
+            TAB_STRIDE,
+            PAGE_SIZE,
+            PAGE_STRIDE,
+            PAGE_DIVISOR,
+            HEADS,
+            GROUP,
+            SPLITS,
+        )
+    else:
+        # Exact split boundaries are defined separately for each query.
+        for lane in tl.static_range(2):
+            width = w0 if lane == 0 else w1
+            length = n0 if lane == 0 else n1
+            begin = part * width
+            end = tl.minimum(length, begin + width)
+            lens = tl.full((16,), length, tl.int32)
+            _paged_pair_partition(
+                Q,
+                K,
+                V,
+                Mid,
+                Lse,
+                Table,
+                first_row + lane,
+                1,
+                lens,
+                req,
+                hk,
+                part,
+                begin,
+                end,
+                width,
+                TAB_STRIDE,
+                PAGE_SIZE,
+                PAGE_STRIDE,
+                PAGE_DIVISOR,
+                HEADS,
+                GROUP,
+                SPLITS,
+            )
+
+
+@tr.jit
 def decode_merge(
     Mid,
     Lse,

@@ -158,6 +158,47 @@ measurements with the same natural-English chat prompts as the baseline.
 | 1024 | 1024 | 64.94 | 3.421 | 292.32 |
 | 4096 | 1024 | 133.05 | 3.662 | 273.05 |
 
+### Smaller verifier tiles, batch 1, ISL 128, 1024, 4096 and OSL 1024
+
+Four value coordinates per warp improve parallelism in the narrow GDN
+verifier. The deployment also uses the runtime's MTP fast paths and
+overlap loop on its execution stream. The full engine check retained
+raw KL 0.008055, conditional KL 0.008032, 99.54% non-tie top-1, and
+32 accepted generations. The engine outputs matched the preceding
+commit token for token.
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 78.08 | 2.472 | 404.51 |
+| 1024 | 1024 | 79.36 | 2.748 | 363.86 |
+| 4096 | 1024 | 134.41 | 2.984 | 335.09 |
+
+### Dynamic MTP trial, ISL 1024 and OSL 1024
+
+The paired paged-attention kernel adapts `batch_spec_kernels.py` from
+aegis-engines. Adjacent verify rows share a K/V tile when their split
+widths match. A split-boundary test verifies bitwise agreement with
+independent queries, including an odd final query and indexed page tables.
+
+The trial used four drafts through batch 4, three through batch 32,
+and one through batch 128. It passed the greedy oracle at concurrency
+1, 32, 64, and 128. Intermediate-concurrency tests found divergences
+outside the rule, so the wrapper still uses ordinary decoding.
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 346.75 | 77.23 | 2.811 |
+| 32 | 32 | 3571.17 | 891.94 | 7.553 |
+| 128 | 128 | 5334.44 | 2332.52 | 20.960 |
+
+### Dynamic MTP trial, ISL 4096 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 295.03 | 144.34 | 3.252 |
+| 8 | 8 | 1287.49 | 994.78 | 4.950 |
+| 32 | 32 | 2293.27 | 2615.56 | 10.664 |
+
 ## Standalone comparison
 
 The original `/ref-engine/engine.sh` copy crashed while instantiating its

@@ -20,6 +20,7 @@ import triton as tr
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
 from tensorrt_llm._torch.utils import is_gdn_replay_enabled
@@ -362,6 +363,10 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
         self.draft_config = None
         self.draft_model = None
         self.spec_worker = None
+        self.spec_decode_fast_paths = self.spec_config is not None
+        self.runtime_hooks = (
+            RuntimeHooks(loop_on_execution_stream=True) if self.spec_decode_fast_paths else None
+        )
         if self.spec_config is not None:
             text.num_nextn_predict_layers = 1
             if is_gdn_replay_enabled():
@@ -375,6 +380,7 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
                 self.model_config,
                 self.model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                spec_decode_fast_paths=self.spec_decode_fast_paths,
             )
             self.spec_worker.set_draft_model(self.draft_model)
 

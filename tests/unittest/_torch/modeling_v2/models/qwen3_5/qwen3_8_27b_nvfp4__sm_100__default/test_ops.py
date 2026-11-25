@@ -324,11 +324,28 @@ def test_paged_decode(cell) -> None:
     cache, table = _paged_cache(lengths, True)
     pos = torch.cat([torch.arange(n - width, n, device="cuda", dtype=torch.int32) for n in lengths])
     q, gate = _random(pos.numel(), 6144) / 2, _random(pos.numel(), 6144)
+    output = decode_attention(q, gate, pos, cache, table, rows_per_seq=width)
     _assert_bf16(
-        decode_attention(q, gate, pos, cache, table, rows_per_seq=width),
+        output,
         decode_attention.reference(q, gate, pos, cache, table, rows_per_seq=width),
         ulps=2,
     )
+    if len(lengths) >= 8:
+        individual = [
+            decode_attention(
+                q[begin:end],
+                gate[begin:end],
+                pos[begin:end],
+                cache,
+                table,
+                rows_per_seq=width,
+                request_start=seq,
+            )
+            for seq, (begin, end) in enumerate(
+                zip(range(0, len(pos), width), range(width, len(pos) + 1, width), strict=True)
+            )
+        ]
+        torch.testing.assert_close(output, torch.cat(individual), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("cell", paged_context_attention.CELLS)
