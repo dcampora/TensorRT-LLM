@@ -29,7 +29,7 @@ from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 from ...._router_index import disable_v2_by_default
 from . import weights
 from .mtp import MtpDraft, MtpLayer
-from .ops.attention import apply_gate, prepare_qkv
+from .ops.attention import apply_gate, fp8_qkv_partitions, prepare_qkv
 from .ops.gdn import Context, Replay, gated_rmsnorm, gdn_context, gdn_decode, gdn_verify
 from .ops.paged import (
     Cache,
@@ -39,7 +39,7 @@ from .ops.paged import (
     decode_attention,
     paged_context_attention,
 )
-from .ops.projections import Fp4Linear, Fp8Linear
+from .ops.projections import Fp4Linear, Fp8Linear, fp8_quantize
 from .prefill_graph import PrefillGraph
 
 if TYPE_CHECKING:
@@ -178,16 +178,27 @@ class Layer(nn.Module):
     def full_attention(
         self, projection: torch.Tensor, step: Step, rope: torch.Tensor, cache: Cache
     ) -> torch.Tensor:
-        decode = step.context is None
-        q, k, v, gate = prepare_qkv(
-            projection, self.q_norm, self.k_norm, rope, step.positions, self.eps
-        )
         table = step.block_offsets[cache.group, :, 0]
-        if decode:
-            append_kv(k, v, step.positions, cache, table, None, step.decode_width)
+        if step.context is None:
+            scales = (self.qkv.input_scale, self.qkv.weight_scale) if projection.ndim == 3 else None
+            q, _, _, gate = prepare_qkv(
+                projection,
+                self.q_norm,
+                self.k_norm,
+                rope,
+                step.positions,
+                self.eps,
+                scales=scales,
+                cache=cache,
+                table=table,
+                rows_per_seq=step.decode_width,
+            )
             return decode_attention(
                 q, gate, step.positions, cache, table, self.out.input_scale, step.decode_width
             )
+        q, k, v, gate = prepare_qkv(
+            projection, self.q_norm, self.k_norm, rope, step.positions, self.eps
+        )
         append_kv(k, v, step.positions, cache, table, step.context_indices)
         starts, chunks = step.context.starts, step.context.chunks
         if step.fresh_context:
@@ -197,7 +208,12 @@ class Layer(nn.Module):
         return apply_gate(output, gate)
 
     def attention_projections(self, x: torch.Tensor, step: Step) -> torch.Tensor:
-        return self.qkv(_pad(x, step.projection_rows), decode=step.context is None)[: x.shape[0]]
+        rows = x.shape[0]
+        decode = step.context is None
+        if decode and not self.is_linear and (rows <= 8 or rows in (128, 256)):
+            packed = fp8_quantize(x, self.qkv.input_scale, pdl=rows <= 8)
+            return fp8_qkv_partitions(packed, self.qkv.weight)
+        return self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
 
     def attention_core(
         self, x: torch.Tensor, projection: torch.Tensor, step: Step, rope: torch.Tensor, cache

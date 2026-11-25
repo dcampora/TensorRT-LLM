@@ -10,6 +10,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.attention import (  # noqa: E501
     apply_gate,
+    fp8_qkv_partitions,
     prepare_qkv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.draft import (  # noqa: E501
@@ -119,7 +120,7 @@ def test_fp4_gemm(cell) -> None:
     _assert_bf16(actual, expected)
 
 
-@pytest.mark.parametrize("cell", prepare_qkv.CELLS)
+@pytest.mark.parametrize("cell", [cell for cell in prepare_qkv.CELLS if "rows" in cell.spec])
 def test_qkv_and_rope(cell) -> None:
     torch.manual_seed(13)
     rows = cell.spec["rows"]
@@ -133,6 +134,20 @@ def test_qkv_and_rope(cell) -> None:
     args = x, _random(256) / 4, _random(256) / 4, table, pos, 1e-6
     for actual, expected in zip(prepare_qkv(*args), prepare_qkv.reference(*args), strict=True):
         _assert_bf16(actual, expected)
+
+
+@pytest.mark.parametrize("cell", fp8_qkv_partitions.CELLS)
+def test_fp8_qkv_partitions(cell) -> None:
+    torch.manual_seed(42)
+    rows = cell.spec["rows"]
+    shape = (rows, 5120)
+    packed = torch.randint(-16, 17, shape, device="cuda").to(torch.float8_e4m3fn)
+    shape = (14336, 5120)
+    weight = torch.randint(-16, 17, shape, device="cuda").to(torch.float8_e4m3fn)
+    args = packed, weight.T.unsqueeze(0)
+    torch.testing.assert_close(
+        fp8_qkv_partitions(*args), fp8_qkv_partitions.reference(*args), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("cell", apply_gate.CELLS)
@@ -240,7 +255,9 @@ def test_gdn_replay_acceptance(cell) -> None:
             *inputs, full_conv, full_state, slots, full_conv_steps, full_ssm_steps, width
         )
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        torch.testing.assert_close(verify_conv[:, :width], full_conv_steps[:, :width], atol=0, rtol=0)
+        torch.testing.assert_close(
+            verify_conv[:, :width], full_conv_steps[:, :width], atol=0, rtol=0
+        )
         accepted = (batches + offset).to(torch.int32) % width + 1
         conv[state_slots] = verify_conv[batches, accepted - 1]
         full_conv[state_slots] = full_conv_steps[batches, accepted - 1]
@@ -285,6 +302,44 @@ def _paged_cache(lengths: tuple[int, ...], head_init: bool) -> tuple[Cache, torc
     dims = all_pages, 2, 4, 32, 256
     pool = _random(*dims) if head_init else torch.zeros(dims, device="cuda", dtype=torch.bfloat16)
     return Cache(0, 0, 2, pool[:, 0], pool[:, 1]), table
+
+
+@pytest.mark.parametrize("cell", [cell for cell in prepare_qkv.CELLS if "width" in cell.spec])
+def test_qkv_writes_paged_cache(cell) -> None:
+    torch.manual_seed(43)
+    width = cell.spec["width"]
+    rows = width * 2
+    cache, table = _paged_cache((30 + width, 63 + width), False)
+    ref = cache._replace(key=cache.key.clone(), value=cache.value.clone())
+    standalone = cache._replace(key=cache.key.clone(), value=cache.value.clone())
+    table = table.repeat_interleave(2, dim=0)[::2]
+    positions = torch.cat([torch.arange(s, s + width, device="cuda") for s in (30, 63)])
+    phi = _random(63 + width, 32).float()
+    rope = torch.cat((phi.cos(), phi.sin()), dim=-1)
+    x = _random(rows, 14336)
+    scales = None
+    args = _random(256) / 4, _random(256) / 4, rope, positions, 1e-6
+    if cell.spec.get("parts", False):
+        x = _random(2, rows, 14336).float()
+        scales = x.new_tensor(0.25), x.new_tensor(0.125)
+    q, _, _, gate = prepare_qkv(
+        x, *args, scales=scales, cache=cache, table=table, rows_per_seq=width
+    )
+    combined = x if scales is None else ((x[0] + x[1]) * (scales[0] * scales[1])).bfloat16()
+    expected_q, k, v, expected_gate = prepare_qkv(combined, *args)
+    append_kv(k, v, positions, standalone, table, None, width)
+    ref_outputs = prepare_qkv.reference(
+        x, *args, scales=scales, cache=ref, table=table, rows_per_seq=width
+    )
+    for actual, expected in zip((q, cache.key, cache.value, gate), ref_outputs, strict=True):
+        _assert_bf16(actual, expected)
+    for actual, expected in (
+        (q, expected_q),
+        (gate, expected_gate),
+        (cache.key, standalone.key),
+        (cache.value, standalone.value),
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cell", append_kv.CELLS)

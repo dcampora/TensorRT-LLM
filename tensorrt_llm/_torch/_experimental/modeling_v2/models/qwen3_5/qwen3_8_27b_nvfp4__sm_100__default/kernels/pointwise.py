@@ -103,19 +103,19 @@ def qkv_rope(
     WK,
     Rope,
     Pos,
-    Slots,
     PS: tl.constexpr,
     QS: tl.constexpr,
     NS: tl.constexpr,
-    KV_BATCH: tl.constexpr,
-    KV_CAP: tl.constexpr,
-    WRITE_CACHE: tl.constexpr,
     EPS: tl.constexpr,
-    AltK=None,
-    AltV=None,
     Sx=None,
     Sw=None,
     PLANE: tl.constexpr = 0,
+    Table=None,
+    PAGE_SIZE: tl.constexpr = 0,
+    PAGE_STRIDE: tl.constexpr = 0,
+    PAGE_DIVISOR: tl.constexpr = 0,
+    TABLE_STRIDE: tl.constexpr = 0,
+    ROWS_PER_SEQ: tl.constexpr = 1,
 ):
     row, h = tl.program_id(0), tl.program_id(1)
     d = tl.arange(0, 256)
@@ -141,19 +141,16 @@ def qkv_rope(
     rhi = hi * cos + lo * sin
     if is_k:
         head = h - QS
-        if WRITE_CACHE:
-            slot = tl.load(Slots + row).to(tl.int64)
-            # Within each sequence a head owns contiguous token rows.
-            target = slot * KV_BATCH + head * KV_CAP * 256 + p * 256
-        else:
+        if Table is None:
             target = (row * NS + head) * 256
-        val = _qkv_value(P, row * PS + QS * 512 + NS * 256 + head * 256 + d, Sx, Sw, PLANE)
-        if AltK is not None and row == 2:
-            out = AltK + head * 256
-            tl.store(AltV + head * 256 + d, val)
         else:
-            out = K + target
-            tl.store(V + target + d, val)
+            request = row // ROWS_PER_SEQ
+            page = tl.load(Table + request * TABLE_STRIDE + p // PAGE_SIZE).to(tl.int64)
+            target = (page // PAGE_DIVISOR) * PAGE_STRIDE
+            target += (head * PAGE_SIZE + p % PAGE_SIZE) * 256
+        val = _qkv_value(P, row * PS + QS * 512 + NS * 256 + head * 256 + d, Sx, Sw, PLANE)
+        out = K + target
+        tl.store(V + target + d, val)
     else:
         out = Q + (row * QS + h) * 256
         g = _qkv_value(P, row * PS + off + 256 + d, Sx, Sw, PLANE)

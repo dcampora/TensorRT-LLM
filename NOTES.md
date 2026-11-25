@@ -416,3 +416,47 @@ close to the preceding measurements.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 3852.03 | 1047.99 | 6.708 |
 | 128 | 128 | 5970.47 | 2626.63 | 18.269 |
+
+### Sustained serving, ISL 1024 and 4096, OSL 1024
+
+The serving benchmark used its standard minimum of 16 requests and four
+requests per concurrency slot.
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 32 | 128 | 3591.93 | 153.56 | 8.424 |
+| 1024 | 128 | 512 | 5370.95 | 408.16 | 23.244 |
+| 4096 | 32 | 128 | 2583.52 | 355.97 | 11.392 |
+
+## FP8 QKV with a paged cache epilogue
+
+The full-attention decode projection ports aegis-engines'
+`fp8_tma.py`. The Gluon kernel accumulates two FP32 halves from the
+original FP8 storage layout. The rotary kernel adds and scales the
+halves, rounds once to BF16, and writes K and V directly to the
+runtime's page table. Other row counts still use cuBLASLt and share
+the direct paged write. Six rotating checkpoint layers matched
+cuBLASLt's BF16 projection bit for bit. At five, 128, and 256 rows
+the projection fell from 17.29, 28.13, and 41.88 microseconds to
+14.82, 21.10, and 36.79 microseconds respectively. The epilogue and
+TMA pipeline are candidates for a native `csrc/` build.
+
+All 42 operator cells passed, including direct writes into shuffled
+pages and across page boundaries. The contract's scores and greedy
+continuations were identical to the preceding version. The server
+started and all 384 serving comparisons passed.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 15.34 | 2.390 | 418.34 |
+| 1024 | 1024 | 37.29 | 2.629 | 380.37 |
+| 4096 | 1024 | 126.35 | 2.873 | 348.08 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 3895.50 | 929.55 | 6.788 |
+| 128 | 128 | 5869.31 | 2639.91 | 18.524 |
