@@ -26,16 +26,20 @@ class PrefillGraph:
         self.metadata = None
         self.positions: torch.Tensor | None = None
         self.verify = False
+        self.last_only = False
         self.steps: dict[tuple[int, int], Step] = {}
-        self.graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        self.graphs: dict[tuple[int, int, bool], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
         self.run = eager_on_graph(self._eager, graph_key=self._key, graph_body=self._capture)
 
-    def prepare(self, metadata, positions: torch.Tensor, verify: bool) -> None:
+    def prepare(
+        self, metadata, positions: torch.Tensor, verify: bool, return_context_logits: bool
+    ) -> None:
         self.metadata = metadata
         self.positions = positions[..., : metadata.num_tokens]
         self.verify = verify
+        self.last_only = not verify and not return_context_logits
 
-    def _key(self, ids: torch.Tensor) -> tuple[int, int] | None:
+    def _key(self, ids: torch.Tensor) -> tuple[int, int, bool] | None:
         md = self.metadata
         rows = ids.shape[0]
         if (
@@ -72,7 +76,7 @@ class PrefillGraph:
         static.state_slots.copy_(md.mamba_metadata.state_indices[:1])
         static.block_offsets.copy_(md.kv_cache_block_offsets[:, :1])
         static.positions.copy_(positions)
-        return key
+        return (*key, self.last_only)
 
     def _eager(self, ids: torch.Tensor) -> torch.Tensor:
         if get_current_replay_token() is not None and (key := self._key(ids)) is not None:
@@ -96,4 +100,7 @@ class PrefillGraph:
 
     def _capture(self, ids: torch.Tensor) -> torch.Tensor:
         key = ids.shape[0], id(self.metadata.kv_cache_manager)
-        return self.core._compute_layers(self.core.embedding.index_select(0, ids), self.steps[key])
+        step = self.steps[key]
+        if self.last_only:
+            return self.core.compute_last_context_row(ids, step)
+        return self.core._compute_layers(self.core.embedding.index_select(0, ids), step)

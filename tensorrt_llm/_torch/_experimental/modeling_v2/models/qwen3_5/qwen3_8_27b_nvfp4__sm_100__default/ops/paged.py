@@ -118,6 +118,7 @@ class CausalContextAttention(OpWrapper):
     CELLS = (
         Cell(why="Fresh packed contexts", spec={"lengths": (15, 89)}),
         Cell(why="Full context", spec={"lengths": (1024,)}),
+        Cell(why="Only the final query is consumed", spec={"lengths": (131,), "last_only": True}),
         Cell(why="TMA stages packed contexts at uneven offsets", spec={"lengths": (512, 513, 17)}),
     )
 
@@ -128,7 +129,15 @@ class CausalContextAttention(OpWrapper):
         v: torch.Tensor,
         starts: torch.Tensor,
         chunks: torch.Tensor,
+        *,
+        last_only: bool = False,
     ) -> torch.Tensor:
+        query_start = 0
+        if last_only:
+            assert starts.numel() == 2
+            query_start = (q.shape[0] - 1) // 64 * 64
+            q = q[query_start:]
+            chunks = chunks[-1:]
         y = torch.empty_like(q)
         if q.shape[0] >= 512:
             prefill_attention.attention(q, k, v, y, starts, chunks)
@@ -145,10 +154,11 @@ class CausalContextAttention(OpWrapper):
             64,
             64,
             False,
+            query_start,
             num_warps=8,
             num_stages=2,
         )
-        return y
+        return y[-1:] if last_only else y
 
     def reference(
         self,
@@ -157,9 +167,11 @@ class CausalContextAttention(OpWrapper):
         v: torch.Tensor,
         starts: torch.Tensor,
         chunks: torch.Tensor,
+        *,
+        last_only: bool = False,
     ) -> torch.Tensor:
         spans = starts.tolist()
-        return torch.cat(
+        output = torch.cat(
             [
                 _attention_reference(
                     q[lo:hi], k[lo:hi], v[lo:hi], torch.arange(hi - lo, device=q.device)
@@ -167,6 +179,7 @@ class CausalContextAttention(OpWrapper):
                 for lo, hi in zip(spans[:-1], spans[1:], strict=True)
             ]
         )
+        return output[-1:] if last_only else output
 
 
 class CausalPagedContext(OpWrapper):

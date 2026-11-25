@@ -121,6 +121,8 @@ def route(
             "Qwen3.8-27B requires a full BF16 V2 KV cache with FP32 GDN, "
             "block reuse disabled, and fixed pool ratios"
         )
+    if llm_args.enable_chunked_prefill:
+        raise NoTarget("Qwen3.8-27B requires whole-request prefill")
     if llm_args.max_beam_width != 1 or model_config.lora_config is not None:
         raise NoTarget("Qwen3.8-27B NVFP4 requires beam width 1 and no LoRA adapters")
     if llm_args.cache_transceiver_config is not None:

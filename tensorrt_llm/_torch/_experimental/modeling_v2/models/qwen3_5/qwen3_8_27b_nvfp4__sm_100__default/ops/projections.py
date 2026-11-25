@@ -212,6 +212,10 @@ class PackedFp4Gemm(OpWrapper):
             spec={"m": 64, "k": 17408, "n": 5120, "down": True},
         ),
         Cell(why="TMA down projection", spec={"m": 128, "k": 17408, "n": 5120, "down": True}),
+        Cell(why="Short prefill down", spec={"m": 128, "k": 17408, "n": 5120, "down": False}),
+        Cell(
+            why="Short prefill gate and up", spec={"m": 128, "k": 5120, "n": 34816, "down": False}
+        ),
         Cell(
             why="Tuned prefill gate and up", spec={"m": 1024, "k": 5120, "n": 34816, "down": False}
         ),

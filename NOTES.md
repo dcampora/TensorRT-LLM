@@ -726,3 +726,104 @@ again matched batch 1 token for token.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 4267.57 | 832.39 | 6.259 |
 | 128 | 128 | 6618.51 | 2262.56 | 16.550 |
+
+### Sustained serving with tuned projections, ISL 1024 and 4096, OSL 1024
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 32 | 128 | 3455.01 | 176.05 | 8.964 |
+| 1024 | 128 | 512 | 5509.14 | 438.27 | 22.660 |
+| 4096 | 32 | 128 | 2848.99 | 298.58 | 10.212 |
+
+The native FlashInfer SM100 paged-attention trial started and served on
+BF16 pages. It produced four unaccepted development outputs at
+concurrency 32 and sixteen at concurrency 128. The target keeps its
+validated paged attention. Two-warp pair attention also changed
+rounding and took longer than four warps. The standalone's integer
+vocabulary reduction was exact, including ties and NaNs. At 256 rows
+it took 70.67 microseconds and the runtime's BF16 argmax took 49.59.
+
+### Serving draft-depth controls, ISL 1024 and OSL 1024
+
+These one-wave runs keep the same requests and graph sizes and vary the
+number of drafts at the indicated concurrency.
+
+| Concurrency | Drafts | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 2 | 4030.79 | 820.77 | 6.825 |
+| 32 | 3 | 4267.57 | 832.39 | 6.259 |
+| 32 | 4 | 3514.13 | 852.45 | 7.559 |
+| 128 | 1 | 6618.51 | 2262.56 | 16.550 |
+| 128 | 2 | 5665.89 | 2661.62 | 18.835 |
+
+Aligning the context chunks to 64-token cache pages still diverged from
+batch 1. For example, a 4096-token input at concurrency 32 diverged at
+output position 2, where the batch-1 top-two gap was 0.875 nats.
+The whole-prefill configuration retains exact long-prompt parity.
+
+## Benchmark inputs
+
+The serving runs use the supplied `/task/bench_serving.py` and the
+following passage. The passage SHA-256 is
+`cfcd655d2cbe567c352941de8bba832b610ad39a806c036a39b230e419d56731`.
+
+```bash
+cat CODING_GUIDELINES.md \
+    docs/source/developer-guide/overview.md \
+    docs/source/developer-guide/ci-overview.md \
+    docs/source/developer-guide/perf-benchmarking.md > /tmp/qwen-passage
+./serve.sh /model --port 8000
+```
+
+Run the benchmark against the ready server from a separate shell.
+
+```bash
+python3 /task/bench_serving.py --url http://127.0.0.1:8000 \
+    --model qwen3.8-27b-nvfp4 --passage /tmp/qwen-passage
+```
+
+The one-wave tables use `--minimum 1 --multiplier 1`. Sustained tables
+use the benchmark defaults. The contract timings use the same passage
+with exact-length thinking-enabled chats and the 32-output control.
+
+## First-token prefill and full-output parity
+
+The ordinary single-context graph now computes only the final query tile
+and final feed-forward row in the last layer. It appends the request's
+complete K/V state. MTP and teacher-forced scoring still produce all
+required hidden rows. The final-row path follows aegis-engines
+`engine.py`. The target caches up to 32 immutable chunk layouts keyed by
+context lengths and device.
+
+Short single-prompt prefills overlap the two GDN input projections.
+Rotating checkpoint layers gave bitwise-identical outputs. At 128 rows
+the two projections fell from 26.58 to 21.53 microseconds. At 256 they
+fell from 33.79 to 28.49. The pinned FP4 tactics at 128 rows also
+matched bitwise. They reduced the gate/up GEMM from 21.81 to 19.70
+microseconds and down from 18.78 to 17.43.
+
+The route requires whole-request prefill after the alignment control.
+The normal serving configuration continues to mix whole-context and
+decode work in one scheduler step.
+
+All 49 operation cells, 32 contract oracle cases, and 384 development
+serving checks passed. The one-token and MTP paths picked the same
+first token on all 56 checked prompts. At OSL 128, all 208 serving
+responses matched batch 1 token for token. At OSL 1024, all 160
+responses at concurrency 32 and 128 matched their batch-1 runs
+across 24 natural-language prompts at ISLs 128, 1024, and 4096.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 13.42 | 2.309 | 433.07 |
+| 1024 | 1024 | 35.63 | 2.547 | 392.66 |
+| 4096 | 1024 | 120.61 | 2.784 | 359.19 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4263.59 | 852.15 | 6.233 |
+| 128 | 128 | 6614.25 | 2305.95 | 16.600 |

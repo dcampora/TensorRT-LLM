@@ -43,7 +43,7 @@ class Engine:
             detokenize=False,
         )
         llm = self.score_llm if length == 1 else self.llm
-        tokens = llm.generate(ids, params, use_tqdm=False).outputs[0].token_ids
+        tokens = llm.generate_async(ids, params).result().outputs[0].token_ids
         if ignore_eos and len(tokens) != length:
             raise RuntimeError(f"expected {length} generated tokens, received {len(tokens)}")
         return tokens
@@ -81,7 +81,7 @@ class Engine:
             detokenize=False,
             return_context_logits=True,
         )
-        logits = self.score_llm.generate(ids, params, use_tqdm=False).context_logits
+        logits = self.score_llm.generate_async(ids, params).result().context_logits
         if logits is None or logits.shape != (len(ids), self.vocab_size):
             raise RuntimeError("TensorRT-LLM did not return one vocabulary vector per position")
 

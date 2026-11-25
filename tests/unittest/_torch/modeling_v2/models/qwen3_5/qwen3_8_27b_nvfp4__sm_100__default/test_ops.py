@@ -397,12 +397,20 @@ def test_context_attention(cell) -> None:
         _random(sum(lengths), 1024) / 2,
         _random(sum(lengths), 1024),
     )
+    last_only = cell.spec.get("last_only", False)
     # Softmax tiles round the unnormalized probabilities to BF16 for the V dot product.
     _assert_bf16(
-        context_attention(*args, starts, chunks),
-        context_attention.reference(*args, starts, chunks),
+        context_attention(*args, starts, chunks, last_only=last_only),
+        context_attention.reference(*args, starts, chunks, last_only=last_only),
         ulps=2,
     )
+    if last_only:
+        torch.testing.assert_close(
+            context_attention(*args, starts, chunks, last_only=True),
+            context_attention(*args, starts, chunks)[-1:],
+            atol=0,
+            rtol=0,
+        )
 
 
 @pytest.mark.parametrize("cell", decode_attention.CELLS)

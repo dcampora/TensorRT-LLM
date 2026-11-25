@@ -10,6 +10,7 @@ TensorRT-LLM supplies packed iteration metadata and owns all request state.
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 from itertools import accumulate
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -66,6 +67,17 @@ def _decode_projection_rows(rows: int) -> int:
 
 def _device_ints(values: list, device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+
+
+def _context_chunk_layout(
+    lengths: tuple[int, ...], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    counts = [tr.cdiv(length, 64) for length in lengths]
+    chunks = [(seq, chunk) for seq, count in enumerate(counts) for chunk in range(count)]
+    return (
+        _device_ints(chunks, device),
+        _device_ints(list(accumulate(counts, initial=0)), device),
+    )
 
 
 def _context_groups(lengths: list[int]):
@@ -236,7 +248,11 @@ class Layer(nn.Module):
         if not self.is_linear:
             return self.project_qkv(x, step), None
         rows = x.shape[0]
-        if step.context is not None or (8 < rows < 128):
+        if step.context is None:
+            overlap = rows <= 8 or rows >= 128
+        else:
+            overlap = len(step.context_spans) == 1 and step.projection_rows <= 256
+        if not overlap:
             return self.project_qkv(x, step), self.project_gate(x, step)
         # Both projections consume the same normalized input. The
         # recurrence can start as soon as both stream dependencies retire.
@@ -351,6 +367,7 @@ class Qwen38Decoder(DecoderModel):
         self._manager = None
         self._caches = ()
         self.prefill_graph = PrefillGraph(self)
+        self.context_chunk_layout = lru_cache(maxsize=32)(_context_chunk_layout)
 
     def forward(
         self,
@@ -441,8 +458,7 @@ class Qwen38Decoder(DecoderModel):
     ) -> Step:
         mamba = md.mamba_metadata
         spans = list(accumulate(lengths, initial=0))
-        counts = [tr.cdiv(length, 64) for length in lengths]
-        chunks = [(seq, chunk) for seq, count in enumerate(counts) for chunk in range(count)]
+        chunks, chunk_starts = self.context_chunk_layout(tuple(lengths), device)
         slots = mamba.state_indices[first:last]
         starts = mamba.cu_seqlens[first : last + 1]
         indices = mamba.seq_idx.reshape(-1)[begin:end]
@@ -451,8 +467,8 @@ class Qwen38Decoder(DecoderModel):
             indices = indices - first
         context = Context(
             starts,
-            _device_ints(chunks, device),
-            _device_ints(list(accumulate(counts, initial=0)), device),
+            chunks,
+            chunk_starts,
             slots,
             mamba.has_initial_states[first:last],
             last - first,
@@ -475,6 +491,38 @@ class Qwen38Decoder(DecoderModel):
             None,
             None,
         )
+
+    def compute_last_context_row(self, input_ids: torch.Tensor, step: Step) -> torch.Tensor:
+        # A fresh single prompt needs the complete KV append. Only its final
+        # hidden state reaches the LM head when the ordinary sampler runs.
+        x, residual = self.embedding.index_select(0, input_ids), None
+        for layer, cache in zip(
+            self.layers[: self.num_trunk_layers - 1], self._caches[:-1], strict=True
+        ):
+            x, residual = layer(x, residual, step, self.rope, cache)
+        layer = self.layers[self.num_trunk_layers - 1]
+        cache = self._caches[-1]
+        x, residual = layer.input_rms_norm(x, residual)
+        q, k, v, gate = prepare_qkv(
+            layer.project_qkv(x, step),
+            layer.q_norm,
+            layer.k_norm,
+            self.rope,
+            step.positions,
+            layer.eps,
+        )
+        table = step.block_offsets[cache.group, :, 0]
+        append_kv(k, v, step.positions, cache, table, step.context_indices)
+        ctx = step.context
+        assert ctx is not None
+        x = context_attention(q, k, v, ctx.starts, ctx.chunks, last_only=True)
+        x = layer.out(_pad(apply_gate(x, gate[-1:]), _PREFILL_MIN_ROWS))[:1]
+        residual = residual[-1:]
+        x = layer.post_rms_norm(x, residual)
+        up = layer.gate_up(_pad(x, _PREFILL_MIN_ROWS))
+        x = layer.down.swiglu(up, self.row_counts[1:2], decode=False)[:1]
+        fi.gemma_fused_add_rmsnorm(x, residual, self.norm_weight, self.eps)
+        return x
 
     def _compute_layers(self, x: torch.Tensor, step: Step) -> torch.Tensor:
         residual = None
@@ -571,7 +619,9 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
         speculative = self.spec_worker is not None
         breakable_prefill = attn_metadata.num_contexts and is_in_breakable_cuda_graph()
         if breakable_prefill:
-            self.model.prefill_graph.prepare(attn_metadata, position_ids, speculative)
+            self.model.prefill_graph.prepare(
+                attn_metadata, position_ids, speculative, return_context_logits
+            )
         hidden = self.model(attn_metadata, input_ids, position_ids, speculative)
         if breakable_prefill:
             live = attn_metadata.num_tokens
@@ -595,7 +645,7 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
                 draft_model=self.draft_model,
                 resource_manager=resource_manager,
             )
-        if not return_context_logits:
+        if not return_context_logits and hidden.shape[0] != attn_metadata.num_seqs:
             end = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             hidden = hidden.index_select(0, end)
         return self.lm_head(hidden).float()

@@ -14,6 +14,8 @@ from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
 )
 
 PREFILL_TACTICS = {
+    (128, 5120, 34816): ((256, 128), (2, 1), True, False, "sm100", None),
+    (128, 17408, 5120): ((256, 64), (2, 1), True, False, "sm100", None),
     (1024, 5120, 34816): ((256, 192), (2, 1), False, False, "sm100", None),
     (4096, 17408, 5120): ((256, 192), (2, 1), False, False, "sm100", None),
 }
