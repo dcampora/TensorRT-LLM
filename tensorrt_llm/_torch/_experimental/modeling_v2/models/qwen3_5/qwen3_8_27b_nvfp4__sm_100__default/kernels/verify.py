@@ -5,6 +5,8 @@
 
 import triton as tr
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 from .pointwise import launch_dependents, wait_inputs
 
@@ -62,6 +64,91 @@ def verify_conv(
         x0, x1, x2 = x1, x2, x3
     if PDL:
         launch_dependents()
+
+
+@gluon.jit
+def verify_prepare(
+    X,
+    Weight,
+    History,
+    Slots,
+    QK,
+    Value,
+    BA,
+    A,
+    Bias,
+    Gates,
+    Intermediate,
+    X_STRIDE: gl.constexpr,
+    H_SEQ: gl.constexpr,
+    H_CH: gl.constexpr,
+    H_TIME: gl.constexpr,
+    I_SEQ: gl.constexpr,
+    I_ROW: gl.constexpr,
+    I_CH: gl.constexpr,
+    I_TIME: gl.constexpr,
+    WIDTH: gl.constexpr,
+    PARTS: gl.constexpr,
+):
+    # Adapted from aegis-engines cb6779a, batch_spec_kernels.py.
+    group, seq = gl.program_id(0), gl.program_id(1)
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [PARTS, 1], [1, 0])
+    part = group * PARTS + gl.arange(0, PARTS, layout=gl.SliceLayout(1, layout))
+    lane = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+    channel = part[:, None] * 128 + lane[None, :]
+    slot = gl.load(Slots + seq).to(gl.int64)
+    state = History + slot * H_SEQ + channel * H_CH
+    weight = Weight + channel * 4
+    w0 = gl.load(weight)
+    w1 = gl.load(weight + 1)
+    w2 = gl.load(weight + 2)
+    w3 = gl.load(weight + 3)
+    source = X + seq * WIDTH * X_STRIDE + channel
+    dest = Intermediate + seq * I_SEQ + channel * I_CH
+    x0 = gl.load(state)
+    x1 = gl.load(state + H_TIME)
+    x2 = gl.load(state + 2 * H_TIME)
+    for step in gl.static_range(WIDTH):
+        row = seq * WIDTH + step
+        x3 = gl.load(source + step * X_STRIDE)
+        acc = (x0 * w0).to(gl.float32)
+        acc += (x1 * w1).to(gl.float32)
+        acc += (x2 * w2).to(gl.float32)
+        acc += (x3 * w3).to(gl.float32)
+        convolved = (acc / (1.0 + gl.exp(-acc))).to(gl.bfloat16)
+        window = dest + step * I_ROW
+        gl.store(window, x1)
+        gl.store(window + I_TIME, x2)
+        gl.store(window + 2 * I_TIME, x3)
+        if group * PARTS < 32:
+            value = convolved.to(gl.float32)
+            value = value / gl.sqrt(gl.sum(value * value, 1) + 1e-6)[:, None]
+            if group * PARTS < 16:
+                value *= 128**-0.5
+            gl.store(QK + row * 4096 + channel, value)
+        else:
+            gl.store(Value + row * 6144 + channel - 4096, convolved)
+            head = part - 32
+            log_a = gl.exp(gl.load(A + head).to(gl.float32))
+            bias = gl.load(Bias + head).to(gl.float32)
+            a = gl.load(BA + row * 96 + 48 + head).to(gl.float32) + bias
+            b = gl.load(BA + row * 96 + head).to(gl.float32)
+            decay = gl.exp(-log_a * gl.where(a <= 20.0, gl.log(1 + gl.exp(a)), a))
+            beta = (1.0 / (1.0 + gl.exp(-b))).to(gl.bfloat16).to(gl.float32)
+            gl.store(Gates + row * 96 + head, decay)
+            gl.store(Gates + row * 96 + 48 + head, beta)
+        x0, x1, x2 = x1, x2, x3
+
+
+@tr.jit
+def _prepared_candidate(QK, V, Gates, row, head, kc, vc):
+    channel = head // 3 * 128 + kc
+    q = tl.load(QK + row * 4096 + channel)
+    k = tl.load(QK + row * 4096 + 2048 + channel)
+    v = tl.load(V + (row * 48 + head) * 128 + vc).to(tl.float32)
+    decay = tl.load(Gates + row * 96 + head)
+    beta = tl.load(Gates + row * 96 + 48 + head)
+    return q, k, v, decay, beta
 
 
 @tr.jit
@@ -148,6 +235,8 @@ def verify_replay(
     HISTORY: tl.constexpr,
     BV: tl.constexpr,
     PDL: tl.constexpr,
+    PreparedQK=None,
+    PreparedGates=None,
 ):
     tile, work = tl.program_id(0), tl.program_id(1)
     seq, head = work // 48, work % 48
@@ -168,7 +257,7 @@ def verify_replay(
     gp = Decays + replay_slot * DECAY_SLOT + head * HISTORY
     state_ptr = State + state_slot * STATE_STRIDE
     state_ptr += head * 16384 + vc[:, None] * 128 + kc[None, :]
-    state = tl.load(state_ptr)
+    state = tl.load(state_ptr, cache_modifier=".cg" if PreparedQK is not None else "")
     for i in range(count):
         off = bank * HISTORY + i
         delta = tl.load(dp + (off * 48 + head) * 128 + vc)
@@ -182,7 +271,12 @@ def verify_replay(
         bank = 1 - bank
     for i in tl.static_range(WIDTH):
         row = seq * WIDTH + i
-        q, key, val, decay, beta = _gdn_candidate(QKV, BA, row, head, kc, vc, log_a, bias)
+        if PreparedQK is None:
+            q, key, val, decay, beta = _gdn_candidate(QKV, BA, row, head, kc, vc, log_a, bias)
+        else:
+            q, key, val, decay, beta = _prepared_candidate(
+                PreparedQK, QKV, PreparedGates, row, head, kc, vc
+            )
         state *= decay
         delta = (val - tl.sum(state * key[None, :], 1)) * beta
         state = tl.fma(delta[:, None], key[None, :], state)

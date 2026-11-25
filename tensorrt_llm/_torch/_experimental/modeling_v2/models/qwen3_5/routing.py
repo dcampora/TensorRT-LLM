@@ -145,8 +145,8 @@ def route(
             or any(not 1 <= depth <= spec.max_draft_len for depth in schedule.values())
         ):
             raise NoTarget("Qwen3.8-27B requires at least one draft at every configured batch size")
-    if llm_args.prefill_cuda_graph_backend.value != "disabled":
-        raise NoTarget("Qwen3.8-27B NVFP4 supports CUDA graphs for decode")
+    if llm_args.prefill_cuda_graph_backend.value not in ("disabled", "breakable"):
+        raise NoTarget("Qwen3.8-27B supports breakable prefill CUDA graphs")
 
     from .qwen3_8_27b_nvfp4__sm_100__default.modeling import ModelingV2Qwen38Nvfp4Sm100Default
 

@@ -248,6 +248,15 @@ class GatedDeltaVerify(OpWrapper):
     CELLS = (
         Cell(why="Four drafts for single-request decode", spec={"batch": 1, "width": 5}),
         Cell(why="One draft per request with indexed states", spec={"batch": 32, "width": 2}),
+        Cell(why="Replay switches history banks", spec={"batch": 2, "width": 3, "replay": True}),
+        Cell(
+            why="Replay with prepared queries, keys, and gates",
+            spec={"batch": 8, "width": 2, "replay": True},
+        ),
+        Cell(
+            why="Wide replay prepares two vectors per block",
+            spec={"batch": 64, "width": 2, "replay": True},
+        ),
     )
 
     def __call__(
@@ -267,26 +276,52 @@ class GatedDeltaVerify(OpWrapper):
     ) -> torch.Tensor:
         batch = slots.shape[0]
         rows = batch * width
-        convolved = x.new_empty((rows, 10240))
         pdl = rows <= 8
-        verify.verify_conv[(batch, 40)](
-            x,
-            weight,
-            history,
-            slots,
-            convolved,
-            intermediate_conv,
-            x.stride(0),
-            *history.stride(),
-            *intermediate_conv.stride(),
-            width,
-            256,
-            pdl,
-            num_warps=4,
-            launch_pdl=pdl,
-        )
+        qk = gates = None
+        if replay is not None and batch >= 8:
+            qk = x.new_empty((rows, 4096), dtype=torch.float32)
+            gates = x.new_empty((rows, 96), dtype=torch.float32)
+            convolved = x.new_empty((rows, 6144))
+            parts = 2 if batch >= 64 else 1
+            verify.verify_prepare[(80 // parts, batch)](
+                x,
+                weight,
+                history,
+                slots,
+                qk,
+                convolved,
+                ba,
+                log_decay,
+                bias,
+                gates,
+                intermediate_conv,
+                x.stride(0),
+                *history.stride(),
+                *intermediate_conv.stride(),
+                width,
+                parts,
+                num_warps=parts,
+            )
+        else:
+            convolved = x.new_empty((rows, 10240))
+            verify.verify_conv[(batch, 40)](
+                x,
+                weight,
+                history,
+                slots,
+                convolved,
+                intermediate_conv,
+                x.stride(0),
+                *history.stride(),
+                *intermediate_conv.stride(),
+                width,
+                256,
+                pdl,
+                num_warps=4,
+                launch_pdl=pdl,
+            )
         output = x.new_empty((rows, 6144))
-        value_tile = 4 if pdl else 32
+        value_tile = 8 if qk is not None else (4 if pdl else 32)
         grid = (128 // value_tile, batch * 48)
         if replay is None:
             verify.verify_state[grid](
@@ -327,6 +362,8 @@ class GatedDeltaVerify(OpWrapper):
                 replay.deltas.shape[2],
                 value_tile,
                 pdl,
+                qk,
+                gates,
                 num_warps=1,
                 launch_pdl=pdl,
             )

@@ -219,14 +219,73 @@ The engine retained the preceding commit's 32 generations and score
 metrics. All 32 operation cells and both checkpoint-backed tests passed,
 including overlapping a new prefill with an active speculative decode.
 
+### Closed-loop serving at a3ce5a1c, ISL 1024 and 4096, OSL 1024
+
+The supplied serving benchmark used its default 16-request minimum
+and four requests per concurrency slot. The HTTP server stayed up
+after a client connection disconnected between cases. The remaining
+cases ran with fresh client sessions and their standard warmup waves.
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1 | 16 | 349.73 | 69.85 | 2.801 |
+| 1024 | 2 | 16 | 543.73 | 121.48 | 3.443 |
+| 1024 | 4 | 16 | 876.97 | 137.13 | 4.359 |
+| 1024 | 8 | 32 | 1518.61 | 144.19 | 5.032 |
+| 1024 | 16 | 64 | 2281.22 | 148.75 | 6.600 |
+| 1024 | 32 | 128 | 3166.02 | 220.57 | 9.670 |
+| 1024 | 64 | 256 | 3745.97 | 375.56 | 15.746 |
+| 1024 | 128 | 512 | 4616.39 | 439.76 | 26.978 |
+| 4096 | 1 | 16 | 310.75 | 141.56 | 3.139 |
+| 4096 | 8 | 32 | 1305.71 | 165.80 | 5.645 |
+| 4096 | 32 | 128 | 2330.04 | 369.19 | 12.751 |
+
+### Captured batch-1 prefill, ISL 128, 1024, 4096 and OSL 1024
+
+The runtime's breakable prefill runner keeps a graph for each bucket.
+The target captures the fresh single-sequence trunk with persistent
+position, state-slot, and page-table views. The runtime can run the same
+target eagerly for other context shapes. At TP1, runtime warmup registered
+the break without capturing its inner graph, so the target records that
+graph on the first matching replay. The contract wrapper warms the
+configured shapes before readiness.
+
+The graph trial without inner capture took 88.69 and 80.70 ms to first
+token at ISL 128 and 1024. With the inner graphs, the oracle scores and
+all 32 continuations matched the preceding version.
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 20.45 | 2.476 | 403.90 |
+| 1024 | 1024 | 42.75 | 2.749 | 363.78 |
+| 4096 | 1024 | 134.04 | 2.985 | 335.06 |
+
+### Batched GDN verification
+
+At ISL 1024 and OSL 64, Nsight Systems attributed 40% of the batch-32
+decode graph's kernel time and 52% at batch 128 to GDN verification.
+On batch 128, the original request-major view put 144 MiB between
+adjacent state slots. Separate native pools gave a 3 MiB stride. Both
+layouts averaged 350 microseconds per GDN verify, so the runtime's
+existing layout stays in use.
+
+The batched verifier ports convolution with query/key normalization
+and gate preparation from aegis-engines' `batch_spec_kernels.py`.
+It computes those inputs once per head and updates eight value
+coordinates per warp. With four pending history rows in a rotating raw
+kernel probe, batch-32 verification fell from 137 to 90 microseconds and
+batch 128 fell from 302 to 213 microseconds. The replay cells compare
+BF16 outputs and convolution windows bit for bit against full FP32
+checkpointing across history bank switches.
+
 ## Standalone comparison
 
 The original `/ref-engine/engine.sh` copy crashed while instantiating its
 adaptive conditional CUDA graph with this image's CUDA driver. The rerun
 with `QWEN_ADAPTIVE_DRAFT=0`, `QWEN_FP4_TMA=0` and prompt caching disabled
 processed all 32 development items. Its conditional top-20 KL was 0.011746,
-non-tie top-1 was 99.17%, and no greedy generation diverged outside the
-accepted positions. The conditional KL uses both distributions
+raw top-20 KL was 0.011454, and non-tie top-1 was 99.17%. All 32 greedy
+generations passed. The conditional KL uses both distributions
 renormalized over the reference's top 20 token IDs.
 
 ### Standalone engine, ISL 128, 1024, 4096 and OSL 1024

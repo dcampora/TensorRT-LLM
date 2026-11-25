@@ -167,6 +167,8 @@ def run(model: Path, responses: TextIO, mode: str) -> None:
             generate_options = {
                 **options,
                 "speculative_config": {"decoding_type": "MTP", "max_draft_len": 4},
+                "prefill_cuda_graph_backend": "breakable",
+                "prefill_capture_num_tokens": [128, 1024, 4096],
             }
         llm = stack.enter_context(LLM(str(model), **generate_options))
         if mode == "require":

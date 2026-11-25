@@ -20,6 +20,7 @@ import triton as tr
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
@@ -39,6 +40,7 @@ from .ops.paged import (
     paged_context_attention,
 )
 from .ops.projections import Fp4Linear, Fp8Linear
+from .prefill_graph import PrefillGraph
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -227,8 +229,6 @@ class Layer(nn.Module):
 
 
 class Qwen38Decoder(DecoderModel):
-    supports_prefill_cuda_graph = False
-
     def __init__(self, model_config: ModelConfig) -> None:
         super().__init__(model_config)
         config = model_config.pretrained_config.get_text_config()
@@ -243,6 +243,7 @@ class Qwen38Decoder(DecoderModel):
         self.register_buffer("row_counts", None, persistent=False)
         self._manager = None
         self._caches = ()
+        self.prefill_graph = PrefillGraph(self)
 
     def forward(
         self,
@@ -251,17 +252,23 @@ class Qwen38Decoder(DecoderModel):
         position_ids: torch.Tensor,
         verify: bool = False,
     ) -> torch.Tensor:
-        md = attn_metadata
-        manager = md.kv_cache_manager
+        if attn_metadata.num_contexts and is_in_breakable_cuda_graph():
+            return self.prefill_graph.run(input_ids)
+        return self.compute(attn_metadata, input_ids, position_ids, verify)
+
+    def bind_caches(self, metadata) -> None:
+        manager = metadata.kv_cache_manager
         if manager is not self._manager:
             self._caches = tuple(
                 manager.mamba_layer_cache(layer.index)
                 if layer.is_linear
-                else bind_layer(manager, layer.index, md.host_kv_cache_pool_mapping)
+                else bind_layer(manager, layer.index, metadata.host_kv_cache_pool_mapping)
                 for layer in self.layers[: self.num_trunk_layers]
             )
             self._manager = manager
 
+    def compute(self, md, input_ids, position_ids, verify: bool) -> torch.Tensor:
+        self.bind_caches(md)
         x = self.embedding.index_select(0, input_ids)
         positions = position_ids.reshape(-1, x.shape[0])[0]
         contexts = md.num_contexts
@@ -440,7 +447,15 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
         if inputs_embeds is not None:
             raise ValueError("Qwen3.8-27B text target requires token IDs")
         speculative = self.spec_worker is not None
+        breakable_prefill = attn_metadata.num_contexts and is_in_breakable_cuda_graph()
+        if breakable_prefill:
+            self.model.prefill_graph.prepare(attn_metadata, position_ids, speculative)
         hidden = self.model(attn_metadata, input_ids, position_ids, speculative)
+        if breakable_prefill:
+            live = attn_metadata.num_tokens
+            hidden = hidden[:live]
+            input_ids = input_ids[:live]
+            position_ids = position_ids[..., :live]
         if speculative:
             logits = self.lm_head(hidden.index_select(0, spec_metadata.gather_ids)).float()
             return self.spec_worker(

@@ -175,7 +175,7 @@ def test_gdn_decode(cell) -> None:
     _check_recurrent(gdn_decode, *args, args[-1], 1)
 
 
-@pytest.mark.parametrize("cell", gdn_verify.CELLS)
+@pytest.mark.parametrize("cell", [cell for cell in gdn_verify.CELLS if not cell.spec.get("replay")])
 def test_gdn_verify(cell) -> None:
     torch.manual_seed(22)
     batch, width = (cell.spec[key] for key in ("batch", "width"))
@@ -194,9 +194,12 @@ def test_gdn_verify(cell) -> None:
     torch.testing.assert_close(state, saved_state, atol=0, rtol=0)
 
 
-def test_gdn_replay_acceptance() -> None:
+@pytest.mark.parametrize("cell", [cell for cell in gdn_verify.CELLS if cell.spec.get("replay")])
+def test_gdn_replay_acceptance(cell) -> None:
     torch.manual_seed(23)
-    batch, width, history_size = 2, 3, 5
+    batch, width = (cell.spec[key] for key in ("batch", "width"))
+    history_size = width + 2
+    replay_capacity = 2 * batch
     _, _, weight, decay, bias, conv, temporal, slots = _gdn_inputs(batch * width, batch)
     full_conv, full_state = conv.clone(), temporal.clone()
     conv_planes = (batch, width, *conv.shape[1:])
@@ -205,16 +208,16 @@ def test_gdn_replay_acceptance() -> None:
     full_ssm_steps = temporal.new_empty((batch, width, *temporal.shape[1:]))
     replay = Replay(
         slots.flip(0),
-        torch.zeros(4, dtype=torch.int32, device="cuda"),
-        torch.zeros(4, dtype=torch.int32, device="cuda"),
-        temporal.new_empty((4, 2, history_size, 48, 128)),
-        temporal.new_empty((4, 2, history_size, 16, 128)),
-        temporal.new_empty((4, 2, 48, history_size)),
+        torch.zeros(replay_capacity, dtype=torch.int32, device="cuda"),
+        torch.zeros(replay_capacity, dtype=torch.int32, device="cuda"),
+        temporal.new_empty((replay_capacity, 2, history_size, 48, 128)),
+        temporal.new_empty((replay_capacity, 2, history_size, 16, 128)),
+        temporal.new_empty((replay_capacity, 2, 48, history_size)),
     )
     batches = torch.arange(batch, device="cuda")
     state_slots = slots.long()
     replay_slots = replay.slots.long()
-    for counts in ((2, 3), (1, 3), (3, 1), (1, 1)):
+    for offset in (1, 2, 0, 1):
         x, ba = _random(batch * width, 16384), _random(batch * width, 96)
         inputs = x, ba, weight, decay, bias
         actual = gdn_verify(*inputs, conv, temporal, slots, verify_conv, None, width, replay)
@@ -223,7 +226,7 @@ def test_gdn_replay_acceptance() -> None:
         )
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         torch.testing.assert_close(verify_conv, full_conv_steps, atol=0, rtol=0)
-        accepted = torch.tensor(counts, device="cuda", dtype=torch.int32)
+        accepted = (batches + offset).to(torch.int32) % width + 1
         conv[state_slots] = verify_conv[batches, accepted - 1]
         full_conv[state_slots] = full_conv_steps[batches, accepted - 1]
         full_state[state_slots] = full_ssm_steps[batches, accepted - 1]
