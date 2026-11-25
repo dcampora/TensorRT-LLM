@@ -96,6 +96,12 @@ developer guide because its default source paths were absent.
 | 1024 | 1024 | 16 | 1229.7 | 283.73 | 12.807 |
 | 1024 | 1024 | 32 | 3022.8 | 270.22 | 10.388 |
 | 1024 | 1024 | 64 | 5111.8 | 271.81 | 12.342 |
+| 1024 | 1024 | 128 | 8769.5 | 267.03 | 14.308 |
+| 4096 | 1024 | 1 | 193.5 | 89.74 | 5.083 |
+| 4096 | 1024 | 8 | 1220.7 | 337.52 | 6.203 |
+
+The retry completed the 1024-token prompt run at concurrency 128. The
+4096-token prompt sweep disconnected during warmup at concurrency 32.
 
 ## Standalone comparison
 
@@ -199,3 +205,45 @@ at least four requests for concurrency 1.
 | 1024 | 1024 | 1 | 623.3 | 77.27 | 1.530 |
 | 1024 | 1024 | 32 | 4422.7 | 899.02 | 6.090 |
 | 1024 | 1024 | 128 | 7805.6 | 484.38 | 14.504 |
+
+A batch-dependent draft schedule used three drafts through eight active
+requests, two through 64 and one through 128. It passed the single-client
+and concurrency-128 comparisons, with one concurrency-32 divergence at a
+0.875-nat margin. The serving default remained three drafts for this revision.
+
+| ISL | OSL | Concurrency | Scheduled-draft output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 617.9 | 75.99 |
+| 1024 | 1024 | 32 | 5676.1 | 246.56 |
+| 1024 | 1024 | 128 | 8922.4 | 531.42 |
+
+## Prefill CUDA graphs
+
+The runtime captures the whole decoder body for a fresh single prompt
+whose length matches a configured bucket. The target stages embeddings,
+positions, cache slots and page tables at stable addresses before capture
+and replay. Mixed steps, continuations, padded lengths and teacher-forced
+score requests run eagerly. The runtime change is an opt-in policy that
+checks the capture and replay shapes. The launchers capture lengths 128,
+256, 512, 1024, 2048 and 4096 for generation.
+
+Initial captures borrowed transient metadata during warmup and faulted on
+replay. Staging in the runtime's breakable graph context fixed those
+captures. Compute Sanitizer reported zero memory errors on the single
+engine with all six buckets. The full launcher matched eager execution on
+70 requests interleaving scoring and generation, with exact and unbucketed
+prompt lengths. All 32 development items passed at the same KL and top-1
+agreement as the exact-scale revision.
+
+Batch 1 through `engine.sh`, with the median of two measurements in each
+cell. One-token requests use the speculative generation engine so they take
+the same prefill graph as longer generation requests.
+
+| ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 11.20 | 1.462 | 684.1 |
+| 1024 | 1024 | 19.60 | 1.628 | 614.4 |
+| 4096 | 1024 | 48.20 | 1.563 | 639.7 |
+
+`serve.sh` loaded the prefill and generation graphs and passed the
+batch-1 comparisons at concurrencies 1, 32 and 128.

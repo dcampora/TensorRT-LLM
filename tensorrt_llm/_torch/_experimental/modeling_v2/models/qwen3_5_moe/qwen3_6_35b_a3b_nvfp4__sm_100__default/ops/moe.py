@@ -188,7 +188,7 @@ class Experts(nn.Module):
         grouped = rows >= cutoff
         use_gemv = rows <= 128
         packed_prefill = contexts and grouped
-        share_in_parallel = grouped or use_gemv
+        share_in_parallel = side is not None and (grouped or use_gemv)
 
         if share_in_parallel:
             main = torch.cuda.current_stream()
@@ -220,7 +220,10 @@ class Experts(nn.Module):
                 cluster=2,
                 raw=epilogue is not None,
             )
-            main.wait_stream(side)
+            if share_in_parallel:
+                main.wait_stream(side)
+            else:
+                shared = self._shared(x, packed_prefill)
             if epilogue is None:
                 out = torch.empty_like(x)
                 alpha = self.shared_down.alpha if packed_prefill else None
@@ -244,7 +247,10 @@ class Experts(nn.Module):
         if use_gemv:
             mid = gemv(x, self.gate_up, 1, ids, probs)
             experts = gemv(mid, self.down, 2, ids, probs)
-            main.wait_stream(side)
+            if share_in_parallel:
+                main.wait_stream(side)
+            else:
+                shared = self._shared(x, False)
         else:
             tile = 32 if rows > 2048 else 16
             sorted_ids, slots = torch.sort(ids.flatten(), stable=True)

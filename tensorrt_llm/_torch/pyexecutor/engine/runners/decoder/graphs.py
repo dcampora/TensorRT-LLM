@@ -1025,6 +1025,16 @@ class DecoderCudaGraphs:
                             self._warmup_inputs,
                         )
 
+    def _can_capture_prefill(self, num_tokens: int) -> bool:
+        metadata = self._metadata.attn_metadata
+        if getattr(metadata, "decoder_replay_plan", None) is not None:
+            return False
+        return not runtime_hooks_of(self.model).exact_single_context_prefill or (
+            metadata.num_contexts == metadata.num_seqs == 1
+            and metadata.num_ctx_tokens == num_tokens
+            and metadata.kv_cache_params.num_cached_tokens_per_seq == [0]
+        )
+
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture prefill CUDA graphs, timing each phase separately.
 
@@ -1087,15 +1097,13 @@ class DecoderCudaGraphs:
                                     runtime_draft_len=runtime_draft_len,
                                 ),
                                 self._warmup_inputs,
-                                can_capture=lambda: getattr(
-                                    self._metadata.attn_metadata, "decoder_replay_plan", None
-                                )
-                                is None,
+                                can_capture=lambda: self._can_capture_prefill(num_tokens),
                             )
                             if not captured:
                                 logger.info(
                                     "Skipping breakable prefill graph capture for "
-                                    f"{num_tokens} tokens: decoder replay changes boundary metadata"
+                                    f"{num_tokens} tokens because the warmup shape cannot replay "
+                                    "the model body"
                                 )
                         finally:
                             self._metrics["ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(

@@ -4,7 +4,7 @@
 """Select the text-only Qwen3.6 ModelOpt target."""
 
 from tensorrt_llm._torch.utils import is_gdn_replay_enabled
-from tensorrt_llm.llmapi.llm_args import LoadFormat, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import LoadFormat, MTPDecodingConfig, PrefillCudaGraphBackend
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
@@ -94,6 +94,8 @@ def route(model_config, llm_args, compute_capability):
         raise NoTarget("the target requires FP8 KV cache")
     if llm_args.attn_backend != "TRTLLM":
         raise NoTarget("the target consumes TensorRT-LLM attention metadata")
+    if llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
+        raise NoTarget("the target supports breakable prefill CUDA graphs")
     kv = llm_args.kv_cache_config
     if kv.use_kv_cache_manager_v2 is False or kv.mamba_ssm_cache_dtype != "float32":
         raise NoTarget("the target requires KV cache manager V2 with FP32 recurrent state")

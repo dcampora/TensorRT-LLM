@@ -3,13 +3,16 @@
 
 """Text decoder for the ModelOpt Qwen3.6-35B-A3B checkpoint on SM100."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
 
 from .... import disable_v2_by_default
 from ..routing import LAYER_TYPES
@@ -209,9 +212,14 @@ class PackedHead(PackedWeights):
         return self.projector.logits(x)
 
 
-class QwenDecoder(DecoderModel):
-    supports_prefill_cuda_graph = False
+@dataclass(frozen=True)
+class PrefillBuffers:
+    hidden: torch.Tensor
+    step: Step
+    block_offsets: torch.Tensor
 
+
+class QwenDecoder(DecoderModel):
     def __init__(self, model_config):
         super().__init__(model_config)
         self.embed_tokens = nn.Embedding(VOCAB, HIDDEN, dtype=BF16, _freeze=True)
@@ -219,6 +227,7 @@ class QwenDecoder(DecoderModel):
         self.final_norm = parameter((HIDDEN,))
         self._cache_manager = None
         self._layer_caches = ()
+        self._prefill_buffers: dict[int, PrefillBuffers] = {}
         self.mtp = DraftLayer() if model_config.spec_config is not None else None
         self.mtp_cache = None
 
@@ -241,6 +250,7 @@ class QwenDecoder(DecoderModel):
             layer.moe.prepare()
 
     def _bind_cache_views(self, md):
+        self._prefill_buffers.clear()
         cm = md.kv_cache_manager
         mapping = md.host_kv_cache_pool_mapping.tolist()
         caches = []
@@ -269,16 +279,44 @@ class QwenDecoder(DecoderModel):
                 separate,
             )
 
-    def forward(
-        self, attn_metadata, input_ids, position_ids, inputs_embeds=None, spec_metadata=None
-    ):
+    def prepare_step(self, attn_metadata, position_ids, spec_metadata) -> Step:
         if self._cache_manager is not attn_metadata.kv_cache_manager:
             self._bind_cache_views(attn_metadata)
-        step = Step.from_metadata(attn_metadata, position_ids, self.requests, spec_metadata)
+        return Step.from_metadata(attn_metadata, position_ids, self.requests, spec_metadata)
+
+    def stage_prefill(self, input_ids, inputs_embeds, step, block_offsets) -> PrefillBuffers:
+        """Stage per-request operands before the runtime captures or replays its graph."""
+        rows = step.context_tokens
+        buffers = self._prefill_buffers.get(rows)
+        if buffers is None:
+            static_step = replace(
+                step,
+                positions=torch.empty_like(step.positions),
+                request_rows=torch.zeros_like(step.request_rows),
+                slots=torch.empty_like(step.slots),
+                cu=step.cu.clone(),
+                has_initial=None,
+            )
+            buffers = PrefillBuffers(
+                torch.empty((rows, HIDDEN), dtype=BF16, device=step.positions.device),
+                static_step,
+                torch.empty_like(block_offsets[:, :1], memory_format=torch.contiguous_format),
+            )
+            self._prefill_buffers[rows] = buffers
         if inputs_embeds is None:
-            x = self.embed_tokens(input_ids[: attn_metadata.num_tokens])
+            inputs_embeds = self.embed_tokens(input_ids[:rows])
+        buffers.hidden.copy_(inputs_embeds[:rows])
+        buffers.step.positions.copy_(step.positions)
+        buffers.step.slots.copy_(step.slots)
+        buffers.block_offsets.copy_(block_offsets[:, :1])
+        return buffers
+
+    def forward(self, input_ids, inputs_embeds, step, block_offsets, *, prefill_graph=False):
+        if inputs_embeds is None:
+            x = self.embed_tokens(input_ids[: step.positions.numel()])
         else:
-            x = inputs_embeds[: attn_metadata.num_tokens]
+            x = inputs_embeds[: step.positions.numel()]
+        side = None if prefill_graph else self.side
         residual = torch.empty_like(x)
         first = self.layers[0]
         x8 = torch.empty_like(x, dtype=FP8)
@@ -288,10 +326,10 @@ class QwenDecoder(DecoderModel):
         for i, (layer, cache) in enumerate(zip(self.layers, self._layer_caches)):
             if layer.full_attention:
                 kv, pool = cache
-                table = attn_metadata.kv_cache_block_offsets[pool]
+                table = block_offsets[pool]
                 x = layer.attention(x8, step, kv, table, self.rope)
             else:
-                x = layer.attention(x, x8, step, cache, self.side)
+                x = layer.attention(x, x8, step, cache, side)
             x = residual_rms_norm(x, residual, layer.after, True, True)
             save = i + 1 < len(self.layers)
             if save:
@@ -302,17 +340,17 @@ class QwenDecoder(DecoderModel):
             else:
                 weight, scale, x8 = self.final_norm, None, None
             epilogue = None if step.contexts else ExpertEpilogue(residual, weight, save, x8, scale)
-            x = layer.moe(x, self.bins, self.side, step.contexts, step.batch, epilogue, step.width)
+            x = layer.moe(x, self.bins, side, step.contexts, step.batch, epilogue, step.width)
             if epilogue is None:
                 x = residual_rms_norm(x, residual, weight, True, save, x8, scale)
-        return x, step
+        return x
 
 
 @disable_v2_by_default
 class ModelingV2Qwen36Nvfp4Sm100Default(DecoderModelForCausalLM):
-    """Qwen3.6 language model with packed tensor-core experts and vocabulary."""
+    """Qwen3.6 language model with optional fused one-model MTP-Eagle."""
 
-    supports_prefill_cuda_graph = False
+    runtime_hooks = RuntimeHooks(exact_single_context_prefill=True)
 
     def __init__(self, model_config):
         # Use a target-local vocabulary projection in place of the runtime base's
@@ -346,6 +384,12 @@ class ModelingV2Qwen36Nvfp4Sm100Default(DecoderModelForCausalLM):
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
         return "V2"
 
+    def validate_request(self, request) -> None:
+        if _has_mm_payload_keys(request.py_multimodal_data):
+            raise ValueError("The Qwen3.6 SM100 target supports text requests.")
+        if self.spec_config is not None and request.py_logits_post_processors:
+            raise ValueError("Fused Qwen3.6 MTP does not provide logits to callbacks.")
+
     def load_weights(self, weights):
         load_decoder_weights(self.model, weights)
         self.lm_head.load(weights, ("",), ("lm_head",))
@@ -369,9 +413,19 @@ class ModelingV2Qwen36Nvfp4Sm100Default(DecoderModelForCausalLM):
         spec_metadata=None,
         **kwargs,
     ):
-        hidden, step = self.model(
-            attn_metadata, input_ids, position_ids, inputs_embeds, spec_metadata
-        )
+        step = self.model.prepare_step(attn_metadata, position_ids, spec_metadata)
+        block_offsets = attn_metadata.kv_cache_block_offsets
+        if (
+            is_in_breakable_cuda_graph()
+            and step.contexts == step.batch == 1
+            and attn_metadata.kv_cache_params.num_cached_tokens_per_seq == [0]
+        ):
+            buffers = self.model.stage_prefill(input_ids, inputs_embeds, step, block_offsets)
+            hidden = self.model(
+                None, buffers.hidden, buffers.step, buffers.block_offsets, prefill_graph=True
+            )
+        else:
+            hidden = self.model(input_ids, inputs_embeds, step, block_offsets)
         if spec_metadata is not None:
             return mtp_step(
                 input_ids,

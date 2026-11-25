@@ -2878,6 +2878,13 @@ class DecoderInputPreparer:
                     or supports_mixed_breakable
                 )
             )
+            if self.runtime_hooks.exact_single_context_prefill:
+                breakable_eligible = (
+                    breakable_eligible
+                    and host.num_ctx_requests == 1
+                    and host.num_ctx_tokens == total_num_tokens
+                    and host.num_cached_tokens_snapshot == [0]
+                )
             if replay_plan is not None and replay_plan.replays_local_tokens and not is_dummy:
                 logger.debug(
                     "Breakable prefill CUDA graph is unavailable for batches that "
@@ -2900,6 +2907,8 @@ class DecoderInputPreparer:
         )
         if breakable_prefill and get_per_request_prefill_cuda_graph_flag():
             graph_available = breakable_eligible
+            if self.runtime_hooks.exact_single_context_prefill:
+                graph_available = graph_available and total_num_tokens == virtual_num_tokens
             if not (breakable_runner.is_capturing or breakable_runner.is_warming_up):
                 # An eager forward must receive the original token count. Warmup forwards run
                 # eagerly, except those that capture the bucket graph's break graphs.

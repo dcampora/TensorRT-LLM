@@ -252,6 +252,9 @@ class RuntimeHooks:
     stage_decode_inputs: bool = False
     # Capture the decode CUDA graphs (at most 256 tokens per step) on a high-priority stream.
     prioritize_decode_graphs: bool = False
+    # The prefill graph covers one fresh prompt whose length equals the graph bucket.
+    # Mixed, cached and padded steps run the normal eager forward.
+    exact_single_context_prefill: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
     # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side

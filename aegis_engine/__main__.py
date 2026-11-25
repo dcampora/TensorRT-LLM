@@ -43,8 +43,7 @@ def handle(generator, scorer, request, vocab_size, eos):
             include_stop_str_in_output=True,
             **common,
         )
-        llm = scorer if count == 1 else generator
-        output = llm.generate(ids, params, use_tqdm=False)
+        output = generator.generate(ids, params, use_tqdm=False)
         return {"ids": list(output.outputs[0].token_ids)}
 
     rows = len(ids) - 1
@@ -111,21 +110,29 @@ def main():
             max_tokens=16384 if drafts else None,
         ),
     )
+    prefill_graph_options = {}
+    if mode == "require" and os.environ.get("AEGIS_PREFILL_GRAPHS", "1") == "1":
+        prefill_graph_options.update(
+            prefill_cuda_graph_backend="breakable",
+            prefill_capture_num_tokens=[128, 256, 512, 1024, 2048, 4096],
+        )
 
     def send(value):
         print(json.dumps(value, separators=(",", ":")), file=reply, flush=True)
 
     with ExitStack() as stack:
-        scorer = stack.enter_context(LLM(str(model), **options))
+        scorer_options = {**options, **({} if drafts else prefill_graph_options)}
+        scorer = stack.enter_context(LLM(str(model), **scorer_options))
         generator = scorer
         if drafts:
-            # The speculative sampler rejects context-logit requests. Keep an
-            # ordinary decoder for teacher forcing and single-token responses.
+            # The speculative sampler needs a separate ordinary decoder for
+            # teacher-forced context logits.
             generator = stack.enter_context(
                 LLM(
                     str(model),
                     speculative_config=MTPDecodingConfig(max_draft_len=drafts),
                     **options,
+                    **prefill_graph_options,
                 )
             )
         send({"ready": True})

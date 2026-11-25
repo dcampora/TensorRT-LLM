@@ -5,7 +5,7 @@
 
 The proposal layer and shortlist are adapted from aegis-engines
 speculation.py. The step returns TensorRT-LLM's speculative sampler contract
-and uses the same block table as the target's paged layers.
+and uses the runtime's paged block tables for the draft layer.
 """
 
 from dataclasses import replace
@@ -149,6 +149,7 @@ def mtp_step(input_ids, hidden, step, md, spec, draft_layer, head, decoder):
         last = accepted[spec.batch_indices_cuda[:batch], lengths - 1]
         next_tokens = torch.cat((last[:, None], next_drafts), dim=-1)
     return {
+        "logits": None,
         "new_tokens": accepted,
         "new_tokens_lens": lengths,
         "next_draft_tokens": next_drafts,

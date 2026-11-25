@@ -9,7 +9,7 @@ import pytest
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget, registered_routes
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5_moe import routing
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.llmapi.llm_args import LoadFormat, MTPDecodingConfig, PrefillCudaGraphBackend
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
@@ -39,6 +39,7 @@ def deployment():
     args = SimpleNamespace(
         disable_mm_encoder=True,
         attn_backend="TRTLLM",
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
         kv_cache_config=SimpleNamespace(
             dtype="auto",
             use_kv_cache_manager_v2=True,
@@ -48,6 +49,7 @@ def deployment():
             max_attention_window=None,
         ),
         max_beam_width=1,
+        max_batch_size=128,
         cache_transceiver_config=None,
         load_format=LoadFormat.AUTO,
         enable_lora=False,
@@ -55,6 +57,7 @@ def deployment():
         enable_locality_domains=False,
         lm_head_output_dtype="auto",
         speculative_config=None,
+        guided_decoding_backend=None,
     )
     return config, args
 
@@ -85,4 +88,20 @@ def test_refuses_other_kv_dtype(deployment):
     config, args = deployment
     args.kv_cache_config.dtype = "bfloat16"
     with pytest.raises(NoTarget, match="FP8 KV cache"):
+        routing.route(config, args, (10, 0))
+
+
+def test_refuses_piecewise_graph(deployment):
+    config, args = deployment
+    args.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
+    with pytest.raises(NoTarget, match="breakable prefill CUDA graphs"):
+        routing.route(config, args, (10, 0))
+
+
+def test_draft_schedule_keeps_kv_history(deployment):
+    config, args = deployment
+    args.speculative_config = MTPDecodingConfig(max_draft_len=3, draft_len_schedule={8: 3, 128: 1})
+    assert routing.route(config, args, (10, 0))
+    args.speculative_config = MTPDecodingConfig(max_draft_len=3, draft_len_schedule={8: 3, 128: 0})
+    with pytest.raises(NoTarget, match="retain draft KV history"):
         routing.route(config, args, (10, 0))
