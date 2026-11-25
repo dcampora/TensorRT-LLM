@@ -1,0 +1,293 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Operator parity over the Qwen3.8 decode and context layouts."""
+
+from itertools import accumulate
+
+import flashinfer as fi
+import pytest
+import torch
+
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.attention import (  # noqa: E501
+    apply_gate,
+    prepare_qkv,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.gdn import (
+    Context,
+    gated_rmsnorm,
+    gdn_context,
+    gdn_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.paged import (  # noqa: E501
+    Cache,
+    append_kv,
+    context_attention,
+    decode_attention,
+    paged_context_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.projections import (  # noqa: E501
+    fp8_quantize,
+    fp8_requantize,
+    packed_fp4_gemm,
+    swiglu_fp4,
+)
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="The Qwen3.8 NVFP4 target requires SM100.",
+)
+
+
+def _random(*size: int) -> torch.Tensor:
+    return torch.randn(size, device="cuda", dtype=torch.bfloat16)
+
+
+def _assert_bf16(actual: torch.Tensor, expected: torch.Tensor, ulps: float = 1) -> None:
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    expected = expected.float().flatten(1)
+    delta = (actual.float().flatten(1) - expected).abs()
+    scale = expected.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    eps = torch.finfo(torch.bfloat16).eps
+    assert (delta <= ulps * eps * scale).all(), (delta / (eps * scale)).amax().item()
+
+
+@pytest.mark.parametrize("cell", fp8_quantize.CELLS)
+def test_static_fp8(cell) -> None:
+    torch.manual_seed(9)
+    x = _random(cell.spec["rows"], cell.spec["width"])
+    scale = torch.tensor(0.037, device="cuda")
+    actual = fp8_quantize(x, scale)
+    expected = fp8_quantize.reference(x, scale)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("cell", fp8_requantize.CELLS)
+def test_fp8_requantize(cell) -> None:
+    torch.manual_seed(10)
+    w = (_random(cell.spec["rows"], cell.spec["width"]) * 105).to(torch.float8_e4m3fn)
+    src, dst = (torch.tensor(s, device="cuda") for s in (0.00063, 0.0012))
+    actual = fp8_requantize(w, src, dst)
+    expected = fp8_requantize.reference(w, src, dst)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("cell", swiglu_fp4.CELLS)
+def test_swiglu_fp4(cell) -> None:
+    torch.manual_seed(11)
+    x = _random(cell.spec["rows"], 2 * cell.spec["width"])
+    scale = torch.tensor(39.125, device="cuda")
+    actual, actual_scale = swiglu_fp4(x, scale)
+    expected, expected_scale = swiglu_fp4.reference(x, scale)
+    # Scale bytes for padded rows have no corresponding activation values.
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import Nvfp4Gemm
+
+    decode = Nvfp4Gemm._dequantize
+    a = decode(actual, actual_scale.view(torch.uint8)).bfloat16()
+    b = decode(expected, expected_scale.view(torch.uint8)).bfloat16()
+    _assert_bf16(a, b)
+
+
+@pytest.mark.parametrize("cell", packed_fp4_gemm.CELLS)
+def test_fp4_gemm(cell) -> None:
+    torch.manual_seed(12)
+    m, k, n, down = (cell.spec[key] for key in ("m", "k", "n", "down"))
+    alpha = torch.tensor([1.0 / 256], device="cuda")
+    activations = _random(m, k)
+    weight = _random(n, k)
+    inv_scale = torch.tensor(16.0, device="cuda")
+    a, a_scale = fi.fp4_quantize(activations, inv_scale, backend="cute-dsl")
+    b, b_scale = fi.fp4_quantize(weight, inv_scale, backend="cute-dsl")
+    args = a, b.T, a_scale, b_scale.T, alpha
+    actual = packed_fp4_gemm(*args, down_decode=down)
+    expected = packed_fp4_gemm.reference(*args, down_decode=down)
+    _assert_bf16(actual, expected)
+
+
+@pytest.mark.parametrize("cell", prepare_qkv.CELLS)
+def test_qkv_and_rope(cell) -> None:
+    torch.manual_seed(13)
+    rows = cell.spec["rows"]
+    x = _random(rows, 14336)
+    pos = torch.arange(rows, device="cuda") + cell.spec["position"]
+    angle = torch.outer(
+        torch.arange(pos.numel() + cell.spec["position"], device="cuda").float(),
+        1 / 10000000 ** (torch.arange(0, 64, 2, device="cuda").float() / 64),
+    )
+    table = torch.cat((angle.cos(), angle.sin()), dim=-1)
+    args = x, _random(256) / 4, _random(256) / 4, table, pos, 1e-6
+    for actual, expected in zip(prepare_qkv(*args), prepare_qkv.reference(*args), strict=True):
+        _assert_bf16(actual, expected)
+
+
+@pytest.mark.parametrize("cell", apply_gate.CELLS)
+def test_attention_gate(cell) -> None:
+    torch.manual_seed(14)
+    x, gate = (_random(cell.spec["rows"], 6144) for _ in range(2))
+    _assert_bf16(apply_gate(x.clone(), gate), apply_gate.reference(x, gate))
+
+
+@pytest.mark.parametrize("cell", gated_rmsnorm.CELLS)
+def test_gated_norm(cell) -> None:
+    torch.manual_seed(15)
+    rows = cell.spec["rows"]
+    x, z = (_random(rows, 6144) for _ in range(2))
+    scale = torch.tensor(0.032, device="cuda") if cell.spec["pack"] else None
+    args = x, z, _random(128), 1e-6, scale
+    actual = gated_rmsnorm(*args, decode=cell.spec["pack"])
+    expected = gated_rmsnorm.reference(*args, decode=cell.spec["pack"])
+    _assert_bf16(actual.bfloat16(), expected.bfloat16())
+
+
+def _gdn_inputs(rows: int, batch: int) -> tuple[torch.Tensor, ...]:
+    slots = torch.arange(batch - 1, -1, -1, device="cuda", dtype=torch.int32) * 2
+    return (
+        _random(rows, 16384),
+        _random(rows, 96) / 4,
+        _random(10240, 4) / 8,
+        _random(48) - 2,
+        _random(48),
+        _random(batch * 2, 3, 10240).transpose(1, 2),
+        _random(batch * 2, 48, 128, 128).float() / 512,
+        slots,
+    )
+
+
+def _check_recurrent(
+    op, x, ba, weight, log_decay, bias, hist, state, slots, metadata, ulps
+) -> None:
+    ref_hist, ref_state = hist.clone(), state.clone()
+    actual = op(x, ba, weight, log_decay, bias, hist, state, metadata)
+    expected = op.reference(x, ba, weight, log_decay, bias, ref_hist, ref_state, metadata)
+    _assert_bf16(actual, expected, ulps=ulps)
+    torch.testing.assert_close(hist, ref_hist, rtol=0, atol=0)
+    _assert_bf16(
+        state[slots].bfloat16().flatten(0, 1), ref_state[slots].bfloat16().flatten(0, 1), ulps=ulps
+    )
+
+
+@pytest.mark.parametrize("cell", gdn_decode.CELLS)
+def test_gdn_decode(cell) -> None:
+    torch.manual_seed(16)
+    batch = cell.spec["batch"]
+    args = _gdn_inputs(batch, batch)
+    _check_recurrent(gdn_decode, *args, args[-1], 1)
+
+
+@pytest.mark.parametrize("cell", gdn_context.CELLS)
+def test_gdn_context(cell) -> None:
+    torch.manual_seed(17)
+    lengths = cell.spec["lengths"]
+    args = _gdn_inputs(sum(lengths), len(lengths))
+    counts = [(n + 63) // 64 for n in lengths]
+    chunks = [(i, c) for i, n in enumerate(counts) for c in range(n)]
+    inputs = (list(accumulate(lengths, initial=0)), chunks, list(accumulate(counts, initial=0)))
+    ctx = Context(
+        *(torch.tensor(x, device="cuda", dtype=torch.int32) for x in inputs),
+        args[-1],
+        torch.tensor(cell.spec["carried"], device="cuda"),
+        len(lengths),
+        max(lengths),
+        64,
+    )
+    # The chunked solve rounds normalized Q/K, triangular factors and its
+    # boundary-state dot products to BF16 before the final output rounding.
+    _check_recurrent(gdn_context, *args, ctx, 4)
+
+
+def _paged_cache(lengths: tuple[int, ...], head_init: bool) -> tuple[Cache, torch.Tensor]:
+    blocks = [(n + 31) // 32 for n in lengths]
+    all_pages = sum(blocks)
+    shuffled = torch.randperm(all_pages, device="cuda", dtype=torch.int32)
+    table = torch.zeros((len(lengths), max(blocks)), device="cuda", dtype=torch.int32)
+    first = 0
+    for i, count in enumerate(blocks):
+        table[i, :count] = 2 * shuffled[first : first + count]
+        first += count
+    dims = all_pages, 2, 4, 32, 256
+    pool = _random(*dims) if head_init else torch.zeros(dims, device="cuda", dtype=torch.bfloat16)
+    return Cache(0, 0, 2, pool[:, 0], pool[:, 1]), table
+
+
+@pytest.mark.parametrize("cell", append_kv.CELLS)
+def test_append_paged(cell) -> None:
+    torch.manual_seed(18)
+    lengths, width = cell.spec["lengths"], cell.spec["width"]
+    starts = [0, 0] if width == 1 else [30, 62]
+    cache, table = _paged_cache(tuple(n + s for n, s in zip(lengths, starts, strict=True)), False)
+    reference = cache._replace(key=cache.key.clone(), value=cache.value.clone())
+    rows = sum(lengths)
+    k, v = _random(rows, 1024), _random(rows, 1024)
+    pos = torch.cat(
+        [torch.arange(s, s + n, device="cuda") for s, n in zip(starts, lengths, strict=True)]
+    )
+    req = (
+        torch.arange(len(lengths), device="cuda").repeat_interleave(
+            torch.tensor(lengths, device="cuda")
+        )
+        if width == 1
+        else None
+    )
+    append_kv(k, v, pos, cache, table, req, width)
+    append_kv.reference(k, v, pos, reference, table, req, width)
+    torch.testing.assert_close(cache.key, reference.key, rtol=0, atol=0)
+    torch.testing.assert_close(cache.value, reference.value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cell", context_attention.CELLS)
+def test_context_attention(cell) -> None:
+    torch.manual_seed(19)
+    lengths = cell.spec["lengths"]
+    starts = torch.tensor(list(accumulate(lengths, initial=0)), device="cuda", dtype=torch.int32)
+    chunks = torch.tensor(
+        [(i, c) for i, size in enumerate(lengths) for c in range((size + 63) // 64)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    args = (
+        _random(sum(lengths), 6144) / 2,
+        _random(sum(lengths), 1024) / 2,
+        _random(sum(lengths), 1024),
+    )
+    # Softmax tiles round the unnormalized probabilities to BF16 for the V dot product.
+    _assert_bf16(
+        context_attention(*args, starts, chunks),
+        context_attention.reference(*args, starts, chunks),
+        ulps=2,
+    )
+
+
+@pytest.mark.parametrize("cell", decode_attention.CELLS)
+def test_paged_decode(cell) -> None:
+    torch.manual_seed(20)
+    lengths, width = cell.spec["lengths"], cell.spec["width"]
+    cache, table = _paged_cache(lengths, True)
+    pos = torch.cat([torch.arange(n - width, n, device="cuda", dtype=torch.int32) for n in lengths])
+    q, gate = _random(pos.numel(), 6144) / 2, _random(pos.numel(), 6144)
+    _assert_bf16(
+        decode_attention(q, gate, pos, cache, table, rows_per_seq=width),
+        decode_attention.reference(q, gate, pos, cache, table, rows_per_seq=width),
+        ulps=2,
+    )
+
+
+@pytest.mark.parametrize("cell", paged_context_attention.CELLS)
+def test_paged_context(cell) -> None:
+    torch.manual_seed(21)
+    prefixes = cell.spec["prefixes"]
+    lengths = (95, 11)
+    cache, table = _paged_cache(tuple(p + n for p, n in zip(prefixes, lengths, strict=True)), True)
+    starts = torch.tensor(list(accumulate(lengths, initial=0)), device="cuda", dtype=torch.int32)
+    chunks = torch.tensor(
+        [(i, c) for i, length in enumerate(lengths) for c in range((length + 63) // 64)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    positions = torch.cat(
+        [
+            torch.arange(prefix, prefix + length, device="cuda", dtype=torch.int32)
+            for prefix, length in zip(prefixes, lengths, strict=True)
+        ]
+    )
+    q = _random(sum(lengths), 6144) / 2
+    args = q, starts, chunks, positions, cache, table
+    _assert_bf16(paged_context_attention(*args), paged_context_attention.reference(*args), ulps=2)
