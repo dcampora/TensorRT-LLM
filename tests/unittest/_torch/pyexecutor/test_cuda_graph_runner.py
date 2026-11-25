@@ -474,6 +474,7 @@ def test_encoder_decoder_fixed_slots_restore_source_order() -> None:
 def _decoder_runner(
     *,
     short_long_seq_len_threshold: int | None = None,
+    short_sequence_graph_when_any_short: bool = False,
     sparse_attention_config: BaseSparseAttentionConfig | None = None,
     private_metadata_buffers: bool = False,
 ) -> CUDAGraphRunner:
@@ -495,6 +496,7 @@ def _decoder_runner(
         dist=None,
         sparse_attention_config=sparse_attention_config,
         short_long_seq_len_threshold=short_long_seq_len_threshold,
+        short_sequence_graph_when_any_short=short_sequence_graph_when_any_short,
         private_metadata_buffers=private_metadata_buffers,
     )
     return CUDAGraphRunner(config)
@@ -573,6 +575,23 @@ def test_seq_len_mode_is_long_without_a_threshold() -> None:
     runner = _decoder_runner()
 
     assert runner._get_seq_len_mode(_generation_batch(1)) is False
+
+
+def test_short_graph_keeps_live_short_requests_separate_from_padding() -> None:
+    runner = _decoder_runner(
+        short_long_seq_len_threshold=256, short_sequence_graph_when_any_short=True
+    )
+    batch = _generation_batch(1024, 256)
+    assert runner._get_seq_len_mode(batch)
+
+    batch.generation_requests[1].is_cuda_graph_dummy = True
+    assert not runner._get_seq_len_mode(batch)
+
+    batch.generation_requests[0].is_cuda_graph_dummy = True
+    assert not runner._get_seq_len_mode(batch)
+
+    batch.generation_requests.pop(0)
+    assert runner._get_seq_len_mode(batch)
 
 
 class SparseGraphKeyTestCase(unittest.TestCase):

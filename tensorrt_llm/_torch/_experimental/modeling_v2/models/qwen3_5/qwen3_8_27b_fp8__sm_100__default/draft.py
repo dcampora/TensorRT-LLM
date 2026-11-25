@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .modeling import DecoderLayer, residual_norm
+from .modeling import DecoderLayer, has_short_generation, residual_norm
 from .ops.activation import attention_gate_quantize, draft_input_norm
 from .ops.attention import prepare_qkv
 from .ops.paged_attention import attention_arguments, paged_attention
@@ -50,7 +50,8 @@ class DraftLayer(DecoderLayer):
         gen_tokens = hidden.shape[0] - attn_metadata.num_ctx_tokens
         predicted = gen_tokens // generation if generation else 1
         decode = not context
-        projection = self.input_proj(hidden, decode)
+        accelerate = not has_short_generation(attn_metadata) and (decode or hidden.shape[0] > 128)
+        projection = self.input_proj(hidden, decode, accelerate)
         q, k, v = prepare_qkv(
             projection,
             self.q_norm,
@@ -62,9 +63,14 @@ class DraftLayer(DecoderLayer):
         layer = attn_metadata.kv_cache_manager.layer_offsets[self.index]
         result = paged_attention(q, k, v, layer, attention_arguments(attn_metadata, predicted))
         hidden = self.output_proj.quantized(
-            *attention_gate_quantize(result, projection), projection.shape[0], decode
+            *attention_gate_quantize(result, projection),
+            projection.shape[0],
+            decode,
+            accelerate,
         )
-        hidden, residual = self.feed_forward(hidden, residual, decode, fused=True)
+        hidden, residual = self.feed_forward(
+            hidden, residual, decode, fused=True, accelerate=accelerate
+        )
         return residual_norm(hidden, residual, self.output_norm)[0]
 
     @staticmethod

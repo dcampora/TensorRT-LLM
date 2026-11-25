@@ -532,6 +532,9 @@ class DecoderRunner(ScheduledModelRunner):
             dist=self._dist,
             sparse_attention_config=self._sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
+            short_sequence_graph_when_any_short=(
+                self.runtime_hooks.decode_short_sequence_threshold is not None
+            ),
             private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             prioritize_decode_graphs=self.runtime_hooks.prioritize_decode_graphs,
             stage_decode_inputs=self.runtime_hooks.stage_decode_inputs,
@@ -553,9 +556,8 @@ class DecoderRunner(ScheduledModelRunner):
     def _short_long_seq_len_threshold(self) -> int | None:
         """The total sequence length that splits the short and long decode graph families, or None for one family.
 
-        Set by a sparse attention config that asks for the split, or by a model whose MSA
-        policy stages identity selections for short sequences: a sequence within the
-        top-k blocks attends every valid block. The short family runs the identity selection,
+        Sparse attention and model runtime hooks can request the split. An MSA sequence
+        within the top-k blocks attends every valid block. Its short family runs identity selection,
         so every token it attends must fit in the top-k blocks. The graph key estimates a
         sequence's length from host token counts, which under the overlap scheduler miss up to
         the in-flight step's accepted tokens; the identity threshold leaves one generation
@@ -575,7 +577,7 @@ class DecoderRunner(ScheduledModelRunner):
                 )
             topk_span = sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
             return topk_span - self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
-        return None
+        return self.runtime_hooks.decode_short_sequence_threshold
 
     def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
         if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:

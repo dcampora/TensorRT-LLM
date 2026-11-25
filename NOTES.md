@@ -312,3 +312,53 @@ The mixed HTTP cases at concurrency 4, 32, and 128 now match all
 isolated short-prompt continuations. The model also passed all 32
 development items through `engine.sh` with the same KL and top-1
 agreement, and `serve.sh` passed the homogeneous concurrency checks.
+
+## Blackwell block-scaled projection dispatch
+
+I reran the standalone reference at batch 1, ISL 1024 and OSL 1024 with
+the GPU idle between processes. Two runs gave a median 256.04 decode
+tokens/s and 50.57 ms TTFT. This supersedes the contended 203.94
+tokens/s observation above for that input length.
+
+Long prefill and established histories use DeepGEMM with the existing
+128-channel E4M3 codes and packed exponents. The small-row output
+projections use TensorRT-LLM's prequantized CuTe DSL operation, with
+each 128-channel activation exponent repeated across four hardware
+subgroups. The loader packs a second scale view over the same FP8
+weights. At four rows the FFN down projection took 22.95 us in the CuTe
+path and 46.52 us in the original GEMM. At 256 rows it took 32.97 us
+in DeepGEMM and 59.34 us in the original GEMM.
+
+Using the new reductions for all decode lengths changed item 28 at
+the 0.5-nat cutoff. The target now keeps the preceding CUTLASS arithmetic
+when any active sequence has a short history. It also keeps the stable
+short paged-attention reduction in that decode graph. The shared graph
+runner carries the opt-in sequence-length classification from confirmed
+host token counts, ignoring padding requests. The first trial fell to
+1,413 and 3,835 output tokens/s at concurrency 32 and 128 (ISL 1024,
+OSL 1024). The CUDA trace showed eager launches because startup used one
+dummy of the requested length and filled the rest of the batch with
+shorter dummies. During startup the longest dummy now selects the graph
+family. The default behavior of other graph families stays the same.
+
+The split passed all 32 development items at KL 0.003288 and 99.909%
+non-tie top-1 agreement, with the same isolated continuations as
+before. The serving endpoint returned those same continuations at
+concurrency 1, 32, and 128. All 64 target operations and 35 CPU CUDA-graph
+runner tests passed. The DeepGEMM operation test allows one adjacent
+BF16 value for individual outputs and limits the aggregate error
+independently.
+
+On three new technical chats per input length, seven of the nine matched
+the standalone reference or diverged at a near-tie. One reference run
+generated a different token from its own scoring argmax at 0.5 nats on
+a 128-token input. On a 1,024-token input the target and reference scorers
+agreed, while target generation picked a different token at a reference
+gap of 0.625. The preceding CUTLASS-only build showed the same two
+divergences.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 66.79 | 4.015 | 249.08 |
+| 1 | 1024 | 1024 | 58.35 | 3.635 | 275.09 |
+| 1 | 4096 | 1024 | 146.79 | 3.887 | 257.28 |

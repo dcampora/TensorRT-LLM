@@ -34,6 +34,7 @@ from .ops.attention import (
     short_paged_attention,
 )
 from .ops.gates import fixed_gate_projection
+from .ops.matmul_accelerated import accelerated_block_matmul
 from .ops.paged_attention import attention_arguments, paged_attention
 from .ops.projection import block_matmul, block_quantize
 from .ops.recurrent import (
@@ -51,22 +52,58 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
+SHORT_HISTORY = 256
+MAX_VERIFY_WIDTH = 8
+
+
+def has_short_generation(md: "TrtllmAttentionMetadata") -> bool:
+    """Use the captured decode family or a conservative eager history bound."""
+    captured_mode = getattr(md, "decode_has_short_sequence", None)
+    if captured_mode is not None:
+        return captured_mode
+    lengths = md.kv_lens_runtime[md.num_contexts : md.num_seqs]
+    return bool((lengths <= SHORT_HISTORY + MAX_VERIFY_WIDTH).any())
+
+
 class BlockProjection(nn.Module):
     """One projection or multiple with a shared input and a fused output."""
 
     def __init__(self) -> None:
         super().__init__()
-        for name in ("weight", "scales", "scales_mn", "narrow_scales", "workspace"):
+        for name in (
+            "weight",
+            "scales",
+            "scales_mn",
+            "narrow_scales",
+            "packed_scales",
+            "workspace",
+        ):
             self.register_buffer(name, None)
 
-    def forward(self, x: torch.Tensor, decode: bool) -> torch.Tensor:
-        return self.quantized(*block_quantize(x), x.shape[0], decode)
+    def forward(self, x: torch.Tensor, decode: bool, accelerate: bool = False) -> torch.Tensor:
+        return self.quantized(*block_quantize(x), x.shape[0], decode, accelerate)
 
     def quantized(
-        self, a: torch.Tensor, scales: torch.Tensor, rows: int, decode: bool
+        self,
+        a: torch.Tensor,
+        scales: torch.Tensor,
+        rows: int,
+        decode: bool,
+        accelerate: bool = False,
     ) -> torch.Tensor:
         """Dispatch the measured SM100 tile for this packed activation shape."""
         n, k = self.weight.shape
+        wide_tile = decode and rows <= 8 and n == 34816
+        if accelerate and not wide_tile:
+            return accelerated_block_matmul(
+                a,
+                scales,
+                self.weight,
+                self.scales,
+                self.packed_scales,
+                rows,
+                small=decode and rows <= 32 and n == 5120,
+            )
         split_k = decode and rows == 1 and n == 5120
         tiled = (
             decode
@@ -116,6 +153,7 @@ class Step:
     gate_workspace: torch.Tensor
     predicted: int
     speculative: bool
+    short_generation: bool
     context_offsets: torch.Tensor | None = None
     host_offsets: list[int] | None = None
     context_lengths: list[int] | None = None
@@ -145,6 +183,7 @@ class Step:
             gate_workspace,
             predicted,
             speculative,
+            generation > 0 and has_short_generation(md),
         )
         if contexts:
             lengths = md.seq_lens[:contexts].tolist()
@@ -381,7 +420,7 @@ class DecoderLayer(nn.Module):
         layer = step.metadata.kv_cache_manager.layer_offsets[self.index]
         out = paged_attention(q, k, v, layer, step.attention_args)
         manager = step.metadata.kv_cache_manager
-        if step.context_rows < p.shape[0]:
+        if step.short_generation:
             pages = manager.get_buffers(self.index, kv_layout="HND")
             offset_scale = manager.get_layer_page_index_scale(self.index)
             # The V2 view is indexed by K/V pairs when every slot starts
@@ -424,6 +463,7 @@ class DecoderLayer(nn.Module):
         residual: torch.Tensor,
         decode: bool,
         fused: bool,
+        accelerate: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply the post-attention residual and SwiGLU."""
         if fused:
@@ -431,8 +471,10 @@ class DecoderLayer(nn.Module):
             normalized = residual_norm_quantize(
                 hidden, residual, self.post_norm, False, decode and rows <= 8
             )
-            gate_up = self.gate_up.quantized(*normalized, rows, decode)
-            return self.down.quantized(*swiglu_quantize(gate_up), rows, decode), residual
+            gate_up = self.gate_up.quantized(*normalized, rows, decode, accelerate)
+            return self.down.quantized(
+                *swiglu_quantize(gate_up), rows, decode, accelerate
+            ), residual
         hidden, residual = residual_norm(hidden, residual, self.post_norm)
         return self.down(silu_and_mul(self.gate_up(hidden, decode)), decode), residual
 
@@ -446,14 +488,15 @@ class DecoderLayer(nn.Module):
         decode = step.context_rows == 0
         fused = step.short_contexts is None
         rows = x.shape[0]
+        accelerate = not step.short_generation and (decode or (fused and rows > 128))
         if fused and residual is not None:
             normalized = residual_norm_quantize(
                 x, residual, self.pre_norm, self.is_linear, decode and rows <= 8
             )
-            projection = self.input_proj.quantized(*normalized, rows, decode)
+            projection = self.input_proj.quantized(*normalized, rows, decode, accelerate)
         else:
             x, residual = residual_norm(x, residual, self.pre_norm)
-            projection = self.input_proj(x, decode)
+            projection = self.input_proj(x, decode, accelerate)
         if self.is_linear:
             hidden = self._linear_attention(x, projection, step)
             if fused:
@@ -465,11 +508,11 @@ class DecoderLayer(nn.Module):
             if fused:
                 activation = attention_gate_quantize(hidden, projection)
         hidden = (
-            self.output_proj.quantized(*activation, rows, decode)
+            self.output_proj.quantized(*activation, rows, decode, accelerate)
             if fused
             else self.output_proj(hidden, decode)
         )
-        return self.feed_forward(hidden, residual, decode, fused)
+        return self.feed_forward(hidden, residual, decode, fused, accelerate)
 
 
 class TokenEmbedding(nn.Module):
@@ -570,8 +613,9 @@ class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
                 loop_on_execution_stream=True,
                 gdn_fused_verify=True,
                 gdn_first_row_checkpoint=True,
+                decode_short_sequence_threshold=SHORT_HISTORY,
             )
-        return None
+        return RuntimeHooks(decode_short_sequence_threshold=SHORT_HISTORY)
 
     def load_weights(self, checkpoint: dict[str, torch.Tensor]) -> None:
         """Populate the target using the original HF keys."""

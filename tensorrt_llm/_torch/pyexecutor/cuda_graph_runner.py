@@ -227,6 +227,8 @@ class CUDAGraphRunnerConfig:
     # sparse attention config when it asks for the split, else from the model's
     # runtime hooks.
     short_long_seq_len_threshold: Optional[int] = None
+    # Some models require the short path whenever any live history is short.
+    short_sequence_graph_when_any_short: bool = False
     # Give the graph metadata a buffer pool of its own instead of the
     # process-wide one, so no other engine writes its metadata buffers (an
     # engine that skips unchanged uploads into them relies on that).
@@ -259,6 +261,7 @@ class CUDAGraphRunner:
     WARMUP_STEPS = 1
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
+    _short_sequence_graph_when_any_short: bool = False
     # Default for runners built without __init__ (test stubs).
     _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
@@ -274,6 +277,7 @@ class CUDAGraphRunner:
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
         self._configured_seq_len_threshold = config.short_long_seq_len_threshold
+        self._short_sequence_graph_when_any_short = config.short_sequence_graph_when_any_short
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
@@ -469,13 +473,30 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         promoted_context_request_ids: frozenset[int] = frozenset()
     ) -> bool:
-        """Select the sparse-attention graph family for the execution view.
+        """Select the sequence-length graph family for the execution view.
 
         ``promoted_context_request_ids`` contains semantic final-context rows
         that the decoder runner temporarily placed in the generation list. It is
         empty for the existing generation-only path.
         """
         if self.short_long_seq_len_threshold is not None:
+            if self._short_sequence_graph_when_any_short:
+                requests = batch.generation_requests
+                live = [request for request in requests if not request.is_dummy]
+                if not live:
+                    # Capture creates one request of the requested length and
+                    # fills the rest of the batch with minimal-length dummies.
+                    return bool(requests) and all(
+                        request.max_beam_num_tokens <=
+                        self.short_long_seq_len_threshold
+                        for request in requests)
+                # Host token counts exclude the overlap step's unconfirmed
+                # tokens. Ignore padding requests on a live step.
+                return any(
+                    (request.context_current_position +
+                     1 if request.py_request_id in promoted_context_request_ids
+                     else request.max_beam_num_tokens
+                     ) <= self.short_long_seq_len_threshold for request in live)
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
             # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
             # computational overhead. To support this feature, we need to capture separate CUDA graphs for short
@@ -803,6 +824,8 @@ class CUDAGraphRunner:
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
             num_sequences_in_batch, False, key.draft_len,
             self.cuda_graph_meta_buffers)
+        if self._short_sequence_graph_when_any_short:
+            graph_attn_metadata.decode_has_short_sequence = key.short_seq_len_mode
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(

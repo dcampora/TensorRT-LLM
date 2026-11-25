@@ -79,6 +79,8 @@ def route(
         raise NoTarget("Qwen3.8-27B FP8 requires enable_block_reuse=False")
     if llm_args.attn_backend != "TRTLLM" or llm_args.max_beam_width != 1:
         raise NoTarget("Qwen3.8-27B FP8 requires TRTLLM attention metadata and beam width 1")
+    if llm_args.sparse_attention_config is not None:
+        raise NoTarget("Qwen3.8-27B FP8 uses dense full-attention layers")
     spec = model_config.spec_config
     if spec is not None:
         if (

@@ -5,8 +5,14 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.kernels.packed_scales import (  # noqa: E501
+    pack_weight,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.gates import (  # noqa: E501
     fixed_gate_projection,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.matmul_accelerated import (  # noqa: E501
+    accelerated_block_matmul,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.projection import (  # noqa: E501
     block_matmul,
@@ -87,4 +93,25 @@ def test_gate_projection(cell, certifying):
     assert_within_ulp(output, expect, 1.0, 0.5)
     torch.testing.assert_close(
         output[:1], fixed_gate_projection(x[:1], w, workspace), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("cell", accelerated_block_matmul.CELLS, ids=lambda cell: cell.why)
+def test_accelerated_matmul(cell, certifying):
+    """The hardware scale layouts preserve every 128-channel activation group."""
+    assert torch.cuda.is_available()
+    rows, n, k, small = (cell.spec[name] for name in ("rows", "n", "k", "small"))
+    generator = torch.Generator(device="cuda").manual_seed(19)
+    x = torch.randn(rows, k, device="cuda", generator=generator).bfloat16()
+    w = (torch.randn(n, k, device="cuda", generator=generator) * 48).to(torch.float8_e4m3fn)
+    sw = torch.exp2(
+        torch.randint(-6, -1, (n // 128, k // 128), device="cuda", generator=generator).float()
+    )
+    a, sa = block_quantize(x)
+    args = (a, sa, w, sw, pack_weight(sw, n, k), rows, small)
+    certifying(accelerated_block_matmul)
+    # A different FP32 reduction can cross one BF16 rounding boundary.
+    # One BF16 spacing is at most two of the comparator's half-ULP units.
+    assert_within_ulp(
+        accelerated_block_matmul(*args), accelerated_block_matmul.reference(*args), 2.0, 0.1
     )
