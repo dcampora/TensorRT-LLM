@@ -3,7 +3,7 @@
 modeling_v2: require
 disable_mm_encoder: true
 generation_config: trtllm
-enable_chunked_prefill: true
+enable_chunked_prefill: false
 enable_autotuner: false
 max_batch_size: 128
 max_num_tokens: 8192

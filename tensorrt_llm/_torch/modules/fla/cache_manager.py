@@ -1006,6 +1006,8 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     # The GDN mixer implements the in-forward snapshot split.
     _supports_inforward_snapshot = True
     _skips_steady_state_index_upload = True
+    _replay_history_dtype: torch.dtype | None = None
+    _replay_step_history = False
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:

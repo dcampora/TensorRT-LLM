@@ -460,3 +460,50 @@ started and all 384 serving comparisons passed.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 3895.50 | 929.55 | 6.788 |
 | 128 | 128 | 5869.31 | 2639.91 | 18.524 |
+
+## Projection and recurrent controls
+
+The checkpoint gives every fused FP8 projection's shards the same
+activation scale and separate weight scales. The target uses the
+checkpoint weight scales to repack the shards to a common FP8 scale,
+as in aegis-engines' ModelOpt loader. Running the FP8 shards separately
+with their original scales produced raw KL 0.019954, non-tie top-1
+98.43%, and six unaccepted development generations. The fused loader's
+raw KL is 0.008055.
+
+The two-part TMA tactic for GDN QKVZ took 16.66, 33.68, and 48.99
+microseconds at 5, 128, and 256 rows across six checkpoint layers.
+The cuBLASLt projections took 14.76, 17.78, and 21.34 microseconds.
+GDN QKVZ continues to use cuBLASLt. A factored recurrent update built
+with TF32x3 also changed rounding and took 390.86 microseconds per
+batch-128 layer, versus about 230 for the exact FP32 verifier.
+
+## Long-prompt serving parity
+
+A longer test used eight distinct prompts at each of ISL 128, 1024,
+and 4096, with OSL 128. Chunked prefill produced six distinct
+concurrency-32/128 divergences with a batch-1 score gap of at least
+0.5 nats. Grouping contexts by equal length had the same result.
+Prefilling each long request separately had the same result with
+chunking enabled and matched batch 1 when each request's prefill
+ran in one iteration.
+
+The serving configuration now disables context chunking. It still
+packs context and generation requests into the same scheduler
+iteration. The prompt and per-iteration token budgets are both 8192,
+so every supported prompt can fit in an iteration. With only this
+configuration change, all 208 long-prompt responses through
+`serve.sh` at concurrency 1, 8, 32, and 128 matched the batch-1
+engine token for token. The 32 contract cases and 384 development
+serving checks passed again.
+
+The shared replay allocator has defaults for its two target options.
+The CPU tests for the hybrid cache managers passed 257 tests with
+one skipped.
+
+### One-wave serving trial, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4002.88 | 918.52 | 6.675 |
+| 128 | 128 | 6087.69 | 2453.34 | 18.078 |
