@@ -354,6 +354,15 @@ def verify_prepared_step(
     gp = Decays + replay_slot * DECAY_SLOT + head * HISTORY
     # The runtime flips the bank whenever this slot holds a previous step.
     write_bank = bank ^ (count > 0).to(gl.int32)
+    channel = group * 128 + kc
+    # All value tiles in this warp use the same queries, keys, and gates.
+    q_rows, k_rows, decay_rows, beta_rows = (), (), (), ()
+    for i in gl.static_range(WIDTH):
+        row = seq * WIDTH + i
+        q_rows += (gl.load(QK + row * 4096 + channel),)
+        k_rows += (gl.load(QK + row * 4096 + 2048 + channel),)
+        decay_rows += (gl.load(Gates + row * 96 + head),)
+        beta_rows += (gl.load(Gates + row * 96 + 48 + head),)
     for tile_offset in gl.static_range(TILES):
         tile = part * TILES + tile_offset
         vc = tile * 4 + gl.arange(0, 4, layout=gl.SliceLayout(1, layout))
@@ -369,12 +378,11 @@ def verify_prepared_step(
 
         for i in gl.static_range(WIDTH):
             row = seq * WIDTH + i
-            channel = group * 128 + kc
-            q = gl.load(QK + row * 4096 + channel)
-            k = gl.load(QK + row * 4096 + 2048 + channel)
+            q = q_rows[i]
+            k = k_rows[i]
             v = gl.load(Value + (row * 48 + head) * 128 + vc).to(gl.float32)
-            decay = gl.load(Gates + row * 96 + head)
-            beta = gl.load(Gates + row * 96 + 48 + head)
+            decay = decay_rows[i]
+            beta = beta_rows[i]
             state *= decay
             delta = (v - gl.sum(state * k[None, :], 1)) * beta
             state = gl.fma(delta[:, None], k[None, :], state)

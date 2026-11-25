@@ -889,3 +889,85 @@ zero-gap token. All 208 long-prompt OSL 128 responses and all 160
 long-prompt OSL 1024 responses matched batch 1 exactly. All 56
 ordinary one-token requests matched the corresponding first MTP
 output. A sampled completion at temperature 0.8 also returned.
+
+### Sustained serving of the fresh-convolution build, ISL 1024 and 4096, OSL 1024
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 32 | 128 | 3657.54 | 157.95 | 8.349 |
+| 1024 | 128 | 512 | 5553.00 | 454.08 | 22.515 |
+| 4096 | 32 | 128 | 2906.67 | 265.65 | 10.190 |
+
+## Additional exact-kernel controls
+
+Changing the fresh TMA attention to one or three K/V pipeline stages
+preserved the output bits. Two stages were fastest across the six tested
+packed shapes. At 4096 tokens, one, two, and three stages took 1201.25,
+914.39, and 930.31 microseconds per layer.
+
+The GDN chunk advance with two warps changed FP32 committed state, so
+the launch retains four warps. A wider four-warp tile saved 32.77
+microseconds for eight simultaneous 1024-token contexts and gave no
+improvement for seven. The smaller tile covers the variable batches in
+normal serving.
+
+The CPU-only cross-model routing, CI selection and Mamba-cache suites
+passed 712 cases with 77 skips.
+
+### Scheduled MTP input packing control, ISL 1024 and OSL 1024
+
+The same existing target was run with and without the scheduler's
+packed uploads, in-graph scatter, and early-copy stream. The sustained
+concurrency-128 control repeated the gain seen with one wave.
+
+| Concurrency | Requests | Default output tokens/s | Packed output tokens/s | Default median TTFT (ms) | Packed median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4313.19 | 4294.46 | 797.92 | 792.33 |
+| 128 | 128 | 6655.56 | 6887.03 | 2857.06 | 2172.33 |
+| 128 | 512 | 5553.00 | 5690.80 | 454.08 | 440.90 |
+
+## Shared verifier inputs and packed scheduler uploads
+
+The recurrent verifier loads each draft row's query, key, decay, and
+beta once per warp and reuses them across value tiles. The two-row
+verifier uses four tiles, and the 32-request, four-row verifier uses
+two. A rotating 48-layer cache probe matched both output and committed
+state bit for bit. Verifier time at batch 128 fell from 189.87 to
+173.31 microseconds per layer. At batch 32 it fell from 88.88 to 86.99.
+
+Short prefill up to 256 rows uses the existing aegis-engines SwiGLU
+packing operation. It wrote the same packed activation and FP8 scale
+codes as the expert quantizer. The raw 128-row operation fell from
+8.48 to 5.65 microseconds. For longer prefills the expert quantizer
+remained faster.
+
+Scheduled MTP enables packed step inputs on the runtime's copy stream
+and scatters them inside the decode graph. The pack includes the draft
+acceptance counts and sampling RNG uploads when required. The fixed
+batch-one draft path keeps its existing upload schedule.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 13.56 | 2.307 | 433.44 |
+| 1024 | 1024 | 32.94 | 2.543 | 393.19 |
+| 4096 | 1024 | 114.19 | 2.786 | 358.92 |
+
+All 53 GPU operation and integration cases passed. The contract engine
+again passed the full 32-case development oracle at mean KL 0.008055
+and 99.537% non-tie top-1 agreement. The 24 serial 1024-token outputs
+were identical to the preceding build. All 56 first-token comparisons
+matched between the ordinary and MTP paths.
+
+### One-wave serving with packed step inputs, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4354.43 | 780.98 | 6.138 |
+| 128 | 128 | 6843.08 | 2794.28 | 15.527 |
+
+The server passed all 384 development comparisons. The two batch-1
+differences were at the same zero-gap token as before. All 208 OSL 128
+and all 160 OSL 1024 long-prompt responses matched batch 1 exactly.
+A temperature-0.8 completion also returned.

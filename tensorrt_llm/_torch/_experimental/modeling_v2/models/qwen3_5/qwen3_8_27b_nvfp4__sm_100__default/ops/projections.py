@@ -288,7 +288,7 @@ class Fp4Linear(nn.Module):
 
     def swiglu(self, x: torch.Tensor, rows: torch.Tensor, *, decode: bool) -> torch.Tensor:
         m = x.shape[0]
-        if decode and m <= 512:
+        if m <= (512 if decode else 256):
             packed, scales = swiglu_fp4(x, self.inv_scale, pdl=m <= 8)
         else:
             packed, scales = fi.silu_and_mul_scaled_nvfp4_experts_quantize(

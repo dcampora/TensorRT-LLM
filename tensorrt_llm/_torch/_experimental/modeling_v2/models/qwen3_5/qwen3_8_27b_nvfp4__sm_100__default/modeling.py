@@ -557,10 +557,22 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
         self.draft_model = None
         self.spec_worker = None
         self.spec_decode_fast_paths = self.spec_config is not None
-        self.runtime_hooks = (
-            RuntimeHooks(loop_on_execution_stream=True) if self.spec_decode_fast_paths else None
-        )
+        self.runtime_hooks = None
         if self.spec_config is not None:
+            scheduled = self.spec_config.draft_len_schedule is not None
+            self.runtime_hooks = RuntimeHooks(
+                loop_on_execution_stream=True,
+                pack_step_inputs=scheduled,
+                pack_parallel_scatter=scheduled,
+                pack_in_graph=scheduled,
+                pack_early_copy=scheduled,
+                skip_unchanged_h2d=scheduled,
+                h2d_changed_span=scheduled,
+                kv_lens_update_once=scheduled,
+                skip_greedy_rng_upload=scheduled,
+                pack_spec_rng_uploads=scheduled,
+                spec_small_h2d=scheduled,
+            )
             text.num_nextn_predict_layers = 1
             if is_gdn_replay_enabled():
                 text._gdn_replay_history_dtype = torch.float32
@@ -575,7 +587,7 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
                 self.model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
                 # For a variable batch the draft layer selects the consumed rows.
-                spec_decode_fast_paths=self.spec_config.draft_len_schedule is None,
+                spec_decode_fast_paths=not scheduled,
             )
             self.spec_worker.set_draft_model(self.draft_model)
 

@@ -285,6 +285,10 @@ class GatedDeltaVerify(OpWrapper):
             spec={"batch": 8, "width": 2, "replay": True, "commit_width": 5, "masked": True},
         ),
         Cell(
+            why="Four-row verification reuses queries and gates across value tiles",
+            spec={"batch": 32, "width": 4, "replay": True, "commit_width": 5, "masked": True},
+        ),
+        Cell(
             why="Wide decode groups adjacent state tiles and preserves replay",
             spec={"batch": 128, "width": 2, "replay": True, "commit_width": 5},
         ),
@@ -378,7 +382,12 @@ class GatedDeltaVerify(OpWrapper):
                 launch_pdl=pdl,
             )
         elif qk is not None and one_step:
-            tiles = 4 if batch >= 64 and width == 2 else 1
+            if batch >= 64 and width == 2:
+                tiles = 4
+            elif batch == 32 and width == 4:
+                tiles = 2
+            else:
+                tiles = 1
             verify.verify_prepared_step[(32 // tiles, batch * 48)](
                 qk,
                 convolved,
