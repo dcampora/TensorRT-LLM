@@ -33,6 +33,7 @@ class QkvRope(OpWrapper):
         Cell(why="Prefill", spec={"rows": 128, "position": 0}),
         Cell(why="Direct paged store crosses a page boundary", spec={"width": 4}),
         Cell(why="Direct paged store combines FP8 partitions", spec={"width": 2, "parts": True}),
+        Cell(why="Padded FP8 partition stride", spec={"width": 2, "parts": True, "pad_rows": 7}),
     )
 
     def __call__(

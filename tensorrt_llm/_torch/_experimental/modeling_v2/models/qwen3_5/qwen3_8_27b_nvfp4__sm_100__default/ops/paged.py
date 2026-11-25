@@ -11,7 +11,7 @@ import torch
 import triton as tr
 
 from .....catalog._op import Arch, Cell, OpWrapper
-from ..kernels import paged_attention
+from ..kernels import paged_attention, prefill_attention
 from .attention import HEAD_SIZE, KV_HEADS, QUERY_HEADS
 
 _DECODE_SPLITS = 8
@@ -118,6 +118,7 @@ class CausalContextAttention(OpWrapper):
     CELLS = (
         Cell(why="Fresh packed contexts", spec={"lengths": (15, 89)}),
         Cell(why="Full context", spec={"lengths": (1024,)}),
+        Cell(why="TMA stages packed contexts at uneven offsets", spec={"lengths": (512, 513, 17)}),
     )
 
     def __call__(
@@ -129,6 +130,9 @@ class CausalContextAttention(OpWrapper):
         chunks: torch.Tensor,
     ) -> torch.Tensor:
         y = torch.empty_like(q)
+        if q.shape[0] >= 512:
+            prefill_attention.attention(q, k, v, y, starts, chunks)
+            return y
         paged_attention.causal_prefill[(chunks.shape[0], QUERY_HEADS)](
             q,
             k,

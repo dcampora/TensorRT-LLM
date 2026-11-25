@@ -54,6 +54,16 @@ def _pad(x: torch.Tensor, rows: int) -> torch.Tensor:
     return F.pad(x, (0, 0, 0, rows - x.shape[0])) if rows > x.shape[0] else x
 
 
+# The pinned cuBLASLt tiles preserve the anchor's K reduction order.
+_DECODE_PROJECTION_ROWS = (32, 48, 64, 96, 128, 160, 192, 224, 256, 384, 512)
+
+
+def _decode_projection_rows(rows: int) -> int:
+    if 20 <= rows <= _DECODE_PROJECTION_ROWS[-1]:
+        return next(size for size in _DECODE_PROJECTION_ROWS if size >= rows)
+    return rows
+
+
 def _device_ints(values: list, device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
 
@@ -214,10 +224,11 @@ class Layer(nn.Module):
     def project_qkv(self, x: torch.Tensor, step: Step) -> torch.Tensor:
         rows = x.shape[0]
         decode = step.context is None
-        if decode and not self.is_linear and (rows <= 8 or rows in (128, 256)):
+        x = _pad(x, step.projection_rows)
+        if decode and not self.is_linear and (rows <= 8 or step.projection_rows in (128, 256)):
             packed = fp8_quantize(x, self.qkv.input_scale, pdl=rows <= 8)
-            return fp8_qkv_partitions(packed, self.qkv.weight)
-        return self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
+            return fp8_qkv_partitions(packed, self.qkv.weight)[:, :rows]
+        return self.qkv(x, decode=decode)[:rows]
 
     def attention_projections(
         self, x: torch.Tensor, step: Step
@@ -253,7 +264,10 @@ class Layer(nn.Module):
 
     def project_attention(self, x: torch.Tensor, step: Step) -> torch.Tensor:
         if step.context is None:
-            return self.out.gemm(x, decode=True)
+            rows = x.shape[0]
+            if rows < step.projection_rows:
+                x = _pad(x.view(torch.uint8), step.projection_rows).view(x.dtype)
+            return self.out.gemm(x, decode=True)[:rows]
         return self.out(_pad(x, step.projection_rows))[: x.shape[0]]
 
     def input_rms_norm(
@@ -393,7 +407,7 @@ class Qwen38Decoder(DecoderModel):
                 (),
                 mamba.state_indices[contexts : md.num_seqs],
                 md.kv_cache_block_offsets[:, contexts : md.num_seqs],
-                decode_rows,
+                _decode_projection_rows(decode_rows),
                 self.row_counts[decode_rows : decode_rows + 1],
                 positions[ctx_rows:],
                 decode_rows // num_decodes,
@@ -510,8 +524,8 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
                 self.model_config,
                 self.model_config.mapping,
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
-                # The row-picking draft layer replaces the full-row epilogue.
-                spec_decode_fast_paths=False,
+                # For a variable batch the draft layer selects the consumed rows.
+                spec_decode_fast_paths=self.spec_config.draft_len_schedule is None,
             )
             self.spec_worker.set_draft_model(self.draft_model)
 

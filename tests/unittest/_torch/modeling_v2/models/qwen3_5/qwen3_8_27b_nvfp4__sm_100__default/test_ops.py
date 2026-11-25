@@ -334,7 +334,8 @@ def test_qkv_writes_paged_cache(cell) -> None:
     scales = None
     args = _random(256) / 4, _random(256) / 4, rope, positions, 1e-6
     if cell.spec.get("parts", False):
-        x = _random(2, rows, 14336).float()
+        padded_rows = cell.spec.get("pad_rows", rows)
+        x = _random(2, padded_rows, 14336).float()[:, :rows]
         scales = x.new_tensor(0.25), x.new_tensor(0.125)
     q, _, _, gate = prepare_qkv(
         x, *args, scales=scales, cache=cache, table=table, rows_per_seq=width

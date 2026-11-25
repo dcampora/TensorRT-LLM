@@ -668,3 +668,61 @@ increased throughput. Batch-1 decode decreased by about 1% in this trial.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 4234.40 | 883.80 | 6.242 |
 | 128 | 128 | 6541.41 | 2372.53 | 16.741 |
+
+### Standalone engine on the one-wave serving prompts, ISL 1024 and OSL 1024
+
+The standalone mirror received the exact token IDs from the one-wave
+OpenAI benchmark's chat prompts. The full-request rate includes prefill
+and is measured at the JSON-lines boundary. Decode throughput uses the
+paired 32- and 1024-output requests. The prompt hashes match both OpenAI
+cells in the table above. The standalone container used the same driver
+compatibility settings as the first comparison.
+
+| Static batch | Full-request output tokens/s | Decode tokens/s | TTFT (ms) | TPOT after 32 (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 4700.79 | 5294.74 | 792.58 | 6.044 |
+| 128 | 7373.04 | 8986.41 | 3185.91 | 14.244 |
+
+## Irregular decode projections and TMA prefill
+
+The target rounds irregular decode projection batches to a supported
+cuBLASLt row count. Recurrence and paged attention still see the live
+rows and the runtime's original request ordering. The pinned tiles use
+the original K partitions and reduction precision. The QKV rotary
+operation can read FP32 partitions with a padded row stride.
+
+Four rotating checkpoint layers matched on 18 decode row counts for
+all three FP8 projection geometries. At 254 live rows, padding to 256
+reduced GDN QKVZ from 158.08 to 28.17 microseconds, full-attention QKV
+from 230.70 to 46.90, and the attention output projection from 104.92
+to 28.24, including the padding. The target also applies its tuned
+NVFP4 down projection at the corresponding padded shapes.
+
+Fresh packed prefill uses the TMA attention from aegis-engines
+`prefill_attention.py` at 512 or more rows. The existing Triton
+attention still handles carried paged contexts. The raw TMA probe
+matched at every tested shape, including uneven packed contexts.
+It reduced 1024- and 4096-token attention from 107.83 and 1120.43
+microseconds to 88.72 and 915.04 per layer. The software pipeline
+and paged epilogue are candidates for a native `csrc/` build.
+
+The fixed-depth MTP engine keeps the runtime's fused first-pass
+metadata epilogue. The scheduled serving batches keep the selected
+first-draft rows. All 46 operation cells, 32 contract cases, and 384
+serving oracle checks passed. The 208 long-prompt serving responses
+again matched batch 1 token for token.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 15.10 | 2.311 | 432.62 |
+| 1024 | 1024 | 36.60 | 2.544 | 393.14 |
+| 4096 | 1024 | 121.77 | 2.782 | 359.45 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4267.57 | 832.39 | 6.259 |
+| 128 | 128 | 6618.51 | 2262.56 | 16.550 |
