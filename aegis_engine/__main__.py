@@ -6,6 +6,7 @@
 import json
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -17,7 +18,7 @@ def token_ids(values, vocab_size, *, allow_empty=False):
     return values
 
 
-def handle(llm, request, vocab_size, eos):
+def handle(generator, scorer, request, vocab_size, eos):
     import torch
 
     from tensorrt_llm import SamplingParams
@@ -42,6 +43,7 @@ def handle(llm, request, vocab_size, eos):
             include_stop_str_in_output=True,
             **common,
         )
+        llm = scorer if count == 1 else generator
         output = llm.generate(ids, params, use_tqdm=False)
         return {"ids": list(output.outputs[0].token_ids)}
 
@@ -63,7 +65,7 @@ def handle(llm, request, vocab_size, eos):
         result["logprobs"] = []
     if not rows:
         return result
-    output = llm.generate(
+    output = scorer.generate(
         ids, SamplingParams(max_tokens=1, return_context_logits=True, **common), use_tqdm=False
     )
     logits = output.context_logits[:rows, :vocab_size].float()
@@ -84,7 +86,7 @@ def main():
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
     from tensorrt_llm import LLM
-    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
     model = Path(sys.argv[1])
     config = json.loads((model / "config.json").read_text())
@@ -92,9 +94,10 @@ def main():
     eos = json.loads((model / "generation_config.json").read_text())["eos_token_id"]
     if isinstance(eos, int):
         eos = [eos]
-    llm = LLM(
-        str(model),
-        modeling_v2=os.environ.get("AEGIS_MODELING_V2", "require"),
+    mode = os.environ.get("AEGIS_MODELING_V2", "require")
+    drafts = int(os.environ.get("AEGIS_MTP_DRAFTS", "3" if mode == "require" else "0"))
+    options = dict(
+        modeling_v2=mode,
         disable_mm_encoder=True,
         skip_tokenizer_init=True,
         max_batch_size=1,
@@ -105,13 +108,26 @@ def main():
             enable_block_reuse=False,
             free_gpu_memory_fraction=0.25,
             mamba_ssm_cache_dtype="float32",
+            max_tokens=16384 if drafts else None,
         ),
     )
 
     def send(value):
         print(json.dumps(value, separators=(",", ":")), file=reply, flush=True)
 
-    try:
+    with ExitStack() as stack:
+        scorer = stack.enter_context(LLM(str(model), **options))
+        generator = scorer
+        if drafts:
+            # The speculative sampler rejects context-logit requests. Keep an
+            # ordinary decoder for teacher forcing and single-token responses.
+            generator = stack.enter_context(
+                LLM(
+                    str(model),
+                    speculative_config=MTPDecodingConfig(max_draft_len=drafts),
+                    **options,
+                )
+            )
         send({"ready": True})
         for line in sys.stdin:
             try:
@@ -119,11 +135,9 @@ def main():
                 if request["op"] == "shutdown":
                     send({"ok": True})
                     break
-                send(handle(llm, request, vocab_size, eos))
+                send(handle(generator, scorer, request, vocab_size, eos))
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                 send({"error": str(exc)})
-    finally:
-        llm.shutdown()
 
 
 if __name__ == "__main__":

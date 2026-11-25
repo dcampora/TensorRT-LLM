@@ -136,3 +136,32 @@ def load_decoder_weights(decoder, checkpoint):
         moe.router[:NUM_EXPERTS].copy_(checkpoint[f"{name}.gate.weight"])
         moe.router[NUM_EXPERTS].copy_(checkpoint[f"{name}.shared_expert_gate.weight"][0])
         moe.router[NUM_EXPERTS + 1 :].zero_()
+
+
+def load_draft_weights(draft, checkpoint):
+    prefix = "mtp.layers.0"
+    names = {
+        "embedding_norm": "mtp.pre_fc_norm_embedding.weight",
+        "hidden_norm": "mtp.pre_fc_norm_hidden.weight",
+        "fc": "mtp.fc.weight",
+        "norm": "mtp.norm.weight",
+        "before_attention": f"{prefix}.input_layernorm.weight",
+        "before_moe": f"{prefix}.post_attention_layernorm.weight",
+        "output": f"{prefix}.self_attn.o_proj.weight",
+        "qnorm": f"{prefix}.self_attn.q_norm.weight",
+        "knorm": f"{prefix}.self_attn.k_norm.weight",
+        "gate_up": f"{prefix}.mlp.experts.gate_up_proj",
+        "down": f"{prefix}.mlp.experts.down_proj",
+        "shared_down": f"{prefix}.mlp.shared_expert.down_proj.weight",
+    }
+    for dest, source in names.items():
+        getattr(draft, dest).copy_(checkpoint[source])
+    draft.qkv.copy_(torch.cat([checkpoint[f"{prefix}.self_attn.{p}_proj.weight"] for p in "qkv"]))
+    draft.router.copy_(
+        torch.cat([checkpoint[f"{prefix}.mlp.{p}.weight"] for p in ("gate", "shared_expert_gate")])
+    )
+    draft.shared_gate.copy_(
+        torch.cat(
+            [checkpoint[f"{prefix}.mlp.shared_expert.{p}_proj.weight"] for p in ("gate", "up")]
+        )
+    )

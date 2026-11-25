@@ -3,7 +3,8 @@
 
 """Select the text-only Qwen3.6 ModelOpt target."""
 
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+from tensorrt_llm.llmapi.llm_args import LoadFormat, MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
@@ -110,8 +111,26 @@ def route(model_config, llm_args, compute_capability):
         or llm_args.lm_head_output_dtype != "auto"
     ):
         raise NoTarget("the target requires the Hugging Face checkpoint and disables LoRA")
-    if llm_args.speculative_config is not None:
-        raise NoTarget("the target currently supports ordinary decoding")
+    spec = llm_args.speculative_config
+    if spec is not None:
+        if (
+            not isinstance(spec, MTPDecodingConfig)
+            or not spec.spec_dec_mode.is_mtp_eagle_one_model()
+            or spec.use_dynamic_tree
+            or spec.max_draft_len not in (1, 2, 3)
+            or spec.max_total_draft_tokens not in (None, spec.max_draft_len)
+            or spec.use_rejection_sampling
+            or spec.enable_penalty
+            or spec.use_relaxed_acceptance_for_thinking
+            or spec.sa_config is not None
+            or spec.speculative_model is not None
+            or spec.draft_lm_head_dtype != "auto"
+            or spec.draft_moe_dtype != "auto"
+            or llm_args.guided_decoding_backend is not None
+            or not is_gdn_replay_enabled()
+        ):
+            raise NoTarget("the target supports linear one-model MTP-Eagle with GDN replay")
+
     from .qwen3_6_35b_a3b_nvfp4__sm_100__default.modeling import ModelingV2Qwen36Nvfp4Sm100Default
 
     return ModelingV2Qwen36Nvfp4Sm100Default

@@ -76,14 +76,19 @@ prepare_qkv = PrepareQkv()
 class GatedAttention(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
-        Cell("packed continuations with context and generation together", {"context": True}),
-        Cell("split-KV decode across nonconsecutive cache pages", {"context": False}),
+        Cell(
+            "packed continuations with context and generation together",
+            {"context": True, "width": 1},
+        ),
+        Cell("split-KV decode across nonconsecutive cache pages", {"context": False, "width": 1}),
+        Cell("multi-token verification grouped by request", {"context": False, "width": 3}),
     )
 
     def __call__(self, q, gate, kv, table, step, output_scale):
         ctx = step.context_tokens
         m = q.shape[0]
-        attention = torch.empty((m, 4096), dtype=FP8, device=q.device)
+        quantized = output_scale is not None
+        attention = torch.empty((m, 4096), dtype=FP8 if quantized else BF16, device=q.device)
         strides = (table.stride(0), table.stride(1), kv.shape[-2], kv.stride(1))
         if ctx:
             y = torch.empty((ctx, 4096), dtype=BF16, device=q.device)
@@ -115,7 +120,7 @@ class GatedAttention(OpWrapper):
                 y.numel(),
                 1024,
                 output_scale,
-                True,
+                quantized,
             )
         if m > ctx:
             q, gate = q[ctx:], gate[ctx:]
@@ -125,7 +130,9 @@ class GatedAttention(OpWrapper):
             splits = triton.cdiv(step.capacity, split)
             part = torch.empty((rows, 16, splits, 256), dtype=torch.float32, device=q.device)
             stats = torch.empty((rows, 16, splits, 2), dtype=torch.float32, device=q.device)
-            k.attention[(splits, 2, rows)](
+            width = step.width
+            query_tile = max(16, triton.next_power_of_2(width * 8))
+            k.attention[(splits, 2, rows // width)](
                 q,
                 kv,
                 part,
@@ -136,11 +143,12 @@ class GatedAttention(OpWrapper):
                 table,
                 *strides,
                 False,
-                16,
+                query_tile,
                 128,
                 split,
                 splits,
                 448.0,
+                width,
                 num_warps=8,
                 num_stages=2,
             )
@@ -154,6 +162,7 @@ class GatedAttention(OpWrapper):
                 triton.next_power_of_2(splits),
                 gate,
                 output_scale,
+                quantized,
                 True,
             )
         return attention
@@ -183,7 +192,10 @@ class GatedAttention(OpWrapper):
                 probability = torch.bmm(query[:, None], key.transpose(-1, -2)) * (256**-0.5)
                 rows.append(torch.bmm(probability.softmax(-1), val).reshape(-1))
         y = torch.stack(rows).to(BF16).float() * gate.float().sigmoid()
-        return (y.to(BF16).float() / output_scale).clamp(-448, 448).to(FP8)
+        y = y.to(BF16)
+        if output_scale is not None:
+            y = (y.float() / output_scale).clamp(-448, 448).to(FP8)
+        return y
 
 
 gated_attention = GatedAttention()

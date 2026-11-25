@@ -205,8 +205,13 @@ def test_gated_attention(cell, certifying):
     table = (2 * torch.randperm(32, device=DEV, dtype=torch.int32)).reshape(2, -1)
     table = torch.stack((table, table + 1), dim=1)
     ctx = 3 if cell.spec["context"] else 0
-    positions = [40, 41, 42, 303] if ctx else [165, 303]
-    requests = [0, 0, 0, 1] if ctx else [0, 1]
+    width = cell.spec["width"]
+    if ctx:
+        positions = [40, 41, 42, 303]
+        requests = [0, 0, 0, 1]
+    else:
+        positions = list(range(166 - width, 166)) + list(range(304 - width, 304))
+        requests = [0] * width + [1] * width
     q = fixture_rand((len(positions), 16, 256), FP8)
     gate = fixture_rand((len(positions), 4096))
     step = SimpleNamespace(
@@ -217,6 +222,7 @@ def test_gated_attention(cell, certifying):
         max_context=ctx,
         cu=torch.tensor([0, ctx], device=DEV) if ctx else None,
         capacity=512,
+        width=width,
     )
     scale = torch.tensor(0.01, device=DEV)
     args = (q, gate, storage, table, step, scale)

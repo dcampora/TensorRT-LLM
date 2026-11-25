@@ -4337,9 +4337,14 @@ def _create_kv_cache_manager(
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):
             from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-            mamba_manager_extra_kwargs["gdn_fused_verify"] = any(
-                module.fused_verify for module in model_engine.model.modules()
-                if isinstance(module, Qwen3NextGatedDeltaNet))
+
+            # A model-owned verifier can publish the previous accepted history
+            # as part of its recurrent operation.
+            mamba_manager_extra_kwargs["gdn_fused_verify"] = getattr(
+                model_engine.model, "gdn_fused_verify", False) or any(
+                    module.fused_verify
+                    for module in model_engine.model.modules()
+                    if isinstance(module, Qwen3NextGatedDeltaNet))
         if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
                                                MambaHybridCacheManagerV2):
             mamba_manager_extra_kwargs.update(

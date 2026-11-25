@@ -95,6 +95,7 @@ def attention(
     SPLIT: tl.constexpr,
     NS: tl.constexpr,
     PROB_SCALE: tl.constexpr,
+    WIDTH: tl.constexpr = 1,
 ):
     block, h, request = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     qrow = tl.arange(0, BQ)
@@ -113,18 +114,24 @@ def attention(
         start = 0
         active = qfirst < length
     else:
-        seq = tl.load(Rows + request)
-        length = tl.load(Pos + request) + 1
+        first = request * WIDTH
+        seq = tl.load(Rows + first)
+        length = tl.load(Pos + first + WIDTH - 1) + 1
         start = block * SPLIT
         last = tl.minimum(start + SPLIT, length)
-        qpos = tl.full((BQ,), length - 1, tl.int32)
-        qidx = request * 16 + h * 8 + (qrow % 8)
+        if WIDTH == 1:
+            qpos = tl.full((BQ,), length - 1, tl.int32)
+            qidx = request * 16 + h * 8 + (qrow % 8)
+        else:
+            token = qrow // 8
+            qpos = tl.load(Pos + first + token, token < WIDTH, 0)
+            qidx = (first + token) * 16 + h * 8 + (qrow % 8)
         active = start < length
     if active:
         if PREFILL:
             valid = qoffset < length
         else:
-            valid = qrow < 8
+            valid = qrow < WIDTH * 8
         q = tl.load(Q + qidx[:, None] * 256 + d[None, :], valid[:, None], 0.0)
         m = tl.full((BQ,), -float("inf"), tl.float32)
         normalizer = tl.full((BQ,), 0.0, tl.float32)
