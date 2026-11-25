@@ -9,6 +9,9 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.kernels.packed_scales import (  # noqa: E501
     pack_weight,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.activation import (  # noqa: E501
+    swiglu_quantize,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.gates import (  # noqa: E501
     fixed_gate_projection,
 )
@@ -112,7 +115,11 @@ def test_accelerated_matmul(cell, certifying):
     sw = torch.exp2(
         torch.randint(-6, -1, (n // 128, k // 128), device="cuda", generator=generator).float()
     )
-    a, sa = block_quantize(x)
+    if cell.spec.get("packed"):
+        gate_up = torch.randn(rows, 2 * k, device="cuda", generator=generator).bfloat16()
+        a, sa = swiglu_quantize(gate_up, packed_scales=True)
+    else:
+        a, sa = block_quantize(x)
     args = (a, sa, w, sw, pack_weight(sw, n, k), rows, small)
     certifying(accelerated_block_matmul)
     # A different FP32 reduction can cross one BF16 rounding boundary.

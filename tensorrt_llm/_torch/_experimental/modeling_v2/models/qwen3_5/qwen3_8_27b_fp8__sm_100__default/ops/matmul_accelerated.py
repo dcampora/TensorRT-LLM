@@ -28,6 +28,10 @@ class AcceleratedBlockMatmul(OpWrapper):
             dict(rows=256, n=5120, k=17408, small=False),
         ),
         Cell("DeepGEMM short GB200 context tile", dict(rows=144, n=14336, k=5120, small=False)),
+        Cell(
+            "DeepGEMM consumes packed SwiGLU exponents with a partial row group",
+            dict(rows=129, n=5120, k=17408, small=False, packed=True),
+        ),
     )
 
     def __call__(
@@ -46,7 +50,11 @@ class AcceleratedBlockMatmul(OpWrapper):
             return torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(
                 a, scales, weight, packed_weight_scales
             )
-        scales = pack_activation_deepgemm(activation_scales, rows)
+        scales = (
+            activation_scales.T[:rows]
+            if activation_scales.dtype == torch.int32
+            else pack_activation_deepgemm(activation_scales, rows)
+        )
         out = torch.empty((rows, weight.shape[0]), dtype=torch.bfloat16, device=weight.device)
         deep_gemm.fp8_gemm_nt(
             (a, scales), (weight, packed_weight_scales), out, disable_ue8m0_cast=True
@@ -63,6 +71,11 @@ class AcceleratedBlockMatmul(OpWrapper):
         rows: int,
         small: bool,
     ) -> torch.Tensor:
+        if activation_scales.dtype == torch.int32:
+            groups = activations.shape[-1] // 128
+            packed = activation_scales.view(torch.uint8).view(groups // 4, -1, 4)
+            exponents = packed.transpose(1, 2).reshape(groups, -1).to(torch.int32)
+            activation_scales = (exponents << 23).view(torch.float32)
         lhs = activations[:rows].float() * activation_scales.T[:rows].repeat_interleave(128, dim=-1)
         rhs = weight.float() * weight_scales.float().repeat_interleave(
             128, dim=0

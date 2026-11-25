@@ -21,9 +21,23 @@ __device__ __forceinline__ float rsqrt_reference(float value)
     return out;
 }
 
+__device__ __forceinline__ void write_scale(
+    void* output, int group, int row, int padded_rows, unsigned int exponent, bool packed)
+{
+    if (packed)
+    {
+        auto* bytes = static_cast<unsigned char*>(output);
+        bytes[((group / 4) * padded_rows + row) * 4 + group % 4] = static_cast<unsigned char>(exponent);
+    }
+    else
+    {
+        static_cast<float*>(output)[group * padded_rows + row] = __uint_as_float(exponent << 23);
+    }
+}
+
 template <bool StoreNormalized, bool Programmatic>
-__global__ void fused_norm(
-    Bf16* x, Bf16* residual, Bf16 const* weight, unsigned char* quantized, float* scales, int rows, int padded_rows)
+__global__ void fused_norm(Bf16* x, Bf16* residual, Bf16 const* weight, unsigned char* quantized, void* scales,
+    int rows, int padded_rows, bool packed)
 {
     constexpr int H = 5120;
     constexpr int RowThreads = 64;
@@ -50,7 +64,7 @@ __global__ void fused_norm(
             *out = make_uint2(0, 0);
             if (col % 128 == 0)
             {
-                scales[(col / 128 + i * (VecStride / 128)) * padded_rows + row] = 0x1p-42f;
+                write_scale(scales, col / 128 + i * (VecStride / 128), row, padded_rows, 85, packed);
             }
         }
         return;
@@ -151,7 +165,7 @@ __global__ void fused_norm(
         float const reciprocal = __uint_as_float((254u - exponent) << 23);
         if (col % 128 == 0)
         {
-            scales[group * padded_rows + row] = __uint_as_float(exponent << 23);
+            write_scale(scales, group, row, padded_rows, exponent, packed);
         }
         float const* a = values[i];
         const __nv_fp8x4_e4m3 low(
@@ -163,8 +177,8 @@ __global__ void fused_norm(
 }
 
 template <bool StoreNormalized>
-int launch(Bf16* x, Bf16* residual, Bf16 const* weight, unsigned char* output, float* scale, int rows, int padded,
-    bool programmatic, cudaStream_t stream)
+int launch(Bf16* x, Bf16* residual, Bf16 const* weight, unsigned char* output, void* scale, int rows, int padded,
+    bool programmatic, bool packed, cudaStream_t stream)
 {
     if (programmatic)
     {
@@ -173,9 +187,10 @@ int launch(Bf16* x, Bf16* residual, Bf16 const* weight, unsigned char* output, f
         attribute.val.programmaticStreamSerializationAllowed = 1;
         cudaLaunchConfig_t config{dim3(padded), dim3(64), 0, stream, &attribute, 1};
         return static_cast<int>(cudaLaunchKernelEx(
-            &config, fused_norm<StoreNormalized, true>, x, residual, weight, output, scale, rows, padded));
+            &config, fused_norm<StoreNormalized, true>, x, residual, weight, output, scale, rows, padded, packed));
     }
-    fused_norm<StoreNormalized, false><<<padded, 64, 0, stream>>>(x, residual, weight, output, scale, rows, padded);
+    fused_norm<StoreNormalized, false>
+        <<<padded, 64, 0, stream>>>(x, residual, weight, output, scale, rows, padded, packed);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -244,8 +259,8 @@ __global__ void draft_dual_norm_kernel(Id const* ids, Bf16 const* table, Bf16 co
 
 } // namespace
 
-extern "C" int norm_quant(void* x, void* residual, void const* weight, void* a, float* scale, int m, int padded,
-    bool store_normalized, bool programmatic, cudaStream_t stream)
+extern "C" int norm_quant(void* x, void* residual, void const* weight, void* a, void* scale, int m, int padded,
+    bool store_normalized, bool programmatic, bool packed, cudaStream_t stream)
 {
     auto* activations = static_cast<Bf16*>(x);
     auto* shortcut = static_cast<Bf16*>(residual);
@@ -253,9 +268,9 @@ extern "C" int norm_quant(void* x, void* residual, void const* weight, void* a, 
     auto* out = static_cast<unsigned char*>(a);
     if (store_normalized)
     {
-        return launch<true>(activations, shortcut, w, out, scale, m, padded, programmatic, stream);
+        return launch<true>(activations, shortcut, w, out, scale, m, padded, programmatic, packed, stream);
     }
-    return launch<false>(activations, shortcut, w, out, scale, m, padded, programmatic, stream);
+    return launch<false>(activations, shortcut, w, out, scale, m, padded, programmatic, packed, stream);
 }
 
 extern "C" int draft_dual_norm(void const* ids, void const* table, void const* hidden, void const* token_weight,

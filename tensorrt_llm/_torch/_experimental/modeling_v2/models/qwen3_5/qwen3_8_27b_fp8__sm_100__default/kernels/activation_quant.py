@@ -10,15 +10,18 @@ from triton.experimental.gluon import language as gl
 from triton.language.extra.cuda import libdevice
 
 
-def buffers(x, rows, width):
+def buffers(x, rows, width, packed_scales=False):
     padded = tr.cdiv(rows, 4) * 4
     activations = torch.empty((padded, width), device=x.device, dtype=torch.float8_e4m3fn)
-    scales = torch.empty((width // 128, padded), device=x.device, dtype=torch.float32)
+    if packed_scales:
+        scales = torch.empty((width // 512, padded), device=x.device, dtype=torch.int32)
+    else:
+        scales = torch.empty((width // 128, padded), device=x.device, dtype=torch.float32)
     return activations, scales
 
 
 @tr.jit(do_not_specialize=["M", "PADDED"])
-def _swiglu(G, A, S, M, PADDED, K: tl.constexpr, ROWS: tl.constexpr):
+def _swiglu(G, A, S, M, PADDED, K: tl.constexpr, ROWS: tl.constexpr, PACKED: tl.constexpr):
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     group = tl.program_id(1)
     k = group * 128 + tl.arange(0, 128)
@@ -34,30 +37,47 @@ def _swiglu(G, A, S, M, PADDED, K: tl.constexpr, ROWS: tl.constexpr):
     scale = (exponent << 23).to(tl.float32, bitcast=True)
     quantized = tl.clamp(y * inv[:, None], -448.0, 448.0)
     tl.store(A + row[:, None] * K + k[None, :], quantized, row[:, None] < PADDED)
-    tl.store(S + group * PADDED + row, scale, row < PADDED)
+    if PACKED:
+        offset = (group // 4 * PADDED + row) * 4 + group % 4
+        tl.store(S + offset, exponent.to(tl.uint8), row < PADDED)
+    else:
+        tl.store(S + group * PADDED + row, scale, row < PADDED)
 
 
-def swiglu_quantize(x):
+def swiglu_quantize(x, packed_scales=False):
     m, width = x.shape
     k = width // 2
-    a, s = buffers(x, m, k)
+    a, s = buffers(x, m, k, packed_scales)
     padded = a.shape[0]
     tile_rows = 16 if m >= 1024 else 4
     _swiglu[(tr.cdiv(padded, tile_rows), k // 128)](
         x,
         a,
-        s,
+        s.view(torch.uint8) if packed_scales else s,
         m,
         padded,
         k,
         tile_rows,
+        packed_scales,
         num_warps=4,
     )
     return a, s
 
 
 @gluon.jit(do_not_specialize=["M", "PADDED"])
-def _gdn_norm(X, QKVZ, W, A, S, M, PADDED, XS: gl.constexpr, H: gl.constexpr, PAD: gl.constexpr):
+def _gdn_norm(
+    X,
+    QKVZ,
+    W,
+    A,
+    S,
+    M,
+    PADDED,
+    XS: gl.constexpr,
+    H: gl.constexpr,
+    PAD: gl.constexpr,
+    PACKED: gl.constexpr,
+):
     block = gl.program_id(0)
     row, head = block // H, block % H
     # This mapping gives RMSNorm the same FP32 reduction order as the standalone kernel.
@@ -74,16 +94,25 @@ def _gdn_norm(X, QKVZ, W, A, S, M, PADDED, XS: gl.constexpr, H: gl.constexpr, PA
     inv = ((254 - exponent) << 23).to(gl.float32, bitcast=True)
     quantized = gl.clamp(y * inv, -448.0, 448.0)
     gl.store(A + block * 128 + c, quantized)
-    gl.store(S + head * PADDED + row, scale)
+    if PACKED:
+        scale_base = S + (head // 4 * PADDED + row) * 4 + head % 4
+        gl.store(scale_base, exponent.to(gl.uint8))
+    else:
+        gl.store(S + head * PADDED + row, scale)
     if PAD:
         if row == M - 1:
             for j in gl.static_range(1, PAD + 1):
                 gl.store(A + (block + H * j) * 128 + c, 0.0)
-                gl.store(S + head * PADDED + row + j, 2.2737367544323206e-13)
+                if PACKED:
+                    gl.store(scale_base + 4 * j, 85)
+                else:
+                    gl.store(S + head * PADDED + row + j, 2.2737367544323206e-13)
 
 
 @gluon.jit(do_not_specialize=["M", "PADDED"])
-def _gdn_norm_heads(X, P, W, A, S, M, PADDED, XS: gl.constexpr, HEADS: gl.constexpr):
+def _gdn_norm_heads(
+    X, P, W, A, S, M, PADDED, XS: gl.constexpr, HEADS: gl.constexpr, PACKED: gl.constexpr
+):
     # Four warps handle four independent heads. Within each warp, reduce the
     # four consecutive channel groups separately before summing them.
     layout: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 1, 32], [4, 1, 1], [2, 0, 1])
@@ -111,12 +140,17 @@ def _gdn_norm_heads(X, P, W, A, S, M, PADDED, XS: gl.constexpr, HEADS: gl.conste
     inverse = ((254 - exponent) << 23).to(gl.float32, bitcast=True)
     quantized = gl.clamp(y * inverse[:, None, None], -448.0, 448.0)
     gl.store(A + offset, gl.where(valid, quantized, 0.0))
-    gl.store(S + head * PADDED + row, scale)
+    if PACKED:
+        scale_base = S + (head // 4 * PADDED + row) * 4 + head % 4
+        gl.store(scale_base, exponent.to(gl.uint8))
+    else:
+        gl.store(S + head * PADDED + row, scale)
 
 
-def gdn_norm_quantize(x, p, weight):
+def gdn_norm_quantize(x, p, weight, packed_scales=False):
     m, heads, width = x.shape
-    a, s = buffers(x, m, heads * width)
+    a, s = buffers(x, m, heads * width, packed_scales)
+    output_scales = s.view(torch.uint8) if packed_scales else s
     padded = a.shape[0]
     if m >= 32:
         _gdn_norm_heads[(padded * heads // 4,)](
@@ -124,11 +158,12 @@ def gdn_norm_quantize(x, p, weight):
             p,
             weight,
             a,
-            s,
+            output_scales,
             m,
             padded,
             p.shape[1],
             heads,
+            packed_scales,
             num_warps=4,
         )
     else:
@@ -137,12 +172,13 @@ def gdn_norm_quantize(x, p, weight):
             p,
             weight,
             a,
-            s,
+            output_scales,
             m,
             padded,
             p.shape[1],
             heads,
             padded - m,
+            packed_scales,
             num_warps=4,
         )
     return a, s
@@ -162,6 +198,7 @@ def _prefill_attention_quant(
     ROWS: tl.constexpr,
     SELECT: tl.constexpr,
     SELECT_QUERY: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     group = tl.program_id(1)
@@ -184,16 +221,26 @@ def _prefill_attention_quant(
     scale = (exponent << 23).to(tl.float32, bitcast=True)
     inv = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
     tl.store(A + layout, tl.clamp(y * inv[:, None], -448.0, 448.0), row[:, None] < PADDED)
-    tl.store(S + group * PADDED + row, scale, row < PADDED)
+    if PACKED:
+        offset = (group // 4 * PADDED + row) * 4 + group % 4
+        tl.store(S + offset, exponent.to(tl.uint8), row < PADDED)
+    else:
+        tl.store(S + group * PADDED + row, scale, row < PADDED)
 
 
 def prefill_attention_quantize(
-    attention, projection, round_gate, tile_rows=None, tail=None, query_tail=None
+    attention,
+    projection,
+    round_gate,
+    tile_rows=None,
+    tail=None,
+    query_tail=None,
+    packed_scales=False,
 ):
     m = attention.shape[0] if tail is None else tail.numel()
     if tile_rows is None:
         tile_rows = 16 if m >= 1024 else 8
-    activations, scales = buffers(attention, m, 6144)
+    activations, scales = buffers(attention, m, 6144, packed_scales)
     padded = activations.shape[0]
     _prefill_attention_quant[(tr.cdiv(padded, tile_rows), 48)](
         attention,
@@ -201,13 +248,14 @@ def prefill_attention_quantize(
         tail,
         query_tail,
         activations,
-        scales,
+        scales.view(torch.uint8) if packed_scales else scales,
         m,
         padded,
         round_gate,
         tile_rows,
         tail is not None,
         query_tail is not None,
+        packed_scales,
         num_warps=4,
     )
     return activations, scales

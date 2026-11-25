@@ -37,7 +37,8 @@ def test_swiglu_quantize(cell, certifying):
     torch.manual_seed(73)
     x = _rand(cell.spec["rows"], 34816)
     certifying(swiglu_quantize)
-    _assert_quantized(swiglu_quantize(x), swiglu_quantize.reference(x))
+    packed = cell.spec.get("packed", False)
+    _assert_quantized(swiglu_quantize(x, packed), swiglu_quantize.reference(x, packed))
 
 
 @pytest.mark.parametrize("cell", gdn_norm_quantize.CELLS, ids=lambda cell: cell.why)
@@ -47,7 +48,8 @@ def test_gdn_norm_quantize(cell, certifying):
     rows = cell.spec["rows"]
     args = (_rand(rows, 48, 128), _rand(rows, 16384), _rand(128))
     certifying(gdn_norm_quantize)
-    _assert_quantized(gdn_norm_quantize(*args), gdn_norm_quantize.reference(*args))
+    packed = cell.spec.get("packed", False)
+    _assert_quantized(gdn_norm_quantize(*args, packed), gdn_norm_quantize.reference(*args, packed))
 
 
 @pytest.mark.parametrize("cell", attention_gate_quantize.CELLS, ids=lambda cell: cell.why)
@@ -57,7 +59,10 @@ def test_attention_gate_quantize(cell, certifying):
     rows = cell.spec["rows"]
     args = (_rand(rows, 6144), _rand(rows, 14336))
     certifying(attention_gate_quantize)
-    _assert_quantized(attention_gate_quantize(*args), attention_gate_quantize.reference(*args))
+    packed = cell.spec.get("packed", False)
+    _assert_quantized(
+        attention_gate_quantize(*args, packed), attention_gate_quantize.reference(*args, packed)
+    )
 
 
 @pytest.mark.parametrize("cell", residual_norm_quantize.CELLS, ids=lambda cell: cell.why)
@@ -69,9 +74,12 @@ def test_residual_norm_quantize(cell, certifying):
     x_ref, residual_ref = x.clone(), residual.clone()
     certifying(residual_norm_quantize)
     programmatic = rows <= 8
+    packed = cell.spec.get("packed", False)
     _assert_quantized(
-        residual_norm_quantize(x, residual, weight, normalized, programmatic),
-        residual_norm_quantize.reference(x_ref, residual_ref, weight, normalized, programmatic),
+        residual_norm_quantize(x, residual, weight, normalized, programmatic, packed),
+        residual_norm_quantize.reference(
+            x_ref, residual_ref, weight, normalized, programmatic, packed
+        ),
     )
     torch.testing.assert_close(residual, residual_ref, atol=0, rtol=0)
     assert_within_ulp(x, x_ref, 1.0, 0.25)

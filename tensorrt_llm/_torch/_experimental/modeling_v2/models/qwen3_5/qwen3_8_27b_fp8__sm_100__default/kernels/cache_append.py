@@ -13,6 +13,7 @@ def _append(
     TABLE,
     OFFSETS,
     SEQ,
+    POSITIONS,
     PAGES,
     PAGE_STRIDE: tl.constexpr,
     KV_STRIDE: tl.constexpr,
@@ -22,7 +23,10 @@ def _append(
     DIVISOR: tl.constexpr,
 ):
     row, head, kv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if SEQ is None:
+    if POSITIONS is not None:
+        sequence = 0
+        position = tl.load(POSITIONS + row)
+    elif SEQ is None:
         sequence = 0
         position = row
     else:
@@ -42,8 +46,9 @@ def append_kv(
     pages: torch.Tensor,
     table: torch.Tensor,
     divisor: int,
-    offsets: torch.Tensor,
+    offsets: torch.Tensor | None,
     seq_ids: torch.Tensor | None,
+    positions: torch.Tensor | None = None,
 ) -> None:
     """Write only the K and V tokens from each new packed QKV row."""
     _append[(qkv.shape[0], 4, 2)](
@@ -51,6 +56,7 @@ def append_kv(
         table,
         offsets,
         seq_ids,
+        positions,
         pages,
         pages.stride(0),
         pages.stride(1),

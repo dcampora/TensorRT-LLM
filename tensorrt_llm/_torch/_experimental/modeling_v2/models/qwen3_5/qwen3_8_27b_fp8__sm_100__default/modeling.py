@@ -35,6 +35,7 @@ from .ops.attention import (
     prepare_qkv,
     short_causal_attention,
     short_paged_attention,
+    single_sequence_paged_gqa,
 )
 from .ops.gates import fixed_gate_projection
 from .ops.matmul_accelerated import accelerated_block_matmul
@@ -64,6 +65,8 @@ if TYPE_CHECKING:
 
 SHORT_HISTORY = 256
 MAX_VERIFY_WIDTH = 8
+# The split reduction keeps its whole block of partial values in one CTA.
+MAX_SINGLE_SEQUENCE_PAGED_HISTORY = 16384
 
 
 def has_short_generation(md: "TrtllmAttentionMetadata") -> bool:
@@ -90,6 +93,14 @@ class BlockProjection(nn.Module):
             "workspace",
         ):
             self.register_buffer(name, None)
+
+    def use_packed_exponents(self, rows: int, decode: bool, accelerate: bool) -> bool:
+        """Match the activation scale layout to the projection's hardware path."""
+        keep_float_scales = decode and (
+            (rows <= 8 and self.wide_weight is not None)
+            or (rows <= 32 and self.weight.shape[0] == 5120)
+        )
+        return accelerate and not keep_float_scales
 
     def forward(self, x: torch.Tensor, decode: bool, accelerate: bool = False) -> torch.Tensor:
         return self.quantized(*block_quantize(x), x.shape[0], decode, accelerate)
@@ -528,11 +539,19 @@ class DecoderLayer(nn.Module):
         if fused:
             rows = hidden.shape[0]
             normalized = residual_norm_quantize(
-                hidden, residual, self.post_norm, False, decode and rows <= 8
+                hidden,
+                residual,
+                self.post_norm,
+                False,
+                decode and rows <= 8,
+                self.gate_up.use_packed_exponents(rows, decode, accelerate),
             )
             gate_up = self.gate_up.quantized(*normalized, rows, decode, accelerate)
             return self.down.quantized(
-                *swiglu_quantize(gate_up), rows, decode, accelerate
+                *swiglu_quantize(gate_up, self.down.use_packed_exponents(rows, decode, accelerate)),
+                rows,
+                decode,
+                accelerate,
             ), residual
         hidden, residual = residual_norm(hidden, residual, self.post_norm)
         return self.down(silu_and_mul(self.gate_up(hidden, decode)), decode), residual
@@ -551,7 +570,12 @@ class DecoderLayer(nn.Module):
         normalized = None
         if fused and residual is not None:
             normalized = residual_norm_quantize(
-                x, residual, self.pre_norm, self.is_linear, decode and rows <= 8
+                x,
+                residual,
+                self.pre_norm,
+                self.is_linear,
+                decode and rows <= 8,
+                self.input_proj.use_packed_exponents(rows, decode, accelerate),
             )
         else:
             x, residual = residual_norm(x, residual, self.pre_norm)
@@ -569,16 +593,32 @@ class DecoderLayer(nn.Module):
         )
         if gate_stream is not None:
             torch.cuda.current_stream(x.device).wait_stream(gate_stream)
+        use_packed_output = self.output_proj.use_packed_exponents(rows, decode, accelerate)
         if self.is_linear:
             hidden = self._linear_attention(x, projection, step, ba)
             if fused:
-                activation = gdn_norm_quantize(hidden, projection, self.gdn_norm)
+                activation = gdn_norm_quantize(hidden, projection, self.gdn_norm, use_packed_output)
             else:
                 hidden = gated_head_norm(hidden, projection, self.gdn_norm)
+        elif (
+            decode
+            and not step.short_generation
+            and step.generation_slots.numel() == 1
+            and step.metadata.tokens_per_block % 32 == 0
+            and step.metadata.kv_cache_block_offsets.shape[-1] * step.metadata.tokens_per_block
+            <= MAX_SINGLE_SEQUENCE_PAGED_HISTORY
+        ):
+            qkv = prepare_qkv(
+                projection, self.q_norm, self.k_norm, rope, step.positions, tiled=False
+            )
+            pages, table, divisor = paged_kv_view(step.metadata, self.index)
+            activation = single_sequence_paged_gqa(
+                qkv, pages, table, step.positions, projection, divisor
+            )
         else:
             hidden = self._full_attention(projection, rope, step)
             if fused:
-                activation = attention_gate_quantize(hidden, projection)
+                activation = attention_gate_quantize(hidden, projection, use_packed_output)
         hidden = (
             self.output_proj.quantized(*activation, rows, decode, accelerate)
             if fused

@@ -13,6 +13,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp
     prepare_qkv,
     short_causal_attention,
     short_paged_attention,
+    single_sequence_paged_gqa,
 )
 
 __extra_import_path__ = ["../../.."]
@@ -136,3 +137,28 @@ def test_append_short_context_kv(cell, certifying):
     append_short_context_kv(packed, pages, table, stride, offsets, ids)
     append_short_context_kv.reference(packed, expected, table, stride, offsets, ids)
     torch.testing.assert_close(pages, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("cell", single_sequence_paged_gqa.CELLS, ids=lambda cell: cell.why)
+def test_single_sequence_paged_gqa(cell, certifying):
+    """Write every verifier row through its page table and apply the query gate."""
+    torch.manual_seed(83)
+    rows, length = cell.spec["rows"], cell.spec["length"]
+    count = (length + rows + 63) // 32
+    table = (torch.randperm(count, device="cuda", dtype=torch.int32) * 2).view(1, count)
+    pages = _rand(count * 2, 2, 4, 32, 256)[::2]
+    reference_pages = pages.clone()
+    qkv, projection = _rand(rows, 8192), _rand(rows, 14336)
+    positions = torch.arange(length, length + rows, device="cuda", dtype=torch.int32)
+    certifying(single_sequence_paged_gqa)
+    values, scale = single_sequence_paged_gqa(qkv, pages, table, positions, projection, 2)
+    expected_values, expected_scale = single_sequence_paged_gqa.reference(
+        qkv, reference_pages, table, positions, projection, 2
+    )
+    torch.testing.assert_close(pages, reference_pages, atol=0, rtol=0)
+    actual = values[:rows].float() * scale.T[:rows].repeat_interleave(128, dim=1)
+    expected = expected_values[:rows].float() * expected_scale.T[:rows].repeat_interleave(
+        128, dim=1
+    )
+    # Native BF16 values in the softmax blocks can cross one E4M3 rounding boundary.
+    assert_within_ulp(actual, expected, 1.0, 0.10, ulp=2.0**-3)

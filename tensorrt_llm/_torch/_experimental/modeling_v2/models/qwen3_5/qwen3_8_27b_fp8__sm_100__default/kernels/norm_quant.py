@@ -30,6 +30,7 @@ def _norm() -> ctypes._CFuncPtr:
         ctypes.c_int,
         ctypes.c_bool,
         ctypes.c_bool,
+        ctypes.c_bool,
         ptr,
     ]
     function.restype = ctypes.c_int
@@ -42,10 +43,11 @@ def residual_norm_quantize(
     weight: torch.Tensor,
     store_normalized: bool,
     programmatic: bool = False,
+    packed_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Add the BF16 residual and produce FP8 activation groups in one kernel."""
     rows, cols = x.shape
-    a, scales = buffers(x, rows, cols)
+    a, scales = buffers(x, rows, cols, packed_scales)
     stream = torch.cuda.current_stream(x.device).cuda_stream
     status = _norm()(
         x.data_ptr(),
@@ -57,6 +59,7 @@ def residual_norm_quantize(
         a.shape[0],
         store_normalized,
         programmatic,
+        packed_scales,
         stream,
     )
     if status:

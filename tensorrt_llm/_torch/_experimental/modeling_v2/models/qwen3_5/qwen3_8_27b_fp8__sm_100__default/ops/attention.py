@@ -7,7 +7,9 @@ import torch
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import attention
 from ..kernels.cache_append import append_kv
+from ..kernels.long_paged import decode_paged
 from ..kernels.short_paged import short_paged
+from .projection import reference_block_quantize
 
 
 class PrepareQkv(OpWrapper):
@@ -229,3 +231,59 @@ class AppendShortContextKV(OpWrapper):
 
 
 append_short_context_kv = AppendShortContextKV()
+
+
+class SingleSequencePagedGqa(OpWrapper):
+    """Append BF16 K/V and fuse the stable split-softmax with gating and FP8 quantization."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("Four verifier tokens with a partial final split", dict(rows=4, length=1535)),
+        Cell("Six verifier tokens across a split boundary", dict(rows=6, length=4094)),
+    )
+
+    def __call__(
+        self,
+        qkv: torch.Tensor,
+        pages: torch.Tensor,
+        table: torch.Tensor,
+        positions: torch.Tensor,
+        projection: torch.Tensor,
+        divisor: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        append_kv(qkv, pages, table, divisor, None, None, positions)
+        q = qkv[:, :6144].view(-1, 24, 256)
+        max_seq_len = table.shape[-1] * pages.shape[-2]
+        return decode_paged(q, pages, table, positions, projection, divisor, max_seq_len)
+
+    def reference(
+        self,
+        qkv: torch.Tensor,
+        pages: torch.Tensor,
+        table: torch.Tensor,
+        positions: torch.Tensor,
+        projection: torch.Tensor,
+        divisor: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        page_size = pages.shape[-2]
+        positions = positions.long()
+        slots = table[0, positions // page_size] // divisor
+        pages[slots, :, :, positions % page_size] = qkv[:, 6144:].reshape(-1, 2, 4, 256)
+        outputs = []
+        with true_fp32_matmul():
+            for i, end in enumerate(positions.tolist()):
+                offsets = torch.arange(end + 1, device=positions.device)
+                indices = table[0, offsets // page_size] // divisor
+                kv = pages[indices, :, :, offsets % page_size].float()
+                key = kv[:, 0].transpose(0, 1).repeat_interleave(6, dim=0)
+                value = kv[:, 1].transpose(0, 1).repeat_interleave(6, dim=0)
+                query = qkv[i, :6144].view(24, 256).float()
+                scores = torch.einsum("hd,htd->ht", query, key) * 0.0625
+                outputs.append(
+                    torch.einsum("ht,htd->hd", scores.softmax(-1), value).flatten().bfloat16()
+                )
+        attention = attention_gate.reference(torch.stack(outputs), projection)
+        return reference_block_quantize(attention)
+
+
+single_sequence_paged_gqa = SingleSequencePagedGqa()

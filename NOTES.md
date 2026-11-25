@@ -607,3 +607,59 @@ first differed from solo at gaps of at most 0.375 nats.
 | 1024 | 1024 | 1 | 4 | 307.32 | 66.39 |
 | 1024 | 1024 | 32 | 32 | 4056.53 | 811.44 |
 | 1024 | 1024 | 128 | 128 | 6866.35 | 2518.10 |
+
+## Packed activation scales and single-request paged attention
+
+The fused norm, SwiGLU, and attention-gate producers write the four
+activation exponents in the order that DeepGEMM reads them. The small-M
+CuTe and CUTLASS paths keep their existing scale layouts. Packing
+directly passed the full oracle and mixed HTTP checks in an isolated
+build.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 292.63 | 57.10 |
+| 1024 | 1024 | 32 | 32 | 4064.33 | 992.35 |
+| 1024 | 1024 | 128 | 128 | 6847.44 | 2551.81 |
+
+Single-request long decode now uses the reference engine's 128-token
+attention splits and BF16 value contraction. The target gathers from
+the physical KV pages and fuses the split merge, output gate, and FP8
+quantization. The batched path continues to use the native paged
+attention operation. The single-request pilot cleared the 0.625-nat
+divergence on the additional 1,024-input chat. The same divergence
+persisted in the FlashInfer ragged prefill pilot.
+
+The three-prompt draft-width check on the row-major-TMA build gave
+median decode rates of 304.47, 309.83, and 312.73 tokens/s with four
+drafts at ISL 128, 1,024, and 4,096, respectively, and OSL 1,024.
+Five drafts gave 310.52, 311.16, and 285.43 tokens/s. The launcher
+keeps four drafts.
+
+The combined build passed 86 target operation tests and all 32
+development items with mean KL 0.003288 and 99.909% non-tie top-1
+agreement. Both EOS checks passed. Eight of the nine supplementary
+64-output chats passed against the standalone engine. On the other
+chat, at ISL 128, generation selected token 328 and the standalone
+generated token 3437. The standalone scorer preferred 328 by 0.5
+nats at that position.
+
+| Batch | ISL | OSL | Prompt | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 1 | 28.60 | 3.336 | 299.79 |
+| 1 | 128 | 1024 | 2 | 29.36 | 2.727 | 366.73 |
+| 1 | 1024 | 1024 | 1 | 44.09 | 3.496 | 286.05 |
+| 1 | 1024 | 1024 | 2 | 44.12 | 3.119 | 320.65 |
+| 1 | 4096 | 1024 | 1 | 132.36 | 3.415 | 292.81 |
+| 1 | 4096 | 1024 | 2 | 133.27 | 3.064 | 326.40 |
+
+The actual HTTP launcher reproduced all development outputs from the
+JSONL engine at concurrency 1, 32, and 128. The mixed short-prompt
+checks passed at concurrency 4, 32, and 128. The first HTTP differences
+on the additional chats had solo score gaps of up to 0.375 nats.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 302.69 | 54.43 |
+| 1024 | 1024 | 32 | 32 | 4106.53 | 790.18 |
+| 1024 | 1024 | 128 | 128 | 6889.47 | 2470.07 |
