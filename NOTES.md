@@ -730,3 +730,23 @@ The batch-1 comparison still found strict differences at 16, 48, and 64.
 `AEGIS_MODELING_V2=off ./serve.sh /model` now keeps the same MTP
 and CUDA graph settings for paired tests. Set `AEGIS_MTP_DRAFTS=0`
 and `AEGIS_PREFILL_GRAPHS=0` to reproduce the initial V1 run.
+
+## Packed expert tile sizes
+
+The routed W4A16 probe used actual layer-13 checkpoint weights.
+The selected tiles reduced the 96-row path from 90.94 to 77.37
+microseconds, the 512-row path from 152.30 to 140.66, and the
+1024-row path from 179.49 to 171.92. The routed outputs matched
+bitwise. The target now chooses the verification tile from the
+number of rows, applies the wider prefill tactic from 1024 rows,
+and enables dependent launches through 512 rows.
+
+All 32 engine items passed. The actual HTTP launcher repeated
+the preceding revision's greedy results at all 11 tested
+concurrency levels.
+
+| ISL | OSL | HTTP concurrency | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 671.3 | 23.92 |
+| 1024 | 1024 | 32 | 6645.9 | 225.08 |
+| 1024 | 1024 | 128 | 11384.8 | 289.64 |

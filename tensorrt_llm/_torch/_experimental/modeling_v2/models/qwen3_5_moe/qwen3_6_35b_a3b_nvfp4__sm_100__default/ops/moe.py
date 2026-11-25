@@ -211,9 +211,9 @@ class Experts(nn.Module):
         if grouped:
             tokens = batch if verifying else rows
             tile = 8 if tokens < 64 else 16 if tokens <= 128 else 64
-            if verifying and batch >= 128:
-                tile = 32
-            wide = contexts and rows >= 4096
+            if verifying and rows >= 96:
+                tile = 64 if rows >= 256 else 32
+            wide = contexts and rows >= 1024
             if wide:
                 tile = 128
             routed = self.grouped(

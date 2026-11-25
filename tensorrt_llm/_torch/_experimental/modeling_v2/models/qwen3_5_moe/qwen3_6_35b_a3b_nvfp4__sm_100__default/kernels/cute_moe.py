@@ -429,7 +429,7 @@ class PackedExperts:
 
     def __call__(self, x, ids, probs, route_tile=8, tactic_m=128, cluster=1, raw=False):
         m = x.size(0)
-        pdl = CUTE_PDL != 0 and m <= 256
+        pdl = CUTE_PDL != 0 and m <= 512
         staged_pdl = CUTE_PDL >= 2 and pdl
         max_rows = get_max_num_permuted_tokens(m, 8, 256, route_tile)
         e, end, slot, perm, active = group_routes(ids, route_tile, max_rows, self.bins)
