@@ -571,3 +571,39 @@ request also completed.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 4110.60 | 927.00 | 6.452 |
 | 128 | 128 | 6261.63 | 2681.45 | 17.304 |
+
+## Overlapped gate projections and paged attention
+
+The GDN B/A projection runs on a CUDA stream alongside the FP8 QKVZ
+projection, following the two-stream execution in aegis-engines `engine.py`.
+Both streams read the same normalized BF16 input and join before updating
+recurrent state. Six rotating checkpoint layers preserved every result.
+The combined projection time at 5, 128, and 256 rows fell from 27.46,
+26.62, and 38.54 microseconds to 23.06, 21.56, and 31.70 microseconds.
+
+For a 32-token decode tile aligned to a page, a single page-table lookup
+serves the entire tile. The pair kernel stages three loads. With 32-token
+pages and sequence lengths up to 2048, this changed the two-query
+kernel from 113.87 to 103.46 microseconds at batch 32 and from 216.47 to
+198.17 microseconds at batch 128. The paged attention outputs were bitwise
+identical. Grouping several GDN heads per CTA preserved the recurrence but
+yielded less than a 1% gain at batch 128, so it stayed experimental.
+
+The 44 operation cells and all 32 contract cases passed with the
+same score metrics. All 384 development serving checks passed and all
+208 long-prompt serving responses matched batch 1 token for token.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 15.63 | 2.311 | 432.80 |
+| 1024 | 1024 | 36.76 | 2.547 | 392.56 |
+| 4096 | 1024 | 126.06 | 2.788 | 358.62 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4197.19 | 934.87 | 6.265 |
+| 128 | 128 | 6423.66 | 2496.88 | 16.977 |

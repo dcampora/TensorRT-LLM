@@ -280,7 +280,7 @@ class PagedCausalDecode(OpWrapper):
                 rows_per_seq,
                 request_start,
                 num_warps=4,
-                num_stages=2,
+                num_stages=3,
             )
         else:
             paged_attention.paged_decode_part[(rows, KV_HEADS, _DECODE_SPLITS)](

@@ -187,7 +187,11 @@ def _paged_pair_partition(
         acc = tl.full((16, 256), 0, tl.float32)
         for offset in range(begin, end, 32):
             t = offset + columns
-            page = tl.load(pages + t // PAGE_SIZE, t < end, 0)
+            if PAGE_SIZE % 32 == 0:
+                # A 32-token tile aligned to the split boundary shares one page.
+                page = tl.load(pages + offset // PAGE_SIZE)
+            else:
+                page = tl.load(pages + t // PAGE_SIZE, t < end, 0)
             kvbase = (page.to(tl.int64) // PAGE_DIVISOR) * PAGE_STRIDE
             kvbase += (hk * PAGE_SIZE + t % PAGE_SIZE) * 256
             key = tl.load(K + kvbase[None, :] + d[:, None], t[None, :] < end, 0)

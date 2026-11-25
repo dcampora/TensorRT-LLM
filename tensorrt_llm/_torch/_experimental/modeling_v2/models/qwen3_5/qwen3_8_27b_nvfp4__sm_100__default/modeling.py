@@ -88,11 +88,12 @@ class Step(NamedTuple):
 
 
 class Layer(nn.Module):
-    def __init__(self, index: int, kind: str, eps: float) -> None:
+    def __init__(self, index: int, kind: str, eps: float, gate_stream: torch.cuda.Stream) -> None:
         super().__init__()
         self.index = index
         self.eps = eps
         self.is_linear = kind == "linear_attention"
+        self.gate_stream = gate_stream
         self.qkv = Fp8Linear()
         self.out = Fp8Linear()
         self.gate_up = Fp4Linear()
@@ -106,21 +107,31 @@ class Layer(nn.Module):
             self.register_buffer("q_norm", None)
             self.register_buffer("k_norm", None)
 
-    def linear_attention(
-        self, x: torch.Tensor, projection: torch.Tensor, step: Step, cache
-    ) -> torch.Tensor:
+    def project_gate(self, x: torch.Tensor, step: Step) -> torch.Tensor:
         rows = x.shape[0]
-        z = projection[:, 10240:]
         if step.context is not None:
             if len(step.context_spans) == 1 or step.projection_rows == _PREFILL_MIN_ROWS:
-                ba = F.linear(_pad(x, step.projection_rows), self.ba)[:rows]
-            else:
-                ba = torch.cat(
-                    [
-                        F.linear(_pad(x[first:end], _PREFILL_MIN_ROWS), self.ba)[: end - first]
-                        for first, end in step.context_spans
-                    ]
-                )
+                return F.linear(_pad(x, step.projection_rows), self.ba)[:rows]
+            return torch.cat(
+                [
+                    F.linear(_pad(x[first:end], _PREFILL_MIN_ROWS), self.ba)[: end - first]
+                    for first, end in step.context_spans
+                ]
+            )
+        if rows <= _PREFILL_MIN_ROWS:
+            return F.linear(_pad(x, _PREFILL_MIN_ROWS), self.ba)[:rows]
+        return torch.cat(
+            [
+                F.linear(_pad(tile, _PREFILL_MIN_ROWS), self.ba)[: tile.shape[0]]
+                for tile in x.split(_PREFILL_MIN_ROWS)
+            ]
+        )
+
+    def linear_attention(
+        self, projection: torch.Tensor, ba: torch.Tensor, step: Step, cache
+    ) -> torch.Tensor:
+        z = projection[:, 10240:]
+        if step.context is not None:
             prefills = gdn_context(
                 projection,
                 ba,
@@ -133,15 +144,6 @@ class Layer(nn.Module):
             )
             return gated_rmsnorm(prefills, z, self.gate_norm, self.eps)
 
-        if rows <= _PREFILL_MIN_ROWS:
-            ba = F.linear(_pad(x, _PREFILL_MIN_ROWS), self.ba)[:rows]
-        else:
-            ba = torch.cat(
-                [
-                    F.linear(_pad(tile, _PREFILL_MIN_ROWS), self.ba)[: tile.shape[0]]
-                    for tile in x.split(_PREFILL_MIN_ROWS)
-                ]
-            )
         args = (
             projection,
             ba,
@@ -209,7 +211,7 @@ class Layer(nn.Module):
             output = paged_context_attention(q, starts, chunks, step.positions, cache, table)
         return apply_gate(output, gate)
 
-    def attention_projections(self, x: torch.Tensor, step: Step) -> torch.Tensor:
+    def project_qkv(self, x: torch.Tensor, step: Step) -> torch.Tensor:
         rows = x.shape[0]
         decode = step.context is None
         if decode and not self.is_linear and (rows <= 8 or rows in (128, 256)):
@@ -217,11 +219,36 @@ class Layer(nn.Module):
             return fp8_qkv_partitions(packed, self.qkv.weight)
         return self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
 
+    def attention_projections(
+        self, x: torch.Tensor, step: Step
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.is_linear:
+            return self.project_qkv(x, step), None
+        rows = x.shape[0]
+        if step.context is not None or (8 < rows < 128):
+            return self.project_qkv(x, step), self.project_gate(x, step)
+        # Both projections consume the same normalized input. The
+        # recurrence can start as soon as both stream dependencies retire.
+        stream = torch.cuda.current_stream(x.device)
+        self.gate_stream.wait_stream(stream)
+        with torch.cuda.stream(self.gate_stream):
+            ba = self.project_gate(x, step)
+        projection = self.project_qkv(x, step)
+        stream.wait_stream(self.gate_stream)
+        ba.record_stream(stream)
+        return projection, ba
+
     def attention_core(
-        self, x: torch.Tensor, projection: torch.Tensor, step: Step, rope: torch.Tensor, cache
+        self,
+        inputs: tuple[torch.Tensor, torch.Tensor | None],
+        step: Step,
+        rope: torch.Tensor,
+        cache,
     ) -> torch.Tensor:
+        projection, ba = inputs
         if self.is_linear:
-            return self.linear_attention(x, projection, step, cache)
+            assert ba is not None
+            return self.linear_attention(projection, ba, step, cache)
         return self.full_attention(projection, step, rope, cache)
 
     def project_attention(self, x: torch.Tensor, step: Step) -> torch.Tensor:
@@ -251,7 +278,7 @@ class Layer(nn.Module):
         layer_cache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_rms_norm(x, residual)
-        x = self.attention_core(x, self.attention_projections(x, step), step, rope, layer_cache)
+        x = self.attention_core(self.attention_projections(x, step), step, rope, layer_cache)
         x = self.post_rms_norm(self.project_attention(x, step), residual)
         intermediate = self.gate_up(_pad(x, step.projection_rows))
         x = self.down.swiglu(intermediate, step.mlp_rows, decode=step.context is None)
@@ -273,8 +300,8 @@ class Layer(nn.Module):
             self.attention_projections(x, step) for x, step in zip(normalized, steps, strict=True)
         ]
         attn = [
-            self.attention_core(x, p, step, rope, cache)
-            for x, p, step in zip(normalized, projections, steps, strict=True)
+            self.attention_core(p, step, rope, cache)
+            for p, step in zip(projections, steps, strict=True)
         ]
         del projections, normalized
         projected = [self.project_attention(x, step) for x, step in zip(attn, steps, strict=True)]
@@ -298,8 +325,9 @@ class Qwen38Decoder(DecoderModel):
         super().__init__(model_config)
         config = model_config.pretrained_config.get_text_config()
         self.eps = config.rms_norm_eps
+        gate_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
-            Layer(i, kind, self.eps) for i, kind in enumerate(config.layer_types)
+            Layer(i, kind, self.eps, gate_stream) for i, kind in enumerate(config.layer_types)
         )
         self.num_trunk_layers = len(self.layers)
         self.register_buffer("embedding", None)
