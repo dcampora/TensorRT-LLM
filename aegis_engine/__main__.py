@@ -137,7 +137,8 @@ def _build_llm(model: Path, mode: Literal["require", "off"], draft_len: int) -> 
         cuda_graph_config={"batch_sizes": [1]},
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
-            max_tokens=MAX_SEQ_LEN,
+            # The physical pool also holds tentative draft rows and runtime padding.
+            max_tokens=2 * MAX_SEQ_LEN,
             host_cache_size=0,
             mamba_ssm_cache_dtype="auto" if mode == "off" and draft_len == 0 else "float32",
         ),

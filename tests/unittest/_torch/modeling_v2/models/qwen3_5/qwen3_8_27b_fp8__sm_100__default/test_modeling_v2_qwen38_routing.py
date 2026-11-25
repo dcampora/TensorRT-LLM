@@ -98,3 +98,14 @@ def test_incompatible_gpu_and_weight_blocks_are_declined(config, monkeypatch):
     config.pretrained_config.quantization_config["weight_block_size"] = [64, 128]
     with pytest.raises(ValueError, match="128 x 128 weight blocks"):
         modeling_v2_resolve(config, args)
+
+
+def test_incomplete_checkpoint_metadata_is_declined(config, monkeypatch):
+    args = _arguments(modeling_v2="require")
+    with monkeypatch.context() as missing_metadata:
+        missing_metadata.delattr(config.pretrained_config.text_config, "layer_types")
+        with pytest.raises(ValueError, match="full attention every fourth layer"):
+            modeling_v2_resolve(config, args)
+    config.pretrained_config.quantization_config = None
+    with pytest.raises(ValueError, match="128 x 128 weight blocks"):
+        modeling_v2_resolve(config, args)

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Route the official Qwen3.8-27B FP8 text tower on GB200."""
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_required, is_gdn_replay_enabled
@@ -52,11 +53,13 @@ def route(
     mismatches = [name for name, value in expected.items() if getattr(text, name, None) != value]
     if mismatches:
         raise NoTarget(f"Qwen3.8-27B text geometry differs in {', '.join(mismatches)}")
-    if list(text.layer_types) != (["linear_attention"] * 3 + ["full_attention"]) * 16:
+    layer_types = getattr(text, "layer_types", None)
+    expected_layers = (["linear_attention"] * 3 + ["full_attention"]) * 16
+    if not isinstance(layer_types, (list, tuple)) or list(layer_types) != expected_layers:
         raise NoTarget("Qwen3.8-27B FP8 requires full attention every fourth layer")
 
-    quantization = getattr(config, "quantization_config", {})
-    if any(
+    quantization = getattr(config, "quantization_config", None)
+    if not isinstance(quantization, Mapping) or any(
         quantization.get(key) != value
         for key, value in {
             "activation_scheme": "dynamic",

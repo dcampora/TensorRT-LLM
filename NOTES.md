@@ -507,7 +507,7 @@ concurrency 1, 32, and 128. Five target routing tests and seven
 shared prefill graph tests passed on CPU. An initial integration
 control with a 4,352-token KV cap hit the runtime's page-table capacity
 error when scheduling a long request. The exact-bucket regression
-uses the launcher's 8,192-token cap.
+used an 8,192-token cap.
 
 At ISL 1,024 and OSL 1,024, the serving pilots sent four chats at
 concurrency 1 and one wave of chats at each higher concurrency. All
@@ -663,3 +663,53 @@ on the additional chats had solo score gaps of up to 0.375 nats.
 | 1024 | 1024 | 1 | 4 | 302.69 | 54.43 |
 | 1024 | 1024 | 32 | 32 | 4106.53 | 790.18 |
 | 1024 | 1024 | 128 | 128 | 6889.47 | 2470.07 |
+
+The isolated standalone rerun used the same two batch-1 chats at each input
+length. It reported 138,627 MiB of GPU memory at readiness.
+
+| Batch | ISL | OSL | Prompt | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 1 | 16.09 | 3.663 | 273.01 |
+| 1 | 128 | 1024 | 2 | 15.66 | 3.981 | 251.22 |
+| 1 | 1024 | 1024 | 1 | 50.78 | 3.904 | 256.12 |
+| 1 | 1024 | 1024 | 2 | 50.31 | 3.666 | 272.76 |
+| 1 | 4096 | 1024 | 1 | 181.78 | 4.338 | 230.50 |
+| 1 | 4096 | 1024 | 2 | 181.26 | 3.991 | 250.59 |
+
+An FP8 draft-head pilot shortlisted vocabulary rows, then recomputed their
+logits with the BF16 head. Its first FlashInfer top-k compilation took about
+nine minutes. BF16 verifier logits saved the FP32 conversion in a separate
+greedy-only pilot. Both used the same earlier batched-projection build and
+showed small throughput differences. A third pilot ran the BF16 prefill
+gate GEMM at each request's own length for every packed prefill. It caused a
+0.625-nat first difference from solo at concurrency 32 on a supplemental
+chat. The serving launcher retains the validated paths.
+
+| Pilot | ISL | OSL | C1 tokens/s | C32 tokens/s | C128 tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FP8 draft shortlist with BF16 reranking | 1024 | 1024 | 296.97 | 4112.37 | 6805.87 |
+| BF16 verifier logits | 1024 | 1024 | 292.22 | 4028.97 | 6826.30 |
+| Per-request prefill gate projection | 1024 | 1024 | — | 4101.99 | 6797.80 |
+
+## JSONL sequence boundary
+
+With an 8,192-token physical pool, a request with ISL 8,184 and OSL 8
+terminated the executor while it allocated tentative KV pages. A
+16,384-token physical pool served that request and the ISL 8,191,
+OSL 1 boundary case. The driver returned an error for a request above
+the 8,192-token sequence limit and then served a fresh request in the
+same process. Both executor allocations reserve this headroom.
+The integration test invoked `engine.sh` and passed all 32 development
+items, the two exact-limit requests, and the follow-up after rejection.
+
+## Recurrent-state precision pilot
+
+The BF16 recurrent cache passed the development oracle and reduced
+the trial server's ready-time GPU memory to 71,935 MiB. It also
+introduced a 0.75-nat first difference from FP32 solo generation on
+a supplementary short chat at concurrency 4, 32, and 128. The KV
+pages used BF16 throughout this trial.
+
+| Pilot | ISL | OSL | C1 tokens/s | C32 tokens/s | C128 tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 recurrent state | 1024 | 1024 | 268.72 | 4194.66 | 7275.69 |

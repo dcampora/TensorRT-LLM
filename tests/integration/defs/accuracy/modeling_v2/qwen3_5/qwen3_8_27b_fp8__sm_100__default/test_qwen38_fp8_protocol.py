@@ -123,6 +123,18 @@ def test_qwen38_fp8_dev_oracle(model_path: Path, dev_oracle: dict) -> None:
                         if (index, offset) not in fragile or not is_top1:
                             failures.append((index, offset, actual, wanted))
                     break
+
+            limit = 8192
+            tokens = oracle["items"][0]["prompt_ids"]
+            prompt = (tokens * (limit // len(tokens) + 1))[:limit]
+            for count in (1, 8):
+                response = call(
+                    "generate", ids=prompt[:-count], max_new_tokens=count, ignore_eos=True
+                )
+                assert len(response["ids"]) == count
+            assert "error" in exchange("generate", ids=prompt, max_new_tokens=1, ignore_eos=True)
+            response = call("generate", ids=tokens, max_new_tokens=1, ignore_eos=True)
+            assert len(response["ids"]) == 1
         finally:
             assert call("shutdown") == {"ok": True}
             assert engine.wait(timeout=60) == 0
