@@ -61,12 +61,33 @@ class ChannelFp8Linear(OpWrapper):
         Cell("full-attention projection on a prefill", {"rows": 128, "width": 9216}),
     )
 
-    def __call__(self, x, weight, activation_scales, weight_scales):
+    def __call__(self, x, weight, activation_scales, weight_scales, unit_scale):
+        if x.shape[0] <= 16:
+            accumulator = torch._scaled_mm(
+                x,
+                weight.T,
+                unit_scale,
+                unit_scale,
+                out_dtype=torch.float32,
+                use_fast_accum=True,
+            )
+            out = torch.empty_like(accumulator, dtype=BF16)
+            k.apply_projection_scales[(triton.cdiv(out.numel(), 512),)](
+                accumulator,
+                activation_scales,
+                weight_scales,
+                out,
+                weight.shape[0],
+                out.numel(),
+                512,
+                num_warps=4,
+            )
+            return out
         return torch._scaled_mm(
             x, weight.T, activation_scales, weight_scales, out_dtype=BF16, use_fast_accum=True
         )
 
-    def reference(self, x, weight, activation_scales, weight_scales):
+    def reference(self, x, weight, activation_scales, weight_scales, unit_scale):
         with true_fp32_matmul():
             return ((x.float() @ weight.float().T) * activation_scales * weight_scales).to(BF16)
 
@@ -79,7 +100,11 @@ def fp8_linear(x, weights):
         x = fp8_cast(x, weights.input_scale)
     if weights.weight_scale.ndim:
         return channel_fp8_linear(
-            x, weights.weight, weights.scales_for_rows(x.shape[0]), weights.weight_scale
+            x,
+            weights.weight,
+            weights.scales_for_rows(x.shape[0]),
+            weights.weight_scale,
+            weights.unit_scale,
         )
     return bmm_fp8(
         x[None],

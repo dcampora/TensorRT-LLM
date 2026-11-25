@@ -58,9 +58,9 @@ def test_channel_fp8_linear(cell, certifying):
     rows, width = cell.spec["rows"], cell.spec["width"]
     x = fixture_rand((rows, 2048), FP8, 0.5)
     weight = fixture_rand((width, 2048), FP8, 0.5)
-    activation_scales = torch.full((rows, 1), 0.0037, device=DEV)
+    activation_scales = torch.linspace(0.0027, 0.0047, rows, device=DEV)[:, None]
     weight_scales = torch.linspace(0.001, 0.002, width, device=DEV)[None, :]
-    args = x, weight, activation_scales, weight_scales
+    args = x, weight, activation_scales, weight_scales, torch.ones(1, device=DEV)
     # One BF16 rounding at a few FP32 accumulation boundaries. The
     # 128-row cell measured relative RMS error of about 1.05e-5.
     assert_within_ulp(op(*args), op.reference(*args), 1, 0.01)
@@ -199,18 +199,30 @@ def test_prepare_qkv(cell, certifying):
     op = attention.prepare_qkv
     certifying(op)
     page = cell.spec["page_size"]
-    qkv = fixture_rand((4, 9216), factor=0.2)
     qnorm, knorm = fixture_rand((256,), factor=0.15), fixture_rand((256,), factor=0.15)
-    angles = fixture_rand((2 * page, 32), torch.float32)
+    if cell.spec.get("tiled"):
+        length = 9 * page
+        positions = torch.arange(length, device=DEV, dtype=torch.int32).repeat(2)
+        requests = torch.arange(2, device=DEV, dtype=torch.int32).repeat_interleave(length)
+        pages = torch.randperm(18, device=DEV, dtype=torch.int32).reshape(2, 9) * 4
+        table = torch.stack((pages, pages + 1), dim=1)
+        slots = 18
+    else:
+        length = 2 * page
+        requests = torch.tensor([0, 0, 1, 1], device=DEV, dtype=torch.int32)
+        positions = torch.tensor([0, page + 3, 2, page], device=DEV, dtype=torch.int32)
+        table = torch.tensor(
+            [[[8, 0], [9, 1]], [[16, 12], [17, 13]]], device=DEV, dtype=torch.int32
+        )
+        slots = 6
+    qkv = fixture_rand((positions.numel(), 9216), factor=0.2)
+    angles = fixture_rand((length, 32), torch.float32)
     rope = torch.cat((angles.cos(), angles.sin()), dim=-1)
     # The second layer shares the slot interleave, so the first layer's K/V
     # page offsets increment by four rather than by the two K/V roles.
-    storage = torch.zeros((6, 2, 2, 2, page, 256), dtype=FP8, device=DEV)
+    storage = torch.zeros((slots, 2, 2, 2, page, 256), dtype=FP8, device=DEV)
     ref = storage.clone()
     kv = storage[:, 0]
-    requests = torch.tensor([0, 0, 1, 1], device=DEV, dtype=torch.int32)
-    positions = torch.tensor([0, page + 3, 2, page], device=DEV, dtype=torch.int32)
-    table = torch.tensor([[[8, 0], [9, 1]], [[16, 12], [17, 13]]], device=DEV, dtype=torch.int32)
     actual_q, actual_gate = op(qkv, qnorm, knorm, rope, positions, requests, kv, table)
     q, gate = op.reference(qkv, qnorm, knorm, rope, positions, requests, ref[:, 0], table)
     torch.testing.assert_close(actual_gate, gate, rtol=0, atol=0)

@@ -8,6 +8,7 @@ import triton
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import paged_attention as k
+from ..kernels import prefill_rope
 from ..weights import BF16, FP8
 
 
@@ -16,13 +17,14 @@ class PrepareQkv(OpWrapper):
     CELLS = (
         Cell("nonconsecutive pages and one partially written page", {"page_size": 32}),
         Cell("multiple requests sharing one pool", {"page_size": 64}),
+        Cell("tiled prefill over strided pages", {"page_size": 32, "tiled": True}),
     )
 
     def __call__(self, qkv, qnorm, knorm, rope, positions, requests, kv, table):
         rows = qkv.shape[0]
         q = torch.empty((rows, 16, 256), dtype=FP8, device=qkv.device)
         gate = torch.empty((rows, 4096), dtype=BF16, device=qkv.device)
-        k.qkv_rope[(rows, 20)](
+        args = (
             qkv,
             qnorm,
             knorm,
@@ -37,8 +39,16 @@ class PrepareQkv(OpWrapper):
             table.stride(1),
             kv.shape[-2],
             kv.stride(1),
-            num_warps=4,
         )
+        if rows >= 512:
+            tile, warps = 4, 2
+            query_blocks = triton.cdiv(rows * 16, tile)
+            cache_blocks = triton.cdiv(rows * 2, tile)
+            prefill_rope.qkv_rope[(query_blocks + 2 * cache_blocks,)](
+                *args, rows, tile, warps, query_blocks, cache_blocks, num_warps=warps
+            )
+        else:
+            k.qkv_rope[(rows, 20)](*args, num_warps=4)
         return q, gate
 
     def reference(self, qkv, qnorm, knorm, rope, positions, requests, kv, table):

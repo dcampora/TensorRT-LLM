@@ -54,6 +54,7 @@ class Fp8Weights(nn.Module):
     def prepare(self) -> None:
         if self.weight_scale.ndim:
             self.activation_scales = self.input_scale.repeat(8192).view(-1, 1)
+            self.unit_scale = torch.ones(1, dtype=torch.float32, device=self.weight.device)
 
     def scales_for_rows(self, rows: int) -> torch.Tensor:
         if rows <= self.activation_scales.shape[0]:
@@ -73,14 +74,16 @@ class PackedWeights(nn.Module):
         self.k = in_features
         self.interleaved = interleaved
 
-    def load(self, checkpoint, roots, projections, *, shared_gate=False):
+    def load(self, checkpoint, roots, projections):
         def pack(root, suffix):
             prefix = f"{root}." if root else ""
             shards = [checkpoint[f"{prefix}{name}.{suffix}"] for name in projections]
             if len(shards) == 1:
                 return shards[0]
             if suffix == "weight_scale_2":
-                return torch.maximum(*shards) if shared_gate else shards[0]
+                if not torch.equal(shards[0], shards[1]):
+                    raise ValueError(f"{root} must have matching ModelOpt gate and up scales")
+                return shards[0]
             if suffix == "weight_scale":
                 return torch.cat([shard.view(torch.uint8) for shard in shards]).view(FP8)
             return torch.cat(shards)
@@ -135,7 +138,7 @@ def load_decoder_weights(decoder, checkpoint):
         shared = [f"{name}.shared_expert"]
         moe.gate_up.load(checkpoint, experts, ("gate_proj", "up_proj"))
         moe.down.load(checkpoint, experts, ("down_proj",))
-        moe.shared_gate_up.load(checkpoint, shared, ("gate_proj", "up_proj"), shared_gate=True)
+        moe.shared_gate_up.load(checkpoint, shared, ("gate_proj", "up_proj"))
         moe.shared_down.load(checkpoint, shared, ("down_proj",))
         moe.router[:NUM_EXPERTS].copy_(checkpoint[f"{name}.gate.weight"])
         moe.router[NUM_EXPERTS].copy_(checkpoint[f"{name}.shared_expert_gate.weight"][0])

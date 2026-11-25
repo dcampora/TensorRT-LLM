@@ -247,3 +247,63 @@ the same prefill graph as longer generation requests.
 
 `serve.sh` loaded the prefill and generation graphs and passed the
 batch-1 comparisons at concurrencies 1, 32 and 128.
+
+The closed-loop sweep used the same inputs and request counts as the
+previous three-draft sweep.
+
+| ISL | OSL | Concurrency | Output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 643.0 | 24.66 | 1.531 |
+| 1024 | 1024 | 32 | 5488.8 | 261.46 | 5.319 |
+| 1024 | 1024 | 128 | 8919.2 | 319.14 | 13.241 |
+
+## Replay layout and attention experiments
+
+A decode profile at batch 128, ISL 1024 and OSL 256, used one MTP draft.
+The recurrent verifier accounted for 30.8% of total GPU kernel time.
+Its median launch was about 320 microseconds. The two guarded shared
+projection epilogues and the paged attention kernel were the next
+target-owned bottlenecks.
+
+An FP32 replay experiment kept the normalized keys, update vectors and
+per-token decay factors at the precision used in the recurrence. It
+passed all 32 development items through `engine.sh`, with mean KL
+0.005972 and confident top-1 agreement 99.726%. The fixed and scheduled
+serving runs both had one concurrency-32 divergence at a 0.5-nat margin
+from the batch-1 launcher. The default continued to use the verified
+replay implementation while the batch-dependent attention arithmetic
+was evaluated.
+
+| ISL | OSL | Concurrency | FP32 replay, three drafts (tokens/s) | FP32 replay, scheduled drafts (tokens/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 662.0 | 662.9 |
+| 1024 | 1024 | 32 | 5441.0 | 5477.6 |
+| 1024 | 1024 | 128 | 9144.6 | 9372.9 |
+
+## Tiled rotary embedding and short FP8 projections
+
+The rotary kernel from aegis-engines `prefill_rope.py` now processes tiled
+heads on long steps. It consumes TensorRT-LLM's per-request K and V page
+offsets, including strided layers. An isolated 4,096-row comparison on
+the original and tiled kernels took 92.18 and 45.38 microseconds, with
+identical FP8 query, key and value bytes and identical BF16 gates.
+
+For short fused projections, the Tensor Core GEMM returns FP32
+accumulators and a Triton epilogue applies the input and per-channel
+checkpoint scales before rounding to BF16. The two weight shards of each
+fused gate/up pair are checked for equal ModelOpt global scales during
+loading. The complete 1,319-question GSM8K integration test passed.
+
+Two external runs per batch-1 workload produced these medians.
+
+| ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 11.33 | 1.437 | 695.9 |
+| 1024 | 1024 | 19.64 | 1.600 | 624.9 |
+| 4096 | 1024 | 48.29 | 1.536 | 650.8 |
+
+The launcher passed all 32 development items, with mean KL 0.005972
+and confident top-1 agreement 99.726%.
+The native server started and passed the batch-1 comparisons at
+concurrencies 1, 32 and 128. The launcher's protocol checks covered error
+recovery, requested log-probability order, and EOS inclusion.

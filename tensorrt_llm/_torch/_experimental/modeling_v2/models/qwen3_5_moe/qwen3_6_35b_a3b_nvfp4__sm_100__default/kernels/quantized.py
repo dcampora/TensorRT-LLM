@@ -8,6 +8,15 @@ from triton.language.extra.cuda import libdevice
 
 
 @tr.jit
+def apply_projection_scales(X, AS, WS, Y, N: tl.constexpr, SIZE: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(X + i, i < SIZE, 0.0)
+    activation_scale = tl.load(AS + i // N, i < SIZE, 0.0)
+    weight_scale = tl.load(WS + i % N)
+    tl.store(Y + i, (value * activation_scale) * weight_scale, i < SIZE)
+
+
+@tr.jit
 def fp8_cast(X, Scale, Y, T, INV: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     s = tl.load(Scale)
