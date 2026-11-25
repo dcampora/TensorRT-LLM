@@ -254,14 +254,14 @@ class Layer(nn.Module):
             overlap = len(step.context_spans) == 1 and step.projection_rows <= 256
         if not overlap:
             return self.project_qkv(x, step), self.project_gate(x, step)
-        # Both projections consume the same normalized input. The
-        # recurrence can start as soon as both stream dependencies retire.
+        # The prefill body also runs eagerly between breakable graph
+        # segments. Explicit events preserve these stream dependencies.
         stream = torch.cuda.current_stream(x.device)
-        self.gate_stream.wait_stream(stream)
+        self.gate_stream.wait_event(stream.record_event())
         with torch.cuda.stream(self.gate_stream):
             ba = self.project_gate(x, step)
         projection = self.project_qkv(x, step)
-        stream.wait_stream(self.gate_stream)
+        stream.wait_event(self.gate_stream.record_event())
         ba.record_stream(stream)
         return projection, ba
 

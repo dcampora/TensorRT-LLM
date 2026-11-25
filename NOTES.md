@@ -971,3 +971,43 @@ The server passed all 384 development comparisons. The two batch-1
 differences were at the same zero-gap token as before. All 208 OSL 128
 and all 160 OSL 1024 long-prompt responses matched batch 1 exactly.
 A temperature-0.8 completion also returned.
+
+## Explicit projection stream synchronization
+
+The overlapping GDN projections now record CUDA events explicitly.
+Breakable-graph warmup executes the prefill body eagerly between
+segments. Explicit events retain the synchronization across the
+projection streams during that execution. The 192 dropped-wait
+warnings from the preceding startup disappeared.
+
+The 53 GPU tests passed. The development oracle's scores and outputs
+and the 24 long contract outputs matched the preceding build.
+The JSON-lines contract also passed error recovery, ragged score
+selections, EOS inclusion, and exact-length generation.
+
+### Contract engine after event synchronization, ISL 128, 1024, 4096 and OSL 1024
+
+The TTFT and paired 32- versus 1024-output decode latencies are medians
+of three thinking-enabled chats per input length.
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 14.49 | 2.309 | 433.08 |
+| 1024 | 1024 | 35.06 | 2.544 | 393.10 |
+| 4096 | 1024 | 114.65 | 2.787 | 358.82 |
+
+### Event-synchronized one-wave serving, ISL 1024 and OSL 1024
+
+The standalone rates include prefill and use the same tokenized chat
+inputs. The standalone measures static batches at the JSON-lines
+boundary. The target measures concurrent streaming OpenAI requests.
+
+| Concurrency or static batch | Requests | V2 output tokens/s | Standalone output tokens/s | V2 median TTFT (ms) | V2 median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4346.18 | 4700.79 | 787.46 | 6.165 |
+| 128 | 128 | 7079.64 | 7373.04 | 2163.16 | 15.494 |
+
+All 384 development serving comparisons passed, with two zero-gap
+differences from batch 1. The 208 OSL 128 and 160 OSL 1024 long-prompt
+responses matched batch 1 token for token. A sampled completion
+returned at temperature 0.8.
