@@ -8,5 +8,6 @@ if [[ $# -ne 1 && ( $# -ne 3 || ${2:-} != --port ) ]]; then
 fi
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 exec trtllm-serve "$1" --port "${3:-8000}" --served_model_name qwen3.8-27b-fp8 \
     --config "$root/aegis_engine/serve.yaml"

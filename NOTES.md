@@ -287,3 +287,28 @@ previous build.
 
 The OpenAI endpoint matched the batch-1 continuations exactly at
 concurrency 1, 32, and 128 on the short-prompt development suite.
+
+The first-row checkpoint improved the same short streaming sweep at all
+three concurrencies, especially once the recurrent pool exceeded L2.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 228.53 | 67.61 |
+| 1024 | 1024 | 32 | 32 | 3291.88 | 1084.77 |
+| 1024 | 1024 | 128 | 128 | 5379.37 | 3319.45 |
+
+## Mixed prompt lengths
+
+Mixing fresh development prompts with 1,024-token prompts exposed the
+short-context numerical issue again. Item 28 diverged at the 0.5-nat
+cutoff at concurrency 4, 32 and 128 because it took the long-context
+prefill path when a long neighbor shared the batch. The target now
+identifies fresh short requests separately, selects their rows for the
+triangular GDN and FP32 attention calculations, and writes the results
+back to their original rows and recurrent slots. A mixed step still
+uses the runtime's normal paged KV and packed generation rows.
+
+The mixed HTTP cases at concurrency 4, 32, and 128 now match all
+isolated short-prompt continuations. The model also passed all 32
+development items through `engine.sh` with the same KL and top-1
+agreement, and `serve.sh` passed the homogeneous concurrency checks.

@@ -25,16 +25,21 @@ def _kl(row: list[list[int | float]], logprobs: list[float]) -> float:
     return value
 
 
-def test_qwen38_fp8_dev_oracle() -> None:
-    """Check normalized scores and every first greedy divergence."""
+@pytest.fixture(scope="module")
+def model_and_oracle() -> tuple[Path, dict]:
     oracle_path = os.environ.get("QWEN38_DEV_ORACLE")
     if not oracle_path:
         pytest.skip("Set QWEN38_DEV_ORACLE to the development oracle JSON")
     model = Path(os.environ["LLM_MODELS_ROOT"]) / os.environ.get(
         "QWEN38_FP8_MODEL_DIR", "Qwen3.8-27B-FP8"
     )
+    return model, json.loads(Path(oracle_path).read_text())
+
+
+def test_qwen38_fp8_dev_oracle(model_and_oracle: tuple[Path, dict]) -> None:
+    """Check normalized scores and every first greedy divergence."""
+    model, oracle = model_and_oracle
     root = Path(__file__).resolve().parents[6]
-    oracle = json.loads(Path(oracle_path).read_text())
     eos = json.loads((model / "generation_config.json").read_text())["eos_token_id"]
     eos_ids = {eos} if isinstance(eos, int) else set(eos)
     vocab_size = json.loads((model / "config.json").read_text())["text_config"]["vocab_size"]
@@ -117,3 +122,43 @@ def test_qwen38_fp8_dev_oracle() -> None:
     assert total_kl / positions <= 0.01
     assert correct_top1 / non_ties >= 0.99
     assert not failures
+
+
+def test_qwen38_fp8_mixed_prefill(model_and_oracle: tuple[Path, dict]) -> None:
+    """Keep short prompt arithmetic when a long request shares the step."""
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    model, oracle = model_and_oracle
+    short = oracle["items"][28]["prompt_ids"]
+    long_a = (oracle["items"][0]["seq_ids"] * 32)[:1024]
+    long_b = (oracle["items"][1]["seq_ids"] * 32)[:1024]
+    llm = LLM(
+        model,
+        modeling_v2="require",
+        disable_mm_encoder=True,
+        skip_tokenizer_init=True,
+        max_batch_size=4,
+        max_num_tokens=4096,
+        max_seq_len=1536,
+        enable_chunked_prefill=True,
+        cuda_graph_config={"batch_sizes": [1, 4]},
+        speculative_config=MTPDecodingConfig(max_draft_len=3),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=6144,
+            host_cache_size=0,
+            mamba_ssm_cache_dtype="float32",
+        ),
+    )
+    params = SamplingParams(
+        max_tokens=64, temperature=0, ignore_eos=True, end_id=248046, detokenize=False
+    )
+    try:
+        solo = llm.generate(short, params, use_tqdm=False).outputs[0].token_ids
+        mixed = llm.generate([long_a, short, long_b, short], params, use_tqdm=False)
+        assert mixed[1].outputs[0].token_ids == solo
+        assert mixed[3].outputs[0].token_ids == solo
+    finally:
+        llm.shutdown()

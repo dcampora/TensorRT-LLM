@@ -88,6 +88,21 @@ class BlockProjection(nn.Module):
         )
 
 
+@dataclass(frozen=True)
+class ShortContexts:
+    """Fresh short requests within a packed context batch."""
+
+    rows: torch.Tensor | None
+    slots: torch.Tensor
+    offsets: torch.Tensor
+    chunks: torch.Tensor
+    starts: torch.Tensor
+    max_length: int
+
+    def select(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.rows is None else x.index_select(0, self.rows)
+
+
 @dataclass
 class Step:
     """Views of one packed runtime step and its request-owned cache slots."""
@@ -105,8 +120,7 @@ class Step:
     host_offsets: list[int] | None = None
     context_lengths: list[int] | None = None
     initial_slots: torch.Tensor | None = None
-    short_chunks: torch.Tensor | None = None
-    short_starts: torch.Tensor | None = None
+    short_contexts: ShortContexts | None = None
 
     @classmethod
     def prepare(
@@ -140,16 +154,50 @@ class Step:
             step.initial_slots = torch.where(
                 mamba.has_initial_states[:contexts], step.context_slots, -1
             )
-            if max(lengths) <= 128 and not mamba.use_initial_states:
-                counts = [(length + 63) // 64 for length in lengths]
-                pairs = [(seq, tile) for seq, count in enumerate(counts) for tile in range(count)]
-                step.short_chunks = torch.tensor(pairs, dtype=torch.int32, device="cpu").to(
-                    positions.device, non_blocking=True
+            fresh = [
+                seq
+                for seq, (length, initial) in enumerate(
+                    zip(lengths, mamba.has_initial_states_cpu[:contexts].tolist(), strict=True)
                 )
-                step.short_starts = torch.tensor(
-                    list(accumulate(counts, initial=0)), dtype=torch.int32, device="cpu"
-                ).to(positions.device, non_blocking=True)
+                if 0 < length <= 128 and not initial
+            ]
+            if fresh:
+                step.short_contexts = step._prepare_short_contexts(fresh, lengths)
         return step
+
+    def _prepare_short_contexts(self, sequences: list[int], lengths: list[int]) -> ShortContexts:
+        def device_tensor(values: list, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+            return torch.tensor(values, dtype=dtype, device="cpu").to(
+                self.positions.device, non_blocking=True
+            )
+
+        sizes = [lengths[seq] for seq in sequences]
+        counts = [(length + 63) // 64 for length in sizes]
+        pairs = [(seq, tile) for seq, count in enumerate(counts) for tile in range(count)]
+        rows = None
+        offsets = self.context_offsets
+        assert offsets is not None
+        slots = self.context_slots
+        if len(sequences) != len(lengths):
+            assert self.host_offsets is not None
+            rows = device_tensor(
+                [
+                    row
+                    for seq in sequences
+                    for row in range(self.host_offsets[seq], self.host_offsets[seq + 1])
+                ],
+                torch.int64,
+            )
+            offsets = device_tensor(list(accumulate(sizes, initial=0)))
+            slots = slots.index_select(0, device_tensor(sequences, torch.int64))
+        return ShortContexts(
+            rows,
+            slots,
+            offsets,
+            device_tensor(pairs),
+            device_tensor(list(accumulate(counts, initial=0))),
+            max(sizes),
+        )
 
 
 def residual_norm(
@@ -196,7 +244,8 @@ class DecoderLayer(nn.Module):
         split = step.context_rows
         parts = []
         if split:
-            if step.short_chunks is not None:
+            short = step.short_contexts
+            if short is not None:
                 assert step.host_offsets is not None
                 ba = torch.cat(
                     [
@@ -219,19 +268,7 @@ class DecoderLayer(nn.Module):
             decay, beta = delta_gates(ba, self.a_log, self.dt_bias)
             assert step.context_lengths is not None
             max_length = max(step.context_lengths)
-            if step.short_chunks is not None:
-                context = short_context_delta(
-                    convolved,
-                    decay,
-                    beta,
-                    step.context_offsets,
-                    step.short_chunks,
-                    step.short_starts,
-                    max_length,
-                    state,
-                    step.context_slots,
-                )
-            else:
+            if short is None or short.rows is not None:
                 q, k, v = (
                     t.contiguous().view(split, -1, 128)
                     for t in convolved.split((2048, 2048, 6144), dim=1)
@@ -255,6 +292,22 @@ class DecoderLayer(nn.Module):
                     backend="flashinfer",
                     gate_domain="log",
                 )
+            if short is not None:
+                short_out = short_context_delta(
+                    short.select(convolved),
+                    short.select(decay),
+                    short.select(beta),
+                    short.offsets,
+                    short.chunks,
+                    short.starts,
+                    short.max_length,
+                    state,
+                    short.slots,
+                )
+                if short.rows is None:
+                    context = short_out
+                else:
+                    context.index_copy_(0, short.rows, short_out)
             parts.append(context)
         if split < x.shape[0]:
             gen = x[split:]
@@ -347,16 +400,19 @@ class DecoderLayer(nn.Module):
                 step.metadata.num_contexts,
                 step.predicted,
             )
-        if step.short_chunks is not None:
+        short = step.short_contexts
+        if short is not None:
             split = step.context_rows
             context = short_causal_attention(
-                q[:split],
-                k[:split],
-                v[:split],
-                p[:split],
-                step.context_offsets,
-                step.short_chunks,
+                short.select(q[:split]),
+                short.select(k[:split]),
+                short.select(v[:split]),
+                short.select(p[:split]),
+                short.offsets,
+                short.chunks,
             )
+            if short.rows is not None:
+                return attention_gate(out, p).index_copy_(0, short.rows, context)
             if split == p.shape[0]:
                 return context
             return torch.cat((context, attention_gate(out[split:], p[split:])))
@@ -388,7 +444,7 @@ class DecoderLayer(nn.Module):
         step: Step,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         decode = step.context_rows == 0
-        fused = step.short_chunks is None
+        fused = step.short_contexts is None
         rows = x.shape[0]
         if fused and residual is not None:
             normalized = residual_norm_quantize(
