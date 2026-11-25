@@ -198,3 +198,51 @@ Serving uses three draft tokens through batch size 32 and one through
 batch size 128. The HTTP token-ID check matched every batch-1 continuation
 at concurrency 1, 32, and 128, including the fragile case. The server
 used 81,253 MiB of GPU memory after graph capture with 285,000 cache tokens.
+
+The first MTP streaming sweep completed concurrency 1 and 32. The
+client disconnected in its concurrency-128 case. The same server had
+already completed the concurrency-128 token-ID check.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 16 | 202.78 | 71.76 |
+| 1024 | 1024 | 32 | 128 | 2093.04 | 204.25 |
+
+## Fused activation and projection kernels
+
+The SwiGLU, GDN RMSNorm and dense attention gate now directly write E4M3
+activation values and FP32 scales. The residual RMSNorm writes both the
+BF16 residual and its quantized projection input. It also writes the
+normalized BF16 activations for the GDN gate projection. The MTP input
+kernel gathers the token embedding and applies the two RMSNorms before
+the BF16 FC. These kernels come from reference `activation_quant.py`
+and `norm_quant.cu/.py`. Fresh short contexts keep the existing arithmetic
+path. Decode and larger batches use the fused producers.
+
+The target uses the reference `fp8_tiles.cu/.py` CUTLASS kernels for
+shape ranges where the GB200 microbenchmark found a faster tile.
+For example, a 32-row fused QKVZ projection took 23.61 us with the narrow
+tile and 31.28 us with the original GEMM. The 128-row FFN down projection
+took 56.42 us and 58.94 us, respectively. I measured the reference's
+separate TMA-packed FFN weights as well. Their small-row gain came with
+about 10.8 GiB of duplicate E4M3 weights. This build keeps one FP8 copy.
+The CUDA norm and CUTLASS implementations would move to the target's
+`csrc/` in a source-built contribution.
+
+The draft proposes from 65,536 vocabulary rows, including the checkpoint's
+added tokenizer tokens, as in reference `speculative.py`. Every accepted
+token still agrees with the verifier's full-vocabulary calculation.
+
+All 59 target operation tests passed on GB200. The default engine again
+passed all 32 development items, with KL 0.003288, non-tie top-1 agreement
+99.909%, and the same 10 exact, 21 near-tie, and one fragile results.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 49.99 | 4.227 | 236.56 |
+| 1 | 1024 | 1024 | 67.86 | 4.575 | 218.59 |
+| 1 | 4096 | 1024 | 207.67 | 5.199 | 192.36 |
+
+The OpenAI token-ID check again matched all batch-1 continuations
+at concurrency 1, 32, and 128. This server used 81,991 MiB after graph
+capture with 285,000 cache tokens.

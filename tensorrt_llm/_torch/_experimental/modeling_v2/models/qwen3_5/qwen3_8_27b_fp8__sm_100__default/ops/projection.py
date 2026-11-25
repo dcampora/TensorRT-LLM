@@ -7,6 +7,7 @@ from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import fp8
+from ..kernels.tiled_gemm import tiled_gemm
 
 
 class BlockRequantize(OpWrapper):
@@ -52,12 +53,17 @@ class BlockQuantize(OpWrapper):
         return fp8.quantize_aligned(x, True)
 
     def reference(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        rows, width = x.shape
-        groups = torch.nn.functional.pad(x.float(), (0, 0, 0, (-rows) % 4))
-        groups = groups.reshape(-1, width // 128, 128)
-        scales = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1.0e-10) / 448)))
-        quantized = (groups / scales.unsqueeze(-1)).clamp(-448, 448)
-        return quantized.reshape(-1, width).to(torch.float8_e4m3fn), scales.T.contiguous()
+        return reference_block_quantize(x)
+
+
+def reference_block_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantization reference shared by the fused BF16 producers."""
+    rows, width = x.shape
+    groups = torch.nn.functional.pad(x.float(), (0, 0, 0, (-rows) % 4))
+    groups = groups.reshape(-1, width // 128, 128)
+    scales = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1.0e-10) / 448)))
+    quantized = (groups / scales.unsqueeze(-1)).clamp(-448, 448)
+    return quantized.reshape(-1, width).to(torch.float8_e4m3fn), scales.T.contiguous()
 
 
 class BlockMatmul(OpWrapper):
@@ -68,6 +74,8 @@ class BlockMatmul(OpWrapper):
         Cell("Split-K single-row output projection", dict(rows=1, n=5120, k=6144)),
         Cell("Padded verify projection", dict(rows=5, n=8192, k=5120)),
         Cell("Batched FFN down projection", dict(rows=32, n=5120, k=17408)),
+        Cell("Narrow verifier tile for the fused QKVZ", dict(rows=7, n=16384, k=5120, tiled=True)),
+        Cell("Narrow output tiles at batch 64", dict(rows=64, n=5120, k=6144, tiled=True)),
     )
 
     def __call__(
@@ -79,9 +87,12 @@ class BlockMatmul(OpWrapper):
         sw_mn: torch.Tensor,
         rows: int,
         split_k: bool,
+        workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if split_k:
             return fp8.ordered_fp8_product(a, sa, w, sw, a.shape[0])
+        if workspace is not None:
+            return tiled_gemm(a, w, sa, sw_mn, workspace)[:rows]
         return gemm_fp8_nt_groupwise(
             a, w, sa, sw_mn, out_dtype=torch.bfloat16, backend="cutlass", scale_major_mode="MN"
         )[:rows]
@@ -95,6 +106,7 @@ class BlockMatmul(OpWrapper):
         sw_mn: torch.Tensor,
         rows: int,
         split_k: bool,
+        workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         lhs = a[:rows].float() * sa.T[:rows].repeat_interleave(128, dim=-1)
         rhs = w.float() * sw.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)

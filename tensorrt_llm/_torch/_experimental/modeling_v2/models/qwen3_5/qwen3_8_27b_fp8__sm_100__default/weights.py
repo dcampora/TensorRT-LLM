@@ -21,6 +21,7 @@ def load_projection(
     weights: Mapping[str, torch.Tensor],
     names: Sequence[str],
     device: torch.device,
+    workspace: torch.Tensor,
 ) -> None:
     """Concatenate output blocks and convert to exponent-only FP8 scales."""
     tensors = [weights[name + ".weight"] for name in names]
@@ -44,6 +45,9 @@ def load_projection(
         value.to(device).contiguous(), block_scales.to(device).contiguous()
     )
     module.scales_mn = module.scales.T.float().contiguous()
+    if module.weight.shape[0] == 5120:
+        module.narrow_scales = module.scales_mn.repeat_interleave(2, dim=1)
+    module.workspace = workspace
 
 
 @torch.no_grad()
@@ -56,9 +60,10 @@ def load_model(
     decoder.embed_tokens.weight = weights[TEXT_PREFIX + "embed_tokens.weight"].to(device)
     decoder.final_norm = weights[TEXT_PREFIX + "norm.weight"].to(device)
     model.lm_head.weight.copy_(weights["lm_head.weight"])
+    decoder.gemm_workspace = torch.empty(16 * 1024 * 1024, device=device, dtype=torch.uint8)
 
     for index, layer in enumerate(decoder.layers):
-        load_layer(layer, f"{TEXT_PREFIX}layers.{index}.", weights, device)
+        load_layer(layer, f"{TEXT_PREFIX}layers.{index}.", weights, device, decoder.gemm_workspace)
 
     inv_freq = 1.0 / (
         decoder.config.rope_theta
@@ -73,7 +78,7 @@ def load_model(
 
     if model.draft_model is not None:
         draft = model.draft_model.mtp_layers[0]
-        load_layer(draft, "mtp.layers.0.", weights, device)
+        load_layer(draft, "mtp.layers.0.", weights, device, decoder.gemm_workspace)
         draft.fc = weights["mtp.fc.weight"].to(device)
         draft.embedding_norm = weights["mtp.pre_fc_norm_embedding.weight"].to(device)
         draft.hidden_norm = weights["mtp.pre_fc_norm_hidden.weight"].to(device)
@@ -82,21 +87,33 @@ def load_model(
 
 
 def load_layer(
-    layer: "DecoderLayer", prefix: str, weights: Mapping[str, torch.Tensor], device: torch.device
+    layer: "DecoderLayer",
+    prefix: str,
+    weights: Mapping[str, torch.Tensor],
+    device: torch.device,
+    workspace: torch.Tensor,
 ) -> None:
     """Load one decoder layer from its checkpoint prefix."""
     layer.pre_norm = weights[prefix + "input_layernorm.weight"].to(device)
     layer.post_norm = weights[prefix + "post_attention_layernorm.weight"].to(device)
     load_projection(
-        layer.gate_up, weights, [prefix + "mlp.gate_proj", prefix + "mlp.up_proj"], device
+        layer.gate_up,
+        weights,
+        [prefix + "mlp.gate_proj", prefix + "mlp.up_proj"],
+        device,
+        workspace,
     )
-    load_projection(layer.down, weights, [prefix + "mlp.down_proj"], device)
+    load_projection(layer.down, weights, [prefix + "mlp.down_proj"], device, workspace)
     if layer.is_linear:
         linear = prefix + "linear_attn."
         load_projection(
-            layer.input_proj, weights, [linear + "in_proj_qkv", linear + "in_proj_z"], device
+            layer.input_proj,
+            weights,
+            [linear + "in_proj_qkv", linear + "in_proj_z"],
+            device,
+            workspace,
         )
-        load_projection(layer.output_proj, weights, [linear + "out_proj"], device)
+        load_projection(layer.output_proj, weights, [linear + "out_proj"], device, workspace)
         layer.ba = torch.cat(
             [weights[linear + f"in_proj_{name}.weight"] for name in ("b", "a")]
         ).to(device)
@@ -111,7 +128,8 @@ def load_layer(
             weights,
             [attention + name + "_proj" for name in ("q", "k", "v")],
             device,
+            workspace,
         )
-        load_projection(layer.output_proj, weights, [attention + "o_proj"], device)
+        load_projection(layer.output_proj, weights, [attention + "o_proj"], device, workspace)
         layer.q_norm = weights[attention + "q_norm.weight"].to(device)
         layer.k_norm = weights[attention + "k_norm.weight"].to(device)

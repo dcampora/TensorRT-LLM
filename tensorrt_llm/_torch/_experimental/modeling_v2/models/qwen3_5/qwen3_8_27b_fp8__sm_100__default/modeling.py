@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Text decoder for the official Qwen3.8-27B block-scaled FP8 checkpoint."""
 
+import json
 from dataclasses import dataclass
 from itertools import accumulate
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +20,13 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
 from .... import disable_v2_by_default
 from . import weights
+from .draft_head import DraftVocabulary
+from .ops.activation import (
+    attention_gate_quantize,
+    gdn_norm_quantize,
+    residual_norm_quantize,
+    swiglu_quantize,
+)
 from .ops.attention import (
     attention_gate,
     prepare_qkv,
@@ -47,20 +56,35 @@ class BlockProjection(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        for name in ("weight", "scales", "scales_mn"):
+        for name in ("weight", "scales", "scales_mn", "narrow_scales", "workspace"):
             self.register_buffer(name, None)
 
     def forward(self, x: torch.Tensor, decode: bool) -> torch.Tensor:
-        rows = x.shape[0]
-        a, scales = block_quantize(x)
+        return self.quantized(*block_quantize(x), x.shape[0], decode)
+
+    def quantized(
+        self, a: torch.Tensor, scales: torch.Tensor, rows: int, decode: bool
+    ) -> torch.Tensor:
+        """Dispatch the measured SM100 tile for this packed activation shape."""
+        n, k = self.weight.shape
+        split_k = decode and rows == 1 and n == 5120
+        tiled = (
+            decode
+            and not split_k
+            and (
+                (n == 5120 and (64 <= rows <= 128 or (k == 6144 and rows <= 8)))
+                or (n != 5120 and (rows <= 8 or (n >= 16384 and rows == 32)))
+            )
+        )
         return block_matmul(
             a,
             scales,
             self.weight,
             self.scales,
-            self.scales_mn,
+            self.narrow_scales if tiled and n == 5120 else self.scales_mn,
             rows,
-            split_k=decode and rows == 1 and self.weight.shape[0] == 5120,
+            split_k,
+            self.workspace if tiled else None,
         )
 
 
@@ -250,8 +274,7 @@ class DecoderLayer(nn.Module):
                         convolved, ba, self.a_log, self.dt_bias, state, step.generation_slots
                     )
                 )
-        out = parts[0] if len(parts) == 1 else torch.cat(parts)
-        return gated_head_norm(out, p, self.gdn_norm)
+        return parts[0] if len(parts) == 1 else torch.cat(parts)
 
     def _verify_delta(self, projection: torch.Tensor, ba: torch.Tensor, step: Step) -> torch.Tensor:
         manager = step.metadata.kv_cache_manager
@@ -339,7 +362,25 @@ class DecoderLayer(nn.Module):
             if split == p.shape[0]:
                 return context
             return torch.cat((context, attention_gate(out[split:], p[split:])))
-        return attention_gate(out, p)
+        return out
+
+    def feed_forward(
+        self,
+        hidden: torch.Tensor,
+        residual: torch.Tensor,
+        decode: bool,
+        fused: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the post-attention residual and SwiGLU."""
+        if fused:
+            rows = hidden.shape[0]
+            normalized = residual_norm_quantize(
+                hidden, residual, self.post_norm, False, decode and rows <= 8
+            )
+            gate_up = self.gate_up.quantized(*normalized, rows, decode)
+            return self.down.quantized(*swiglu_quantize(gate_up), rows, decode), residual
+        hidden, residual = residual_norm(hidden, residual, self.post_norm)
+        return self.down(silu_and_mul(self.gate_up(hidden, decode)), decode), residual
 
     def forward(
         self,
@@ -349,16 +390,32 @@ class DecoderLayer(nn.Module):
         step: Step,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         decode = step.context_rows == 0
-        x, residual = residual_norm(x, residual, self.pre_norm)
-        projection = self.input_proj(x, decode)
+        fused = step.short_chunks is None
+        rows = x.shape[0]
+        if fused and residual is not None:
+            normalized = residual_norm_quantize(
+                x, residual, self.pre_norm, self.is_linear, decode and rows <= 8
+            )
+            projection = self.input_proj.quantized(*normalized, rows, decode)
+        else:
+            x, residual = residual_norm(x, residual, self.pre_norm)
+            projection = self.input_proj(x, decode)
         if self.is_linear:
             hidden = self._linear_attention(x, projection, step)
+            if fused:
+                activation = gdn_norm_quantize(hidden, projection, self.gdn_norm)
+            else:
+                hidden = gated_head_norm(hidden, projection, self.gdn_norm)
         else:
             hidden = self._full_attention(projection, rope, step)
-        hidden = self.output_proj(hidden, decode)
-        hidden, residual = residual_norm(hidden, residual, self.post_norm)
-        hidden = self.down(silu_and_mul(self.gate_up(hidden, decode)), decode)
-        return hidden, residual
+            if fused:
+                activation = attention_gate_quantize(hidden, projection)
+        hidden = (
+            self.output_proj.quantized(*activation, rows, decode)
+            if fused
+            else self.output_proj(hidden, decode)
+        )
+        return self.feed_forward(hidden, residual, decode, fused)
 
 
 class TokenEmbedding(nn.Module):
@@ -392,7 +449,7 @@ class Qwen38TextModel(DecoderModel):
                 for index, layer_type in enumerate(self.config.layer_types)
             ]
         )
-        for name in ("final_norm", "rope", "gate_workspace"):
+        for name in ("final_norm", "rope", "gate_workspace", "gemm_workspace"):
             self.register_buffer(name, None)
 
     def forward(
@@ -428,6 +485,7 @@ class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
     """Dense text-only Qwen3.8-27B FP8 on one SM100 GPU."""
 
     def __init__(self, config: "ModelConfig") -> None:
+        checkpoint_dir = config.pretrained_config.name_or_path
         text = config.pretrained_config.text_config
         config.pretrained_config = text
         if config.spec_config is not None:
@@ -438,6 +496,14 @@ class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
             hidden_size=text.hidden_size,
             vocab_size=text.vocab_size,
         )
+        self._draft_control_tokens = [text.bos_token_id, text.eos_token_id]
+        if self.spec_worker is not None and checkpoint_dir:
+            tokenizer_config = Path(checkpoint_dir, "tokenizer_config.json")
+            if tokenizer_config.is_file():
+                added_tokens = json.loads(tokenizer_config.read_text()).get(
+                    "added_tokens_decoder", {}
+                )
+                self._draft_control_tokens.extend(map(int, added_tokens))
 
     @classmethod
     def supports_spec_decode_fast_paths(cls, model_config: "ModelConfig") -> bool:
@@ -452,6 +518,13 @@ class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
     def load_weights(self, checkpoint: dict[str, torch.Tensor]) -> None:
         """Populate the target using the original HF keys."""
         weights.load_model(self, checkpoint)
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        if self.spec_worker is not None:
+            self.spec_worker.draft_head = DraftVocabulary(
+                self.lm_head.weight, self._draft_control_tokens
+            )
 
     def validate_request(self, request: "LlmRequest") -> None:
         """Reject image and video inputs for this text-only target."""

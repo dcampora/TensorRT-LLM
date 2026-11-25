@@ -46,7 +46,13 @@ def test_matmul(cell, certifying):
         torch.randint(-6, -1, (n // 128, k // 128), device="cuda", generator=generator).float()
     )
     a, sa = block_quantize(x)
-    args = (a, sa, w, sw, sw.T.contiguous(), rows, rows == 1)
+    scale_mn = sw.T.contiguous()
+    workspace = None
+    if cell.spec.get("tiled"):
+        workspace = torch.empty(16 << 20, device="cuda", dtype=torch.uint8)
+        if n == 5120:
+            scale_mn = scale_mn.repeat_interleave(2, dim=1)
+    args = (a, sa, w, sw, scale_mn, rows, rows == 1, workspace)
     certifying(block_matmul)
     assert_within_ulp(block_matmul(*args), block_matmul.reference(*args), 1.0, 0.5)
 

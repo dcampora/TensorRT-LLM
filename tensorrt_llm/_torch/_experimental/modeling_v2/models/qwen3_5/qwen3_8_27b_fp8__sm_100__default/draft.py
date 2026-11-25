@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from flashinfer import gemma_rmsnorm, silu_and_mul
 from torch import nn
 
 from .modeling import DecoderLayer, residual_norm
-from .ops.attention import attention_gate, prepare_qkv
+from .ops.activation import attention_gate_quantize, draft_input_norm
+from .ops.attention import prepare_qkv
 from .ops.paged_attention import attention_arguments, paged_attention
 
 if TYPE_CHECKING:
@@ -36,9 +36,14 @@ class DraftLayer(DecoderLayer):
         **kwargs: object,
     ) -> torch.Tensor:
         """Extend the draft cache using the runtime's shifted token stream."""
-        embed = gemma_rmsnorm(embed_tokens(input_ids), self.embedding_norm, 1e-6)
-        hidden = gemma_rmsnorm(hidden_states, self.hidden_norm, 1e-6)
-        hidden = F.linear(torch.cat((embed, hidden), dim=-1), self.fc)
+        inputs = draft_input_norm(
+            input_ids.contiguous(),
+            embed_tokens.weight,
+            hidden_states.contiguous(),
+            self.embedding_norm,
+            self.hidden_norm,
+        )
+        hidden = F.linear(inputs, self.fc)
         hidden, residual = residual_norm(hidden, None, self.pre_norm)
         context = attn_metadata.num_contexts
         generation = attn_metadata.num_seqs - context
@@ -56,9 +61,10 @@ class DraftLayer(DecoderLayer):
         )
         layer = attn_metadata.kv_cache_manager.layer_offsets[self.index]
         result = paged_attention(q, k, v, layer, attention_arguments(attn_metadata, predicted))
-        hidden = self.output_proj(attention_gate(result, projection), decode)
-        hidden, residual = residual_norm(hidden, residual, self.post_norm)
-        hidden = self.down(silu_and_mul(self.gate_up(hidden, decode)), decode)
+        hidden = self.output_proj.quantized(
+            *attention_gate_quantize(result, projection), projection.shape[0], decode
+        )
+        hidden, residual = self.feed_forward(hidden, residual, decode, fused=True)
         return residual_norm(hidden, residual, self.output_norm)[0]
 
     @staticmethod
