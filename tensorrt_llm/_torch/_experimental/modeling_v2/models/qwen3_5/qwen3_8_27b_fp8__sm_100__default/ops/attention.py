@@ -6,6 +6,7 @@ import torch
 
 from .....catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
 from ..kernels import attention
+from ..kernels.cache_append import append_kv
 from ..kernels.short_paged import short_paged
 
 
@@ -26,8 +27,8 @@ class PrepareQkv(OpWrapper):
         rope: torch.Tensor,
         pos: torch.Tensor,
         tiled: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return attention.qkv(projection, wq, wk, rope, pos, tiled_prefill=tiled)
+    ) -> torch.Tensor:
+        return attention.packed_qkv(projection, wq, wk, rope, pos, tiled)
 
     def reference(
         self,
@@ -37,7 +38,7 @@ class PrepareQkv(OpWrapper):
         rope: torch.Tensor,
         pos: torch.Tensor,
         tiled: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         qg, k, v = projection.split((12288, 1024, 1024), dim=-1)
         q = qg.view(-1, 24, 512)[..., :256]
         k = k.view(-1, 4, 256)
@@ -55,7 +56,7 @@ class PrepareQkv(OpWrapper):
                 (first * cos - second * sin, second * cos + first * sin, rest), dim=-1
             )
             results.append(rotated.to(projection.dtype))
-        return *results, v.view(-1, 4, 256)
+        return torch.cat((results[0].flatten(1), results[1].flatten(1), v), dim=-1)
 
 
 class AttentionGate(OpWrapper):
@@ -77,8 +78,8 @@ class ShortCausalAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
-        Cell("Two packed short contexts", dict(lengths=(12, 32))),
-        Cell("Two query tiles and a partial final key tile", dict(lengths=(103,))),
+        Cell("Two packed short contexts", dict(lengths=(12, 32), packed=False)),
+        Cell("Strided QKV and a partial final key tile", dict(lengths=(103,), packed=True)),
     )
 
     def __call__(
@@ -135,11 +136,11 @@ class ShortPagedAttention(OpWrapper):
     CELLS = (
         Cell(
             "Nonconsecutive BF16 KV pages with a mixed-batch table offset",
-            dict(rows=3, contexts=2, tokens=1),
+            dict(rows=3, contexts=2, tokens=1, packed=False),
         ),
         Cell(
             "Linear verification rows and a long-history row left intact",
-            dict(rows=4, contexts=0, tokens=2),
+            dict(rows=4, contexts=0, tokens=2, packed=True),
         ),
     )
 
@@ -186,3 +187,45 @@ class ShortPagedAttention(OpWrapper):
 
 
 short_paged_attention = ShortPagedAttention()
+
+
+class AppendShortContextKV(OpWrapper):
+    """Write BF16 K/V into the physical pages of fresh contexts."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell("Fresh single context across page boundaries", dict(lengths=(95,), stride=2)),
+        Cell(
+            "Fresh ragged packed contexts with strided pages", dict(lengths=(12, 32, 57), stride=3)
+        ),
+    )
+
+    def __call__(
+        self,
+        qkv: torch.Tensor,
+        pages: torch.Tensor,
+        table: torch.Tensor,
+        divisor: int,
+        offsets: torch.Tensor,
+        seq_ids: torch.Tensor | None,
+    ) -> None:
+        append_kv(qkv, pages, table, divisor, offsets, seq_ids)
+
+    def reference(
+        self,
+        qkv: torch.Tensor,
+        pages: torch.Tensor,
+        table: torch.Tensor,
+        divisor: int,
+        offsets: torch.Tensor,
+        seq_ids: torch.Tensor | None,
+    ) -> None:
+        page_size = pages.shape[-2]
+        limits = offsets.tolist()
+        for seq, (start, end) in enumerate(zip(limits, limits[1:])):
+            tokens = torch.arange(end - start, device=qkv.device)
+            page = table[seq, tokens // page_size] // divisor
+            pages[page, :, :, tokens % page_size] = qkv[start:end, 6144:].reshape(-1, 2, 4, 256)
+
+
+append_short_context_kv = AppendShortContextKV()

@@ -52,7 +52,7 @@ class DraftLayer(DecoderLayer):
         decode = not context
         accelerate = not has_short_generation(attn_metadata) and (decode or hidden.shape[0] > 128)
         projection = self.input_proj(hidden, decode, accelerate)
-        q, k, v = prepare_qkv(
+        qkv = prepare_qkv(
             projection,
             self.q_norm,
             self.k_norm,
@@ -61,7 +61,7 @@ class DraftLayer(DecoderLayer):
             tiled=not decode,
         )
         layer = attn_metadata.kv_cache_manager.layer_offsets[self.index]
-        result = paged_attention(q, k, v, layer, attention_arguments(attn_metadata, predicted))
+        result = paged_attention(qkv, layer, attention_arguments(attn_metadata, predicted))
         hidden = self.output_proj.quantized(
             *attention_gate_quantize(result, projection),
             projection.shape[0],

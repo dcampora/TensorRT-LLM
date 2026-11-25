@@ -5,8 +5,8 @@
 import torch
 import triton as tr
 import triton.language as tl
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+
+from .short_solve import solve_short
 
 
 @tr.jit
@@ -46,37 +46,6 @@ def _make_lower(K, G, B, START, CHUNKS, A, SCAN, T: tl.constexpr):
     base = (chunk * 48 + h) * T
     tl.store(A + (base + t[:, None]) * T + t[None, :], lower)
     tl.store(SCAN + base + t, cum)
-
-
-@gluon.jit
-def _solve(LOWER, START, CHUNKS, A, T: gl.constexpr):
-    C: gl.constexpr = 16
-    chunk = gl.program_id(0)
-    h = gl.program_id(1)
-    part = gl.program_id(2)
-    seq = gl.load(CHUNKS + chunk * 2)
-    order = gl.load(CHUNKS + chunk * 2 + 1)
-    start = gl.load(START + seq) + order * T
-    end = gl.load(START + seq + 1)
-    # Keep the original row reduction tree while assigning columns to more CTAs.
-    layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 2], [4, 1], [1, 0])
-    row_layout: gl.constexpr = gl.SliceLayout(1, layout)
-    col_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    r = gl.arange(0, T, layout=row_layout)
-    c = part * C + gl.arange(0, C, layout=col_layout)
-    base = (chunk * 48 + h) * T
-    result = gl.full((T, C), 0, gl.float32, layout)
-    for cur in range(1, gl.minimum(T, end - start)):
-        offset = LOWER + (base + cur) * T
-        coeff = gl.load(offset + c)
-        forward = gl.load(offset + r)
-        row = coeff + gl.sum(forward[:, None] * result, 0)
-        result = gl.where(r[:, None] == cur, row[None, :], result)
-    result += (r[:, None] == c[None, :]).to(gl.float32)
-    stores: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
-    out_r = gl.arange(0, T, layout=gl.SliceLayout(1, stores))
-    out_c = part * C + gl.arange(0, C, layout=gl.SliceLayout(0, stores))
-    gl.store(A + (base + out_r[:, None]) * T + out_c[None, :], gl.convert_layout(result, stores))
 
 
 @tr.jit
@@ -153,23 +122,14 @@ def chunked_delta(conv, gates, beta, offsets, chunks, chunk_starts, max_len, sta
     qk = torch.empty((rows, 4096), dtype=torch.bfloat16, device=conv.device)
     out = torch.empty((rows, 48, 128), dtype=torch.bfloat16, device=conv.device)
     tile = 64
-    inverted = torch.empty(
-        (chunks.shape[0], 48, tile, tile), device=conv.device, dtype=torch.bfloat16
-    )
+
     scan = torch.empty((chunks.shape[0], 48, tile), device=conv.device, dtype=torch.float32)
     _unit_qk[(rows, 32)](conv, qk, num_warps=1)
-    lower = torch.empty_like(inverted, dtype=torch.float32)
+    lower = torch.empty((chunks.shape[0], 48, tile, tile), device=conv.device, dtype=torch.float32)
     _make_lower[(chunks.shape[0], 48)](
         qk, gates, beta, offsets, chunks, lower, scan, tile, num_warps=4
     )
-    _solve[(chunks.shape[0], 48, tile // 16)](
-        lower,
-        offsets,
-        chunks,
-        inverted,
-        tile,
-        num_warps=4,
-    )
+    inverted = solve_short(lower, offsets, chunks)
     _apply[(offsets.numel() - 1, 48, 4)](
         conv,
         qk,

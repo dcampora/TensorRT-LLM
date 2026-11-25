@@ -28,6 +28,7 @@ from .ops.activation import (
     swiglu_quantize,
 )
 from .ops.attention import (
+    append_short_context_kv,
     attention_gate,
     prepare_qkv,
     short_causal_attention,
@@ -35,7 +36,7 @@ from .ops.attention import (
 )
 from .ops.gates import fixed_gate_projection
 from .ops.matmul_accelerated import accelerated_block_matmul
-from .ops.paged_attention import attention_arguments, paged_attention
+from .ops.paged_attention import attention_arguments, paged_attention, paged_kv_view
 from .ops.projection import block_matmul, block_quantize
 from .ops.recurrent import (
     causal_convolution,
@@ -409,7 +410,7 @@ class DecoderLayer(nn.Module):
         )
 
     def _full_attention(self, p: torch.Tensor, rope: torch.Tensor, step: Step) -> torch.Tensor:
-        q, k, v = prepare_qkv(
+        qkv = prepare_qkv(
             p,
             self.q_norm,
             self.k_norm,
@@ -417,45 +418,50 @@ class DecoderLayer(nn.Module):
             step.positions,
             tiled=bool(step.context_rows),
         )
-        layer = step.metadata.kv_cache_manager.layer_offsets[self.index]
-        out = paged_attention(q, k, v, layer, step.attention_args)
-        manager = step.metadata.kv_cache_manager
+        md = step.metadata
+        short = step.short_contexts
+        split = step.context_rows
+        if short is not None and short.rows is None and split == p.shape[0]:
+            pages, table, divisor = paged_kv_view(md, self.index)
+            seq_ids = md.mamba_metadata.seq_idx if md.num_contexts > 1 else None
+            append_short_context_kv(qkv, pages, table, divisor, short.offsets, seq_ids)
+            return self._short_attention(qkv, p, short)
+
+        layer = md.kv_cache_manager.layer_offsets[self.index]
+        out = paged_attention(qkv, layer, step.attention_args)
         if step.short_generation:
-            pages = manager.get_buffers(self.index, kv_layout="HND")
-            offset_scale = manager.get_layer_page_index_scale(self.index)
-            # The V2 view is indexed by K/V pairs when every slot starts
-            # on a pair boundary. Otherwise its leading stride spans a slot.
-            divisor = 2 if offset_scale % 2 == 0 else offset_scale
-            pool = int(step.metadata.host_kv_cache_pool_mapping[layer, 0])
-            table = step.metadata.kv_cache_block_offsets[pool, :, 0, :]
-            split = step.context_rows
+            pages, table, divisor = paged_kv_view(md, self.index)
+            query = qkv[split:, :6144].view(-1, 24, 256)
             short_paged_attention(
-                q[split:],
+                query,
                 pages,
                 table,
                 step.positions[split:],
                 out[split:],
                 divisor,
-                step.metadata.num_contexts,
+                md.num_contexts,
                 step.predicted,
             )
-        short = step.short_contexts
-        if short is not None:
-            split = step.context_rows
-            context = short_causal_attention(
-                short.select(q[:split]),
-                short.select(k[:split]),
-                short.select(v[:split]),
-                short.select(p[:split]),
-                short.offsets,
-                short.chunks,
-            )
-            if short.rows is not None:
-                return attention_gate(out, p).index_copy_(0, short.rows, context)
-            if split == p.shape[0]:
-                return context
-            return torch.cat((context, attention_gate(out[split:], p[split:])))
-        return out
+        if short is None:
+            return out
+        context = self._short_attention(qkv[:split], p[:split], short)
+        if short.rows is not None:
+            return attention_gate(out, p).index_copy_(0, short.rows, context)
+        return torch.cat((context, attention_gate(out[split:], p[split:])))
+
+    @staticmethod
+    def _short_attention(
+        qkv: torch.Tensor, projection: torch.Tensor, short: ShortContexts
+    ) -> torch.Tensor:
+        q, k, v = qkv.split((6144, 1024, 1024), dim=-1)
+        return short_causal_attention(
+            short.select(q.view(-1, 24, 256)),
+            short.select(k.view(-1, 4, 256)),
+            short.select(v.view(-1, 4, 256)),
+            short.select(projection),
+            short.offsets,
+            short.chunks,
+        )
 
     def feed_forward(
         self,

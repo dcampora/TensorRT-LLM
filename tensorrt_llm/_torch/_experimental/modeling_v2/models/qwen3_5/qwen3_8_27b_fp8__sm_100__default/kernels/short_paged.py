@@ -15,6 +15,7 @@ def _partial(
     POSITIONS,
     PART,
     LSE,
+    Q_STRIDE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     KV_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
@@ -44,7 +45,7 @@ def _partial(
         slot = (block // INDEX_DIVISOR).to(tl.int64)
         offset = slot * PAGE_STRIDE + (kv_head * PAGE_SIZE + tokens % PAGE_SIZE) * 256
         query = tl.load(
-            Q + (row * 24 + kv_head * 6 + head[:, None]) * 256 + d[None, :],
+            Q + row * Q_STRIDE + (kv_head * 6 + head[:, None]) * 256 + d[None, :],
             head[:, None] < 6,
             0,
         )
@@ -114,6 +115,7 @@ def short_paged(
         positions,
         parts,
         lse,
+        q.stride(0),
         pages.stride(0),
         pages.stride(1),
         table.stride(0),

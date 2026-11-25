@@ -43,16 +43,30 @@ def attention_arguments(md: "TrtllmAttentionMetadata", predicted: int) -> dict:
     )
 
 
-def paged_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: int, arguments: dict
-) -> torch.Tensor:
+def paged_kv_view(
+    md: "TrtllmAttentionMetadata", layer: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return the BF16 physical pages and table for the model layer."""
+    manager = md.kv_cache_manager
+    pages = manager.get_buffers(layer, kv_layout="HND")
+    assert pages is not None
+    scale = manager.get_layer_page_index_scale(layer)
+    # Even scales index contiguous K/V pairs. Other slots use a strided view.
+    divisor = 2 if scale % 2 == 0 else scale
+    local_layer = manager.layer_offsets[layer]
+    pool = int(md.host_kv_cache_pool_mapping[local_layer, 0])
+    table = md.kv_cache_block_offsets[pool, :, 0, :]
+    return pages, table, divisor
+
+
+def paged_attention(qkv: torch.Tensor, layer: int, arguments: dict) -> torch.Tensor:
     """Append packed, pre-rotated keys and values, then compute causal GQA."""
-    rows = q.shape[0]
+    rows = qkv.shape[0]
     return thop_attention(
-        q=torch.cat((q.flatten(1), k.flatten(1), v.flatten(1)), dim=-1),
+        q=qkv,
         k=None,
         v=None,
-        output=q.new_empty((rows, 6144)),
+        output=qkv.new_empty((rows, 6144)),
         local_layer_idx=layer,
         num_heads=24,
         num_kv_heads=4,

@@ -996,6 +996,7 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     # The GDN mixer implements the in-forward snapshot split.
     _supports_inforward_snapshot = True
     _skips_steady_state_index_upload = True
+    _gdn_first_row_checkpoint = False
 
     @override
     def __init__(

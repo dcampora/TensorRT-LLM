@@ -362,3 +362,45 @@ divergences.
 | 1 | 128 | 1024 | 66.79 | 4.015 | 249.08 |
 | 1 | 1024 | 1024 | 58.35 | 3.635 | 275.09 |
 | 1 | 4096 | 1024 | 146.79 | 3.887 | 257.28 |
+
+With both graph families captured at each batch size, the HTTP endpoint
+matched every isolated development continuation in homogeneous batches
+at concurrency 1, 32 and 128 and in mixed short/long batches at
+concurrency 4, 32 and 128. The short streaming sweep used the same inputs
+as the first-row checkpoint sweep.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 292.25 | 66.19 |
+| 1024 | 1024 | 32 | 32 | 3876.23 | 1021.08 |
+| 1024 | 1024 | 128 | 128 | 6558.57 | 2552.01 |
+
+## Packed QKV and fresh short prefill
+
+The Q/K normalization and rotary kernels write one packed BF16 tensor
+in the native attention layout. The target's short context and short
+decode kernels read the corresponding strided views. A fresh short-only
+prefill writes its keys and values directly using the layer's physical
+page-table offsets and runs the FP32 causal reduction once. Mixed or
+continued contexts still run the native paged operation.
+
+The warp-local triangular solve is adapted from `short_solve.cu` in
+aegis-engines. It matched the preceding BF16 solution bit for bit on
+single and packed context lengths from 8 through 128. On the two-tile
+128-token case the isolated solve fell from 64.27 to 25.47 us per layer.
+The runtime-compiled launcher belongs in the family `csrc/` in a full
+build. Scoring computes the same full-vocabulary log-softmax in
+64-position groups to limit host FP32 scratch for long input sequences.
+
+All 66 target operation tests passed, including strided QKV and physical
+KV page writes. The CPU hybrid-manager suite passed 257 tests with one
+CUDA-only skip. The complete development oracle and both EOS checks
+passed with the same scores and continuations. The OpenAI endpoint also
+matched every isolated development continuation at concurrency 1, 32,
+and 128.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 61.56 | 3.709 | 269.58 |
+| 1 | 1024 | 1024 | 65.92 | 3.505 | 285.33 |
+| 1 | 4096 | 1024 | 141.69 | 3.825 | 261.46 |

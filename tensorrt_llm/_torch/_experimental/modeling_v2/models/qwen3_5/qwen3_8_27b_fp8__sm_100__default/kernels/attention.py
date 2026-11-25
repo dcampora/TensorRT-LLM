@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Adapted from aegis-engines qwen3.8-27b-fp8-batched, kernels.py (114cf57c911e)."""
+"""Packed attention from aegis-engines kernels.py (114cf57c911e)."""
 
 import torch
 import triton as tr
@@ -8,192 +8,93 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-MATCH_ROUNDING = True
-ROUND_ATTN_GATE = False
-
 
 @tr.jit
-def _qkv(
-    X,
-    WQ,
-    WK,
-    ROPE,
-    POS,
-    SLOTS,
-    Q,
-    K,
-    V,
-    CK,
-    CV,
-    SELECTED,
-    AK,
-    AV,
-    L: tl.constexpr,
-    DECODE: tl.constexpr,
-    CACHE: tl.constexpr,
-    SELECTED_COUNT: tl.constexpr,
-):
+def _pack_qkv(X, WQ, WK, ROPE, POS, QKV):
     row = tl.program_id(0)
-    h = tl.program_id(1)
-    d = tl.arange(0, 256)
-    p = tl.load(POS + row)
-    query_row = row
-    keep = True
-    if SELECTED is not None:
-        query_row = row % SELECTED_COUNT
-        keep = (h >= 24) | (tl.load(SELECTED + query_row) == row)
-    if keep:
-        if h < 28:
-            is_q = h < 24
-            offset = tl.where(is_q, h * 512, 12288 + (h - 24) * 256)
-            xptr = X + row * 14336 + offset
-            x = tl.load(xptr + d).to(tl.float32)
-            w = tl.load(tl.where(is_q, WQ, WK) + d).to(tl.float32)
-            inv = tl.rsqrt(tl.sum(x * x, 0) * (1.0 / 256.0) + 1.0e-6)
-            x = (x * inv * (1.0 + w)).to(tl.bfloat16).to(tl.float32)
-            dr = d ^ 32
-            rot = tl.load(xptr + dr, d < 64, 0).to(tl.float32)
-            wr = tl.load(tl.where(is_q, WQ, WK) + dr, d < 64, 0).to(tl.float32)
-            rot = (rot * inv * (1.0 + wr)).to(tl.bfloat16).to(tl.float32)
-            cos = tl.load(ROPE + p * 64 + d % 32, d < 64, 1)
-            sin = tl.load(ROPE + p * 64 + 32 + d % 32, d < 64, 0)
-            y = tl.where(d < 64, x * cos + tl.where(d < 32, -rot, rot) * sin, x)
-            if h < 24:
-                tl.store(Q + (query_row * 24 + h) * 256 + d, y)
-            else:
-                if not DECODE:
-                    tl.store(K + (row * 4 + h - 24) * 256 + d, y)
-                if CACHE:
-                    slot = row if SLOTS is None else tl.load(SLOTS + row)
-                    if AK is not None and row == tl.num_programs(0) - 1:
-                        tl.store(AK + (h - 24) * 256 + d, y)
-                    else:
-                        tl.store(CK + ((slot * L + p) * 4 + h - 24) * 256 + d, y)
-        else:
-            v = tl.load(X + row * 14336 + 13312 + (h - 28) * 256 + d)
-            if not DECODE:
-                tl.store(V + (row * 4 + h - 28) * 256 + d, v)
-            if CACHE:
-                slot = row if SLOTS is None else tl.load(SLOTS + row)
-                if AV is not None and row == tl.num_programs(0) - 1:
-                    tl.store(AV + (h - 28) * 256 + d, v)
-                else:
-                    tl.store(CV + ((slot * L + p) * 4 + h - 28) * 256 + d, v)
+    head = tl.program_id(1)
+    channel = tl.arange(0, 256)
+    position = tl.load(POS + row)
+    if head < 28:
+        query = head < 24
+        offset = tl.where(query, head * 512, 12288 + (head - 24) * 256)
+        ptr = X + row * 14336 + offset
+        values = tl.load(ptr + channel).to(tl.float32)
+        weights = tl.where(query, WQ, WK)
+        w = tl.load(weights + channel).to(tl.float32)
+        inverse = tl.rsqrt(tl.sum(values * values, 0) * (1.0 / 256.0) + 1e-6)
+        y = (values * inverse * (1.0 + w)).to(tl.bfloat16).to(tl.float32)
+        rotary = channel ^ 32
+        alternate = tl.load(ptr + rotary, channel < 64, 0.0).to(tl.float32)
+        alt_weight = tl.load(weights + rotary, channel < 64, 0.0).to(tl.float32)
+        alternate = (alternate * inverse * (1.0 + alt_weight)).to(tl.bfloat16).to(tl.float32)
+        cosine = tl.load(ROPE + position * 64 + channel % 32, channel < 64, 1.0)
+        sine = tl.load(ROPE + position * 64 + 32 + channel % 32, channel < 64, 0.0)
+        y = tl.where(
+            channel < 64, y * cosine + tl.where(channel < 32, -alternate, alternate) * sine, y
+        )
+    else:
+        y = tl.load(X + row * 14336 + 13312 + (head - 28) * 256 + channel).to(tl.float32)
+    tl.store(QKV + row * 8192 + head * 256 + channel, y)
 
 
 @gluon.jit
-def _qkv_prefill(
-    X, WQ, WK, ROPE, POS, SLOTS, Q, K, V, CK, CV, L: gl.constexpr, SOURCE: gl.constexpr
-):
+def _pack_qkv_tiled(X, WQ, WK, ROPE, POS, QKV):
     group, row = gl.program_id(0), gl.program_id(1)
     layout: gl.constexpr = gl.BlockedLayout([1, 1, 2], [1, 1, 32], [4, 1, 1], [2, 0, 1])
-    h_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, layout))
-    part_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, layout))
-    d_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, layout))
-    head = group * 4 + gl.arange(0, 4, layout=h_layout)
-    part = gl.arange(0, 4, layout=part_layout)
-    lane = gl.arange(0, 64, layout=d_layout)
-    column = part[None, :, None] * 64 + lane[None, None, :]
+    head = group * 4 + gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, layout)))
+    part = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
+    lane = gl.arange(0, 64, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
+    channel = part[None, :, None] * 64 + lane[None, None, :]
     pos = gl.load(POS + row)
-    slot = gl.load(SLOTS + row) if SLOTS is not None else row
     if group < 7:
-        is_query = group < 6
-        head_offset = gl.where(is_query, head * 512, 12288 + (head - 24) * 256)
-        source = X + row * SOURCE + head_offset[:, None, None]
-        weights = gl.where(is_query, WQ, WK)
-        raw = gl.load(source + column).to(gl.float32)
-        weight = gl.load(weights + column).to(gl.float32)
-        # Keep the four 64-channel reductions used by the single-head kernel.
-        partials = gl.sum(raw * raw, axis=2)
-        inv = gl.rsqrt(gl.sum(partials, axis=1) * (1.0 / 256.0) + 1.0e-6)
-        y = (raw * inv[:, None, None] * (1.0 + weight)).to(gl.bfloat16).to(gl.float32)
-        rotary = column ^ 32
-        rotate = gl.load(source + rotary, column < 64, 0.0).to(gl.float32)
-        rotate_w = gl.load(weights + rotary, column < 64, 0.0).to(gl.float32)
-        rotate = (rotate * inv[:, None, None] * (1.0 + rotate_w)).to(gl.bfloat16).to(gl.float32)
-        angle = ROPE + pos * 64 + column % 32
-        cosine = gl.load(angle, column < 64, 1.0)
-        sine = gl.load(angle + 32, column < 64, 0.0)
-        y = gl.where(column < 64, y * cosine + gl.where(column < 32, -rotate, rotate) * sine, y)
-        if is_query:
-            gl.store(Q + (row * 24 + head[:, None, None]) * 256 + column, y)
-        else:
-            key = head[:, None, None] - 24
-            gl.store(K + (row * 4 + key) * 256 + column, y)
-            if CK is not None:
-                gl.store(CK + ((slot * L + pos) * 4 + key) * 256 + column, y)
-    else:
-        value = head[:, None, None] - 28
-        values = gl.load(X + row * SOURCE + 13312 + value * 256 + column)
-        gl.store(V + (row * 4 + value) * 256 + column, values)
-        if CV is not None:
-            gl.store(CV + ((slot * L + pos) * 4 + value) * 256 + column, values)
-
-
-def qkv(
-    x,
-    wq,
-    wk,
-    rope,
-    pos,
-    cache=None,
-    slots=None,
-    decode=False,
-    selected=None,
-    alternate=None,
-    tiled_prefill=False,
-):
-    m = x.shape[0]
-    q = torch.empty(
-        (m if selected is None else selected.numel(), 24, 256), dtype=x.dtype, device=x.device
-    )
-    k = None if decode else torch.empty((m, 4, 256), dtype=x.dtype, device=x.device)
-    v = None if decode else torch.empty_like(k)
-    ck, cv = cache if cache is not None else (None, None)
-    cache_len = 0 if ck is None else ck.shape[1]
-    ak, av = alternate if alternate is not None else (None, None)
-    if tiled_prefill and not decode and m >= 128:
-        _qkv_prefill[(8, m)](
-            x,
-            wq,
-            wk,
-            rope,
-            pos,
-            slots,
-            q,
-            k,
-            v,
-            ck,
-            cv,
-            cache_len,
-            x.shape[1],
-            num_warps=4,
-            enable_fp_fusion=MATCH_ROUNDING,
+        query = group < 6
+        offset = gl.where(query, head * 512, 12288 + (head - 24) * 256)
+        source = X + row * 14336 + offset[:, None, None]
+        weights = gl.where(query, WQ, WK)
+        values = gl.load(source + channel).to(gl.float32)
+        w = gl.load(weights + channel).to(gl.float32)
+        parts = gl.sum(values * values, axis=2)
+        inverse = gl.rsqrt(gl.sum(parts, axis=1) * (1.0 / 256.0) + 1e-6)
+        y = (values * inverse[:, None, None] * (1.0 + w)).to(gl.bfloat16).to(gl.float32)
+        rotary = channel ^ 32
+        alternate = gl.load(source + rotary, channel < 64, 0.0).to(gl.float32)
+        alt_weight = gl.load(weights + rotary, channel < 64, 0.0).to(gl.float32)
+        alternate = (
+            (alternate * inverse[:, None, None] * (1.0 + alt_weight)).to(gl.bfloat16).to(gl.float32)
+        )
+        angle = ROPE + pos * 64 + channel % 32
+        cosine = gl.load(angle, channel < 64, 1.0)
+        sine = gl.load(angle + 32, channel < 64, 0.0)
+        y = gl.where(
+            channel < 64, y * cosine + gl.where(channel < 32, -alternate, alternate) * sine, y
         )
     else:
-        _qkv[(m, 32)](
-            x,
-            wq,
-            wk,
-            rope,
-            pos,
-            slots,
-            q,
-            k,
-            v,
-            ck,
-            cv,
-            selected,
-            ak,
-            av,
-            cache_len,
-            decode,
-            cache is not None,
-            0 if selected is None else selected.numel(),
-            num_warps=4,
-            enable_fp_fusion=MATCH_ROUNDING,
+        y = gl.load(X + row * 14336 + 13312 + (head[:, None, None] - 28) * 256 + channel).to(
+            gl.float32
         )
-    return q, k, v
+    gl.store(QKV + row * 8192 + head[:, None, None] * 256 + channel, y)
+
+
+def packed_qkv(
+    x: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    rope: torch.Tensor,
+    positions: torch.Tensor,
+    tiled: bool,
+) -> torch.Tensor:
+    """Pack normalized Q, K and unchanged V without separate staging buffers."""
+    rows = x.shape[0]
+    qkv = torch.empty((rows, 8192), device=x.device, dtype=x.dtype)
+    if tiled and rows >= 128:
+        _pack_qkv_tiled[(8, rows)](x, wq, wk, rope, positions, qkv, num_warps=4)
+    else:
+        _pack_qkv[(rows, 32)](x, wq, wk, rope, positions, qkv, num_warps=4)
+    return qkv
+
+
+ROUND_ATTN_GATE = False
 
 
 @tr.jit
@@ -226,6 +127,9 @@ def _dense_causal(
     START,
     PAIRS,
     Y,
+    Q_STRIDE: tl.constexpr,
+    K_STRIDE: tl.constexpr,
+    V_STRIDE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
     FP32_P: tl.constexpr,
@@ -241,15 +145,17 @@ def _dense_causal(
     j = tl.arange(0, BN)
     d = tl.arange(0, 256)
     value_cols = tl.program_id(2) * VALUE_TILE + tl.arange(0, VALUE_TILE)
-    q = tl.load(Q + ((start + i[:, None]) * 24 + h) * 256 + d[None, :], i[:, None] < size, 0)
-    kv = (start * 4 + h // 6) * 256
+    q = tl.load(Q + (start + i[:, None]) * Q_STRIDE + h * 256 + d[None, :], i[:, None] < size, 0)
+    base = (h // 6) * 256
     accum = tl.full((BM, VALUE_TILE), 0.0, tl.float32)
     prev = tl.full((BM,), -1.0e20, tl.float32)
     den = tl.full((BM,), 0.0, tl.float32)
     for look in range(tl.cdiv(tl.minimum((order + 1) * BM, size), BN)):
         t = look * BN + j
-        kk = tl.load(K + kv + t[None, :] * 1024 + d[:, None], t[None, :] < size, 0)
-        vv = tl.load(V + kv + t[:, None] * 1024 + value_cols[None, :], t[:, None] < size, 0)
+        kk = tl.load(K + (start + t[None, :]) * K_STRIDE + base + d[:, None], t[None, :] < size, 0)
+        vv = tl.load(
+            V + (start + t[:, None]) * V_STRIDE + base + value_cols[None, :], t[:, None] < size, 0
+        )
         s = tl.dot(q, kk) * 0.0625
         s = tl.where((t[None, :] <= i[:, None]) & (t[None, :] < size), s, -float("inf"))
         peak = tl.maximum(prev, tl.max(s, 1))
@@ -285,6 +191,9 @@ def dense_causal(q, k, v, p, offsets, pairs, fp32_p=False, value_tile=256):
         offsets,
         pairs,
         y,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
         64,
         tile,
         fp32_p,

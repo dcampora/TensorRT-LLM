@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_fp8__sm_100__default.ops.attention import (  # noqa: E501
+    append_short_context_kv,
     attention_gate,
     prepare_qkv,
     short_causal_attention,
@@ -35,11 +36,11 @@ def test_qkv(cell, certifying):
     positions = torch.arange(10, rows + 10, dtype=torch.int32, device="cuda")
     args = (_rand(rows, 14336), _rand(256), _rand(256), rope, positions, cell.spec["tiled"])
     certifying(prepare_qkv)
-    q, k, v = prepare_qkv(*args)
-    rq, rk, rv = prepare_qkv.reference(*args)
-    assert_within_ulp(q, rq, 1.0, 0.5)
-    assert_within_ulp(k, rk, 1.0, 0.5)
-    torch.testing.assert_close(v, rv, atol=0, rtol=0)
+    packed = prepare_qkv(*args)
+    expected = prepare_qkv.reference(*args)
+    assert packed.is_contiguous()
+    assert_within_ulp(packed[:, :7168], expected[:, :7168], 1.0, 0.5)
+    torch.testing.assert_close(packed[:, 7168:], expected[:, 7168:], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("cell", attention_gate.CELLS, ids=lambda cell: cell.why)
@@ -66,10 +67,13 @@ def test_short_attention(cell, certifying):
         device="cuda",
         dtype=torch.int32,
     )
+    q, k, v = _rand(rows, 8192).split((6144, 1024, 1024), dim=-1)
+    if not cell.spec["packed"]:
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     args = (
-        _rand(rows, 24, 256),
-        _rand(rows, 4, 256),
-        _rand(rows, 4, 256),
+        q.view(-1, 24, 256),
+        k.view(-1, 4, 256),
+        v.view(-1, 4, 256),
         _rand(rows, 14336),
         offsets,
         pairs,
@@ -87,6 +91,8 @@ def test_short_paged_attention(cell, certifying):
     torch.manual_seed(32)
     rows, contexts, tokens = (cell.spec[name] for name in ("rows", "contexts", "tokens"))
     q = _rand(rows, 24, 256)
+    if cell.spec["packed"]:
+        q = _rand(rows, 32, 256)[:, :24]
     pages = _rand(40, 2, 4, 32, 256)[::2]
     table = torch.stack(
         [
@@ -104,3 +110,29 @@ def test_short_paged_attention(cell, certifying):
     assert_within_ulp(output, expect, 2.0, 1.0)
     if rows == 4:
         torch.testing.assert_close(output[2:], expect[2:], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("cell", append_short_context_kv.CELLS, ids=lambda cell: cell.why)
+def test_append_short_context_kv(cell, certifying):
+    """Write exactly the K and V rows selected by the layer's page table."""
+    torch.manual_seed(17)
+    lengths = list(cell.spec["lengths"])
+    stride = cell.spec["stride"]
+    rows = sum(lengths)
+    packed = _rand(rows, 8192)
+    pages = _rand(32 * stride, 2, 4, 32, 256)[::stride]
+    table = (
+        torch.randperm(32, device="cuda", dtype=torch.int32)[: len(lengths) * 3].reshape(-1, 3)
+        * stride
+    )
+    offsets = torch.tensor(list(accumulate(lengths, initial=0)), device="cuda", dtype=torch.int32)
+    ids = torch.tensor(
+        [seq for seq, n in enumerate(lengths) for _ in range(n)], device="cuda", dtype=torch.int32
+    )
+    if len(lengths) == 1:
+        ids = None
+    expected = pages.clone()
+    certifying(append_short_context_kv)
+    append_short_context_kv(packed, pages, table, stride, offsets, ids)
+    append_short_context_kv.reference(packed, expected, table, stride, offsets, ids)
+    torch.testing.assert_close(pages, expected, atol=0, rtol=0)

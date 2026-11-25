@@ -94,16 +94,25 @@ def handle(llm: "LLM", request: dict, eos_ids: list[int], vocab_size: int) -> di
         detokenize=False,
     )
     result = llm.generate(ids, params, use_tqdm=False)
-    logits = result.context_logits[:count].float()
-    logprobs = torch.log_softmax(logits, dim=-1)
-    response["top1"] = logits.argmax(dim=-1).tolist()
-    if top_k is not None:
-        values, indices = logprobs.topk(top_k, dim=-1)
-        response["top_k"] = [list(zip(i, v)) for i, v in zip(indices.tolist(), values.tolist())]
-    if probes is not None:
-        response["logprobs"] = [
-            row[token_ids].tolist() for row, token_ids in zip(logprobs, probes, strict=True)
-        ]
+    # Limit FP32 temporaries for long prompts while normalizing each row
+    # over the complete vocabulary.
+    for begin in range(0, count, 64):
+        end = min(begin + 64, count)
+        logits = result.context_logits[begin:end].float()
+        response["top1"].extend(logits.argmax(dim=-1).tolist())
+        if top_k is None and probes is None:
+            continue
+        logprobs = torch.log_softmax(logits, dim=-1)
+        if top_k is not None:
+            values, indices = logprobs.topk(top_k, dim=-1)
+            response["top_k"].extend(
+                list(zip(i, v)) for i, v in zip(indices.tolist(), values.tolist())
+            )
+        if probes is not None:
+            response["logprobs"].extend(
+                row[token_ids].tolist()
+                for row, token_ids in zip(logprobs, probes[begin:end], strict=True)
+            )
     return response
 
 
