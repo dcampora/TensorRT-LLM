@@ -220,6 +220,8 @@ class RuntimeHooks:
     loop_on_execution_stream: bool = False
     # The model's verifier commits replay checkpoints inside its recurrent kernels.
     gdn_fused_verify: bool = False
+    # The verifier commits the first row of every chain and logs its tentative suffix.
+    gdn_first_row_checkpoint: bool = False
     # Under multi-rank MPI attention DP, rank 0 sends each admitted request's prompt only to the rank
     # that owns it instead of broadcasting every prompt to every rank (RequestBroadcaster).
     prompts_to_owners: bool = False

@@ -246,3 +246,44 @@ passed all 32 development items, with KL 0.003288, non-tie top-1 agreement
 The OpenAI token-ID check again matched all batch-1 continuations
 at concurrency 1, 32, and 128. This server used 81,991 MiB after graph
 capture with 285,000 cache tokens.
+
+Independent benchmark invocations use fresh HTTP connections for each
+concurrency. This tuning sweep used one request per concurrency slot,
+with a minimum of four. It completed the concurrency-128 streaming case.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 4 | 216.25 | 68.57 |
+| 1024 | 1024 | 32 | 32 | 2143.79 | 1084.45 |
+| 1024 | 1024 | 128 | 128 | 3570.34 | 3316.68 |
+
+## First-row recurrent checkpoints
+
+The verifier now commits the always-accepted first row, then records only
+the tentative suffix as FP32 keys, deltas and decays. The next step applies
+the accepted suffix in the original FP32 recurrence order. This adapts the
+reference's first-row design from `verify_replay.py`. It reuses the
+manager's two existing history banks and the runtime's accepted-window
+promotion. The model opts into the manager's one-step history policy
+through `gdn_first_row_checkpoint`.
+
+In the isolated GB200 layer benchmark, the original 128-sequence,
+two-row recurrent verifier took 590 us while replaying eight history
+entries. The first-row verifier took 220 us while restoring the
+preceding accepted draft. At batch 1 and width four, the corresponding
+probe took 22.36 us and 10.15 us. These probes exclude convolution, GEMM,
+and HTTP. All 59 target operation tests passed again, including physical
+slot strides, the first write to an empty bank and both bank directions.
+
+The default engine passed the complete development oracle and both EOS
+checks again. The scores and every greedy continuation matched the
+previous build.
+
+| Batch | ISL | OSL | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 51.38 | 3.978 | 251.38 |
+| 1 | 1024 | 1024 | 67.62 | 4.293 | 232.95 |
+| 1 | 4096 | 1024 | 202.74 | 4.724 | 211.67 |
+
+The OpenAI endpoint matched the batch-1 continuations exactly at
+concurrency 1, 32, and 128 on the short-prompt development suite.

@@ -7,30 +7,29 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
-from .....catalog._op import Cell, OpWrapper
+from .....catalog._op import Arch, Cell, OpWrapper
 from ..kernels import verify
-from .recurrent import _reference_delta
 
 
 class ReplayHistory(NamedTuple):
     """The manager's double-buffered history for one layer.
 
-    Values and keys use their original BF16 convolution outputs. The two
-    BF16 gate logits are stored as one int32 word per value head in the
-    manager's 32-bit gate history, so replay reconstructs the exact FP32
-    recurrent update without an extra state pool.
+    Each BF16 key/value bank stores half as many FP32 keys/deltas. The decay
+    bank already holds FP32 words. The first row anchors the durable state;
+    later rows are replayed from this log after the sampler accepts them.
     """
 
     count: torch.Tensor
     bank: torch.Tensor
     value: torch.Tensor
     key: torch.Tensor
-    gates: torch.Tensor
-    max_tokens: int
+    decay: torch.Tensor
 
 
 class VerifyConvolution(OpWrapper):
     """Convolve each chain without publishing an unaccepted history window."""
+
+    ARCHS = frozenset({Arch.SM_100})
 
     CELLS = (
         Cell("Single-slot four-token verification", dict(seqs=1, tokens=4)),
@@ -73,21 +72,14 @@ class VerifyConvolution(OpWrapper):
 
 
 class VerifyDelta(OpWrapper):
-    """Reconstruct the accepted FP32 state, then run each tentative token."""
+    """Verify a draft chain from a checkpoint at the last accepted first row."""
 
+    ARCHS = frozenset({Arch.SM_100})
     CELLS = (
-        Cell("Append a width-five chain to a cold checkpoint", dict(tokens=5, old=0, direct=False)),
-        Cell(
-            "Replay a previous acceptance and append two tokens",
-            dict(tokens=2, old=5, direct=False),
-        ),
-        Cell(
-            "Commit a full history and use the alternate bank", dict(tokens=5, old=13, direct=False)
-        ),
-        Cell(
-            "Commit a single generation token without speculation",
-            dict(tokens=1, old=6, direct=True),
-        ),
+        Cell("Write the first verify chain into an empty bank", dict(tokens=5, old=0)),
+        Cell("Fold accepted draft rows and use the alternate bank", dict(tokens=2, old=4)),
+        Cell("Fold the longest possible accepted chain", dict(tokens=8, old=8)),
+        Cell("Fold accepted history and commit one direct token", dict(tokens=1, old=6)),
     )
 
     def __call__(
@@ -101,7 +93,6 @@ class VerifyDelta(OpWrapper):
         replay_slots: torch.Tensor,
         history: ReplayHistory,
         tokens: int,
-        direct: bool = False,
     ) -> torch.Tensor:
         return verify.replay_delta(
             qkv,
@@ -115,10 +106,8 @@ class VerifyDelta(OpWrapper):
             history.bank,
             history.value,
             history.key,
-            history.gates,
+            history.decay,
             tokens,
-            history.max_tokens,
-            direct,
         )
 
     def reference(
@@ -132,53 +121,52 @@ class VerifyDelta(OpWrapper):
         replay_slots: torch.Tensor,
         history: ReplayHistory,
         tokens: int,
-        direct: bool = False,
     ) -> torch.Tensor:
         out = []
-        gates = history.gates.view(torch.int32)
-        capacity = history.value.shape[2]
-        for seq, (slot, replay_slot) in enumerate(zip(slots.tolist(), replay_slots.tolist())):
-            assert slot >= 0 and replay_slot >= 0
+        count, bank = history.count.tolist(), history.bank.tolist()
+        replay_shape = (history.value.shape[0], 2, history.value.shape[2] // 2)
+        value = history.value.view(torch.float32).view(*replay_shape, 48, 128)
+        key = history.key.view(torch.float32).view(*replay_shape, 16, 128)
+        for seq, (slot, log_slot) in enumerate(zip(slots.tolist(), replay_slots.tolist())):
+            n, active = count[log_slot], bank[log_slot]
             carry = state[slot].float()
-            bank = int(history.bank[replay_slot])
-            count = int(history.count[replay_slot])
-            for token in range(count):
-                packed = gates[replay_slot, bank, :, token].contiguous()
-                a = (packed >> 16).short().view(torch.bfloat16).float()
-                b = packed.short().view(torch.bfloat16).float()
-                v = history.value[replay_slot, bank, token].flatten()
-                k = history.key[replay_slot, bank, token].flatten()
-                qkv_old = torch.cat((torch.zeros_like(k), k, v))
-                decay = -a_log.float().exp() * F.softplus(a + dt.float())
-                beta = b.sigmoid().bfloat16().float()
-                _, carry = _reference_delta(qkv_old, decay, beta, carry)
-            if not direct and count + history.max_tokens > capacity:
-                state[slot].copy_(carry)
-                bank, count = 1 - bank, 0
+            for token in range(n - 1):
+                direction = key[log_slot, active, token].repeat_interleave(3, dim=0)
+                update = value[log_slot, active, token]
+                decay = history.decay[log_slot, active, :, token]
+                carry = torch.addcmul(
+                    carry * decay[:, None, None], update[:, :, None], direction[:, None, :]
+                )
+            active = 1 - active if n else active
             for token in range(tokens):
                 row = seq * tokens + token
-                b, a = ba[row].chunk(2)
-                decay = -a_log.float().exp() * F.softplus(a.float() + dt.float())
-                beta = b.float().sigmoid().bfloat16().float()
-                y, carry = _reference_delta(qkv[row], decay, beta, carry)
-                out.append(y)
-                if not direct:
-                    history.key[replay_slot, bank, count + token].copy_(
-                        qkv[row, 2048:4096].reshape(16, 128)
-                    )
-                    history.value[replay_slot, bank, count + token].copy_(
-                        qkv[row, 4096:].reshape(48, 128)
-                    )
-                    gates[replay_slot, bank, :, count + token].copy_(
-                        (a.view(torch.int16).int() << 16) | (b.view(torch.int16).int() & 0xFFFF)
-                    )
-            if direct:
-                state[slot].copy_(carry)
+                q, k, v = qkv[row].float().split((2048, 2048, 6144))
+                query = q.reshape(16, 128)
+                direction = k.reshape(16, 128)
+                query = query / (query.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+                direction = direction / (direction.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+                query = query.repeat_interleave(3, dim=0) * (128**-0.5)
+                keys = direction.repeat_interleave(3, dim=0)
+                b, a = ba[row].float().chunk(2)
+                decay = (-a_log.float().exp() * F.softplus(a + dt.float())).exp()
+                beta = b.sigmoid().bfloat16().float()
+                carry = carry * decay[:, None, None]
+                update = (v.reshape(48, 128) - (carry * keys[:, None, :]).sum(-1)) * beta[:, None]
+                carry = torch.addcmul(carry, update[:, :, None], keys[:, None, :])
+                out.append((carry * query[:, None, :]).sum(-1))
+                if token == 0:
+                    state[slot].copy_(carry)
+                else:
+                    key[log_slot, active, token - 1].copy_(direction)
+                    value[log_slot, active, token - 1].copy_(update)
+                    history.decay[log_slot, active, :, token - 1].copy_(decay)
         return torch.stack(out).to(qkv.dtype)
 
 
 class ResetReplay(OpWrapper):
     """Clear pending history and the active bank after a direct update."""
+
+    ARCHS = frozenset({Arch.SM_100})
 
     CELLS = (Cell("Reset nonconsecutive physical slots, skipping padding", dict(slots=(4, 1, -1))),)
 

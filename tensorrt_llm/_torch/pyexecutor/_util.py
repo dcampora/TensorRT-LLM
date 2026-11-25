@@ -4336,7 +4336,10 @@ def _create_kv_cache_manager(
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):
-            fused_verify = runtime_hooks_of(model_engine.model).gdn_fused_verify
+            hooks = runtime_hooks_of(model_engine.model)
+            fused_verify = hooks.gdn_fused_verify
+            if hooks.gdn_first_row_checkpoint:
+                mamba_manager_extra_kwargs["gdn_first_row_checkpoint"] = True
             if not fused_verify:
                 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
                 fused_verify = any(

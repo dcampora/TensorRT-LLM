@@ -92,105 +92,84 @@ def verify_convolution(
 
 
 @tr.jit
-def _step(state, key, value, a, b, dt, a_log):
-    key = key / tl.sqrt(tl.sum(key * key, 0) + 1e-6)
-    a = a + dt
-    decay = tl.exp(a_log * tl.where(a <= 20.0, tl.log(1.0 + tl.exp(a)), a))
-    beta = (1.0 / (1.0 + tl.exp(-b))).to(tl.bfloat16).to(tl.float32)
-    state *= decay
-    delta = (value - tl.sum(state * key[None, :], 1)) * beta
-    return tl.fma(delta[:, None], key[None, :], state)
-
-
-@tr.jit
-def _replay_verify(
+def _anchor(
     X,
-    BA,
+    AB,
     A_LOG,
     DT,
-    SLOTS,
+    STATE_SLOTS,
     REPLAY_SLOTS,
     PREVIOUS,
     BANK,
     STATE,
-    OLD_VALUE,
-    OLD_KEY,
-    OLD_GATES,
+    DELTAS,
+    KEYS,
+    DECAYS,
     Y,
     STATE_STRIDE: tl.constexpr,
-    V_STRIDE: tl.constexpr,
-    K_STRIDE: tl.constexpr,
-    G_STRIDE: tl.constexpr,
+    DELTA_STRIDE: tl.constexpr,
+    KEY_STRIDE: tl.constexpr,
+    DECAY_STRIDE: tl.constexpr,
     META_STRIDE: tl.constexpr,
-    HISTORY: tl.constexpr,
-    STEP_WIDTH: tl.constexpr,
+    RANKS: tl.constexpr,
+    DECAY_RANKS: tl.constexpr,
     TOKENS: tl.constexpr,
     BV: tl.constexpr,
-    DIRECT: tl.constexpr,
 ):
-    seq = tl.program_id(0)
+    v_tile = tl.program_id(0)
     h = tl.program_id(1)
-    v_tile = tl.program_id(2)
-    slot = tl.load(SLOTS + seq).to(tl.int64)
-    history_slot = tl.load(REPLAY_SLOTS + seq).to(tl.int64)
-    valid = (slot >= 0) & (history_slot >= 0)
+    seq = tl.program_id(2)
+    slot = tl.load(STATE_SLOTS + seq).to(tl.int64)
+    log_slot = tl.load(REPLAY_SLOTS + seq).to(tl.int64)
+    valid = (slot >= 0) & (log_slot >= 0)
     v = v_tile * BV + tl.arange(0, BV)
     k = tl.arange(0, 128)
     g = h // 3
-    old_state = STATE + slot * STATE_STRIDE + (h * 128 + v[:, None]) * 128 + k[None, :]
-    state = tl.load(old_state, valid, 0).to(tl.float32)
-    previous = tl.load(PREVIOUS + history_slot * META_STRIDE, valid, 0)
-    bank = tl.load(BANK + history_slot * META_STRIDE, valid, 0)
+    state_ptr = STATE + slot * STATE_STRIDE + (h * 128 + v[:, None]) * 128 + k[None, :]
+    state = tl.load(state_ptr, valid, 0).to(tl.float32)
+    previous = tl.load(PREVIOUS + log_slot * META_STRIDE, valid, 0)
+    bank = tl.load(BANK + log_slot * META_STRIDE, valid, 0)
     a_log = -tl.exp(tl.load(A_LOG + h).to(tl.float32))
     dt = tl.load(DT + h).to(tl.float32)
+    key_ptr = KEYS + log_slot * KEY_STRIDE + g * 128 + k
+    delta_ptr = DELTAS + log_slot * DELTA_STRIDE + h * 128 + v
+    decay_ptr = DECAYS + log_slot * DECAY_STRIDE + h * DECAY_RANKS
 
-    value_base = OLD_VALUE + history_slot * V_STRIDE + h * 128 + v
-    key_base = OLD_KEY + history_slot * K_STRIDE + g * 128 + k
-    gates_base = OLD_GATES + history_slot * G_STRIDE + h * HISTORY
-    for token in range(previous):
-        col = bank * HISTORY + token
-        key = tl.load(key_base + col * 2048).to(tl.float32)
-        value = tl.load(value_base + col * 6144).to(tl.float32)
-        gates = tl.load(gates_base + bank * 48 * HISTORY + token)
-        a = (gates >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
-        b = gates.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
-        state = _step(state, key, value, a, b, dt, a_log)
+    for i in tl.range(0, previous - 1, loop_unroll_factor=1):
+        rank = bank * RANKS + i
+        key = tl.load(key_ptr + rank * 2048).to(tl.float32)
+        delta = tl.load(delta_ptr + rank * 6144).to(tl.float32)
+        decay = tl.load(decay_ptr + bank * 48 * DECAY_RANKS + i)
+        state = tl.fma(delta[:, None], key[None, :], state * decay)
 
-    checkpoint = previous + STEP_WIDTH > HISTORY
-    if not DIRECT and checkpoint:
-        tl.store(old_state, state, valid)
-    dst_bank = tl.where(checkpoint, 1 - bank, bank)
-    dst_start = tl.where(checkpoint, 0, previous)
+    row_start = seq * TOKENS
     for token in tl.static_range(TOKENS):
-        row = seq * TOKENS + token
+        row = row_start + token
         query = tl.load(X + row * 10240 + g * 128 + k).to(tl.float32)
-        key = tl.load(X + row * 10240 + 2048 + g * 128 + k)
-        value = tl.load(X + row * 10240 + 4096 + h * 128 + v)
-        raw_a = tl.load(BA + row * 96 + 48 + h)
-        raw_b = tl.load(BA + row * 96 + h)
-        state = _step(
-            state,
-            key.to(tl.float32),
-            value.to(tl.float32),
-            raw_a.to(tl.float32),
-            raw_b.to(tl.float32),
-            dt,
-            a_log,
-        )
+        key = tl.load(X + row * 10240 + 2048 + g * 128 + k).to(tl.float32)
+        value = tl.load(X + row * 10240 + 4096 + h * 128 + v).to(tl.float32)
+        a = tl.load(AB + row * 96 + 48 + h).to(tl.float32) + dt
+        b = tl.load(AB + row * 96 + h).to(tl.float32)
+        decay = tl.exp(a_log * tl.where(a <= 20.0, tl.log(1.0 + tl.exp(a)), a))
+        beta = (1.0 / (1.0 + tl.exp(-b))).to(tl.bfloat16).to(tl.float32)
+        key = key / tl.sqrt(tl.sum(key * key, 0) + 1e-6)
         q = query / tl.sqrt(tl.sum(query * query, 0) + 1e-6) * 0.08838834764831845
+
+        state *= decay
+        delta = (value - tl.sum(state * key[None, :], 1)) * beta
+        state = tl.fma(delta[:, None], key[None, :], state)
         tl.store(Y + (row * 48 + h) * 128 + v, tl.sum(state * q[None, :], 1))
-        if not DIRECT:
-            col = dst_bank * HISTORY + dst_start + token
-            tl.store(value_base + col * 6144, value, valid)
+        if token == 0:
+            # The first verifier row represents an already accepted token.
+            tl.store(state_ptr, state, valid, cache_modifier=".cs")
+        else:
+            next_bank = tl.where(previous > 0, 1 - bank, bank)
+            rank = next_bank * RANKS + token - 1
+            tl.store(delta_ptr + rank * 6144, delta, valid)
             if v_tile == 0:
                 if h % 3 == 0:
-                    tl.store(key_base + col * 2048, key, valid)
-                packed = (raw_a.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | raw_b.to(
-                    tl.uint16, bitcast=True
-                ).to(tl.uint32)
-                tl.store(gates_base + dst_bank * 48 * HISTORY + dst_start + token, packed, valid)
-    if DIRECT:
-        tl.store(old_state, state, valid)
+                    tl.store(key_ptr + rank * 2048, key, valid)
+                tl.store(decay_ptr + next_bank * 48 * DECAY_RANKS + token - 1, decay, valid)
 
 
 def replay_delta(
@@ -205,15 +184,15 @@ def replay_delta(
     bank: torch.Tensor,
     old_value: torch.Tensor,
     old_key: torch.Tensor,
-    old_gates: torch.Tensor,
+    decay: torch.Tensor,
     tokens: int,
-    max_tokens: int,
-    direct: bool = False,
 ) -> torch.Tensor:
-    """Verify a linear draft chain, updating only durable history and checkpoints."""
-    y = convolved.new_empty((convolved.shape[0], 48, 128))
-    tile = 16
-    _replay_verify[(slots.numel(), 48, 128 // tile)](
+    """Reuse the two BF16 log banks as half-capacity banks of FP32 deltas."""
+    tile = 8
+    num_rows = convolved.shape[0]
+    y = convolved.new_empty((num_rows, 48, 128))
+    deltas, keys = old_value.view(torch.float32), old_key.view(torch.float32)
+    _anchor[(128 // tile, 48, slots.numel())](
         convolved,
         ba,
         a_log,
@@ -223,20 +202,19 @@ def replay_delta(
         previous,
         bank,
         state,
-        old_value,
-        old_key,
-        old_gates.view(torch.int32),
+        deltas,
+        keys,
+        decay,
         y,
         state.stride(0),
-        old_value.stride(0),
-        old_key.stride(0),
-        old_gates.stride(0),
+        deltas.stride(0),
+        keys.stride(0),
+        decay.stride(0),
         previous.stride(0),
-        old_value.shape[2],
-        max_tokens,
+        old_value.shape[2] // 2,
+        decay.shape[-1],
         tokens,
         tile,
-        direct,
         num_warps=1,
     )
     return y

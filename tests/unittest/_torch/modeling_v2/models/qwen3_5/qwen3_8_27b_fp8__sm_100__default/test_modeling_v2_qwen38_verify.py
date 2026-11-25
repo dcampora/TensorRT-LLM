@@ -50,44 +50,44 @@ def test_verify_convolution(cell, certifying):
 
 @pytest.mark.parametrize("cell", verify_delta.CELLS, ids=lambda cell: cell.why)
 def test_verify_delta(cell, certifying):
-    """Follow past acceptances, and write new history in the correct bank."""
+    """The accepted first row commits and the tentative suffix stays in its own bank."""
     assert torch.cuda.is_available()
     torch.manual_seed(53)
-    steps, past, direct = (cell.spec[key] for key in ("tokens", "old", "direct"))
+    steps, past = (cell.spec[k] for k in ("tokens", "old"))
     x, ba = _rand(2 * steps, 10240), _rand(2 * steps, 96)
     a_log, dt = _rand(48, dtype=torch.float32), _rand(48)
     slots, replay_slots = _int([2, 1]), _int([4, 2])
     state = _rand(8, 48, 128, 128, dtype=torch.float32)[::2].mul_(0.02)
     expected_state = state.clone()
-    gates_a = _rand(10, 2, 48, 16)[::2]
-    gates_b = _rand(10, 2, 48, 16)[::2]
-    gates = (
-        (gates_a.view(torch.int16).int() << 16) | (gates_b.view(torch.int16).int() & 0xFFFF)
-    ).view(torch.float32)
     meta = torch.zeros(5, 4, device="cuda", dtype=torch.int32)
     meta[:, 0] = past
     meta[2, 1] = 1
     history = ReplayHistory(
         meta[:, 0],
         meta[:, 1],
-        _rand(10, 2, 16, 48, 128)[::2],
-        _rand(10, 2, 16, 16, 128)[::2],
-        gates,
-        5,
+        (_rand(10, 2, 8, 48, 128, dtype=torch.float32)[::2].mul_(0.05))
+        .view(torch.bfloat16)
+        .view(5, 2, 16, 48, 128),
+        (_rand(10, 2, 8, 16, 128, dtype=torch.float32)[::2].mul_(0.05))
+        .view(torch.bfloat16)
+        .view(5, 2, 16, 16, 128),
+        _rand(10, 2, 48, 16, dtype=torch.float32).sigmoid_()[::2],
     )
-    expected = ReplayHistory(*(t.clone() for t in history[:-1]), history.max_tokens)
+    expected = ReplayHistory(*(t.clone() for t in history))
     certifying(verify_delta)
-    y = verify_delta(x, ba, a_log, dt, state, slots, replay_slots, history, steps, direct)
+    y = verify_delta(x, ba, a_log, dt, state, slots, replay_slots, history, steps)
     ref = verify_delta.reference(
-        x, ba, a_log, dt, expected_state, slots, replay_slots, expected, steps, direct
+        x, ba, a_log, dt, expected_state, slots, replay_slots, expected, steps
     )
     assert_within_ulp(y, ref, 1.0, 0.5)
     torch.testing.assert_close(state, expected_state, atol=3e-6, rtol=2e-5)
-    torch.testing.assert_close(history.value, expected.value, atol=0, rtol=0)
-    torch.testing.assert_close(history.key, expected.key, atol=0, rtol=0)
     torch.testing.assert_close(
-        history.gates.view(torch.int32), expected.gates.view(torch.int32), atol=0, rtol=0
+        history.value.view(torch.float32), expected.value.view(torch.float32), atol=3e-6, rtol=2e-5
     )
+    torch.testing.assert_close(
+        history.key.view(torch.float32), expected.key.view(torch.float32), atol=3e-6, rtol=2e-5
+    )
+    torch.testing.assert_close(history.decay, expected.decay, atol=3e-6, rtol=2e-5)
 
 
 @pytest.mark.parametrize("cell", reset_replay.CELLS, ids=lambda cell: cell.why)

@@ -303,7 +303,6 @@ class DecoderLayer(nn.Module):
             cache.old_x,
             cache.old_B,
             cache.old_dt,
-            replay.replay_step_width,
         )
         return verify_delta(
             qkv,
@@ -315,7 +314,6 @@ class DecoderLayer(nn.Module):
             replay_slots,
             history,
             step.predicted,
-            direct,
         )
 
     def _full_attention(self, p: torch.Tensor, rope: torch.Tensor, step: Step) -> torch.Tensor:
@@ -512,7 +510,11 @@ class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
     @property
     def runtime_hooks(self) -> RuntimeHooks | None:
         if self.spec_config is not None:
-            return RuntimeHooks(loop_on_execution_stream=True, gdn_fused_verify=True)
+            return RuntimeHooks(
+                loop_on_execution_stream=True,
+                gdn_fused_verify=True,
+                gdn_first_row_checkpoint=True,
+            )
         return None
 
     def load_weights(self, checkpoint: dict[str, torch.Tensor]) -> None:

@@ -317,6 +317,7 @@ class GDNReplayState:
         # Whether the GDN layers verify drafts with the fused kernels, which commit
         # in-layer at every batch size (the manager's gdn_fused_verify).
         self.fused_verify = False
+        self.first_row_checkpoint = False
         self.prev_num_accepted_tokens: torch.Tensor | None = None
         self.cache_buf_idx: torch.Tensor | None = None
         # Stacked [layer, slot, ...] tensors, or per-layer views of pool
@@ -749,7 +750,11 @@ class GDNReplayState:
             prev_num_accepted_tokens=self.prev_num_accepted_tokens,
             cache_buf_idx=self.cache_buf_idx,
             replay_step_width=self.replay_step_width,
-            replay_history_size=self.replay_history_size,
+            # A first-row checkpoint retains only the latest verification
+            # chain. The physical banks still use the manager's allocated stride.
+            replay_history_size=(
+                self.replay_step_width if self.first_row_checkpoint else self.replay_history_size
+            ),
         )
 
     def shutdown(self) -> None:
@@ -993,7 +998,14 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     _skips_steady_state_index_upload = True
 
     @override
-    def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        use_replay_state_update: bool | None = None,
+        gdn_first_row_checkpoint: bool = False,
+        **kwargs,
+    ) -> None:
+        self._gdn_first_row_checkpoint = gdn_first_row_checkpoint
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -1002,6 +1014,16 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     @override
     def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
         state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
+        if self._gdn_first_row_checkpoint and self.local_num_mamba_layers:
+            if (
+                not isinstance(state, GDNReplayState)
+                or not state.fused_verify
+                or state.use_flashinfer_ring
+            ):
+                raise ValueError(
+                    "First-row checkpoints require fused verification and double-buffer GDN replay"
+                )
+            state.first_row_checkpoint = True
 
         validate_gdn_layout(self, state)
         return state
