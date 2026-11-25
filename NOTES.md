@@ -1044,3 +1044,10 @@ TTFT was 454.37 ms and the median TPOT was 21.440 ms.
 After the cache-manager line wrap required by the pinned formatter,
 the syntax tree was identical. The contract oracle and protocol checks,
 server smoke test, and 32-request serving oracle check passed again.
+
+An Nsight Systems diagnostic used a warmed LLM API batch of 128 at
+ISL 1024 and OSL 48 with the serving draft schedule. In the captured
+decode graph nodes, the GDN verifier accounted for 27.5% of summed
+kernel time, GDN preparation and convolution for 8.4%, NVFP4
+matrix multiplication for 10.0%, and paged attention for 9.7%.
+The figures describe kernel time within the trace.
