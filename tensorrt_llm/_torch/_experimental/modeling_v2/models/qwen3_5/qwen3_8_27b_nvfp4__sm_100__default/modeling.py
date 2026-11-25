@@ -56,6 +56,19 @@ def _device_ints(values: list, device: torch.device) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
 
 
+def _context_groups(lengths: list[int]):
+    """Pack short contexts at their calibrated projection row count."""
+    first, rows = 0, 0
+    short = lengths[0] <= _PREFILL_MIN_ROWS
+    for seq, length in enumerate(lengths):
+        next_short = length <= _PREFILL_MIN_ROWS
+        if next_short != short or (short and rows + length > _PREFILL_MIN_ROWS):
+            yield first, seq
+            first, rows, short = seq, 0, next_short
+        rows += length
+    yield first, len(lengths)
+
+
 class Step(NamedTuple):
     context: Context | None
     context_rows: int
@@ -93,12 +106,12 @@ class Layer(nn.Module):
 
     def linear_attention(self, x: torch.Tensor, step: Step, cache) -> torch.Tensor:
         rows = x.shape[0]
-        context_rows = step.context_rows
-        projection = self.qkv(_pad(x, step.projection_rows), decode=not context_rows)[:rows]
-        outputs = []
-        if context_rows:
+        decode = step.context is None
+        projection = self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
+        z = projection[:, 10240:]
+        if step.context is not None:
             if len(step.context_spans) == 1 or step.projection_rows == _PREFILL_MIN_ROWS:
-                ba = F.linear(_pad(x[:context_rows], step.projection_rows), self.ba)[:context_rows]
+                ba = F.linear(_pad(x, step.projection_rows), self.ba)[:rows]
             else:
                 ba = torch.cat(
                     [
@@ -107,7 +120,7 @@ class Layer(nn.Module):
                     ]
                 )
             prefills = gdn_context(
-                projection[:context_rows],
+                projection,
                 ba,
                 self.conv_weight,
                 self.log_decay,
@@ -116,78 +129,58 @@ class Layer(nn.Module):
                 cache.temporal,
                 step.context,
             )
-            outputs.append(
-                gated_rmsnorm(prefills, projection[:context_rows, 10240:], self.gate_norm, self.eps)
+            out = gated_rmsnorm(prefills, z, self.gate_norm, self.eps)
+            return self.out(_pad(out, step.projection_rows))[:rows]
+
+        if rows <= _PREFILL_MIN_ROWS:
+            ba = F.linear(_pad(x, _PREFILL_MIN_ROWS), self.ba)[:rows]
+        else:
+            ba = torch.cat(
+                [
+                    F.linear(_pad(tile, _PREFILL_MIN_ROWS), self.ba)[: tile.shape[0]]
+                    for tile in x.split(_PREFILL_MIN_ROWS)
+                ]
             )
-        if context_rows < rows:
-            decode_rows = rows - context_rows
-            x_decode = x[context_rows:]
-            if decode_rows <= _PREFILL_MIN_ROWS:
-                ba = F.linear(_pad(x_decode, _PREFILL_MIN_ROWS), self.ba)[:decode_rows]
-            else:
-                ba = torch.cat(
-                    [
-                        F.linear(_pad(tile, _PREFILL_MIN_ROWS), self.ba)[: tile.shape[0]]
-                        for tile in x_decode.split(_PREFILL_MIN_ROWS)
-                    ]
+        args = (
+            projection,
+            ba,
+            self.conv_weight,
+            self.log_decay,
+            self.bias,
+            cache.conv,
+            cache.temporal,
+            step.state_slots,
+        )
+        if step.verify:
+            replay = None
+            if cache.old_x is not None:
+                replay = Replay(
+                    step.replay_slots,
+                    cache.prev_num_accepted_tokens,
+                    cache.cache_buf_idx,
+                    cache.old_x,
+                    cache.old_B,
+                    cache.old_dt,
                 )
-            args = (
-                projection[context_rows:],
-                ba,
-                self.conv_weight,
-                self.log_decay,
-                self.bias,
-                cache.conv,
-                cache.temporal,
-                step.state_slots[len(step.context_spans) :],
+            decoded = gdn_verify(
+                *args,
+                cache.intermediate_conv_window,
+                cache.intermediate_ssm,
+                step.decode_width,
+                replay,
             )
-            if step.verify:
-                replay = None
-                if cache.old_x is not None:
-                    replay = Replay(
-                        step.replay_slots,
-                        cache.prev_num_accepted_tokens,
-                        cache.cache_buf_idx,
-                        cache.old_x,
-                        cache.old_B,
-                        cache.old_dt,
-                    )
-                decoded = gdn_verify(
-                    *args,
-                    cache.intermediate_conv_window,
-                    cache.intermediate_ssm,
-                    step.decode_width,
-                    replay,
-                )
-            else:
-                decoded = gdn_decode(*args)
-            if not context_rows:
-                packed = gated_rmsnorm(
-                    decoded,
-                    projection[:, 10240:],
-                    self.gate_norm,
-                    self.eps,
-                    self.out.input_scale,
-                    decode=True,
-                )
-                return self.out.gemm(packed, decode=True)
-            outputs.append(
-                gated_rmsnorm(
-                    decoded,
-                    projection[context_rows:, 10240:],
-                    self.gate_norm,
-                    self.eps,
-                    decode=True,
-                )
-            )
-        result = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
-        return self.out(_pad(result, step.projection_rows))[:rows]
+        else:
+            decoded = gdn_decode(*args)
+        packed = gated_rmsnorm(
+            decoded, z, self.gate_norm, self.eps, self.out.input_scale, decode=True
+        )
+        return self.out.gemm(packed, decode=True)
 
     def full_attention(
         self, x: torch.Tensor, step: Step, rope: torch.Tensor, cache: Cache
     ) -> torch.Tensor:
         rows = x.shape[0]
-        decode = not step.context_rows
+        decode = step.context is None
         projection = self.qkv(_pad(x, step.projection_rows), decode=decode)[:rows]
         q, k, v, gate = prepare_qkv(
             projection, self.q_norm, self.k_norm, rope, step.positions, self.eps
@@ -199,35 +192,13 @@ class Layer(nn.Module):
                 q, gate, step.positions, cache, table, self.out.input_scale, step.decode_width
             )
             return self.out.gemm(result, decode=True)
-
-        ctx = step.context_rows
-        positions = step.positions[:ctx]
-        append_kv(k[:ctx], v[:ctx], positions, cache, table, step.context_indices)
+        append_kv(k, v, step.positions, cache, table, step.context_indices)
+        starts, chunks = step.context.starts, step.context.chunks
         if step.fresh_context:
-            output = context_attention(
-                q[:ctx], k[:ctx], v[:ctx], step.context.starts, step.context.chunks
-            )
+            output = context_attention(q, k, v, starts, chunks)
         else:
-            output = paged_context_attention(
-                q[:ctx], step.context.starts, step.context.chunks, positions, cache, table
-            )
-        output = apply_gate(output, gate[:ctx])
-        if ctx < rows:
-            positions = step.positions[ctx:]
-            first_request = len(step.context_spans)
-            append_kv(
-                k[ctx:], v[ctx:], positions, cache, table, None, step.decode_width, first_request
-            )
-            generated = decode_attention(
-                q[ctx:],
-                gate[ctx:],
-                positions,
-                cache,
-                table,
-                rows_per_seq=step.decode_width,
-                request_start=first_request,
-            )
-            output = torch.cat((output, generated))
+            output = paged_context_attention(q, starts, chunks, step.positions, cache, table)
+        output = apply_gate(output, gate)
         return self.out(_pad(output, step.projection_rows))[:rows]
 
     def forward(
@@ -296,44 +267,89 @@ class Qwen38Decoder(DecoderModel):
         contexts = md.num_contexts
         ctx_rows = md.num_ctx_tokens
         num_decodes = md.num_seqs - contexts
-        decode_width = (x.shape[0] - ctx_rows) // num_decodes if num_decodes else 1
-        projection_rows = max(x.shape[0], _PREFILL_MIN_ROWS) if contexts else x.shape[0]
         mamba = md.mamba_metadata
-        state_slots = mamba.state_indices[: md.num_seqs]
-        replay_slots = mamba.replay_state_indices
-        context = None
-        spans = ()
+        outputs = []
+        # In a mixed iteration each phase retains its own projection tactics
+        # and rounding. The worker receives rows in the runtime's packed order.
         if contexts:
             lengths = md.seq_lens[:contexts].tolist()
             starts = list(accumulate(lengths, initial=0))
-            spans = tuple(zip(starts[:-1], starts[1:], strict=True))
-            counts = [tr.cdiv(length, 64) for length in lengths]
-            chunks = [(seq, chunk) for seq, count in enumerate(counts) for chunk in range(count)]
-            context = Context(
-                mamba.cu_seqlens[: contexts + 1],
-                _device_ints(chunks, x.device),
-                _device_ints(list(accumulate(counts, initial=0)), x.device),
-                state_slots[:contexts],
-                mamba.has_initial_states[:contexts],
-                contexts,
-                max(lengths),
-                min(64, max(16, tr.next_power_of_2(ctx_rows))),
+            for first, last in _context_groups(lengths):
+                begin, end = starts[first], starts[last]
+                step = self._context_step(
+                    md, positions[begin:end], lengths[first:last], first, last, begin, end, x.device
+                )
+                outputs.append(self._compute_layers(x[begin:end], step))
+        if num_decodes:
+            decode_rows = x.shape[0] - ctx_rows
+            replay_slots = mamba.replay_state_indices
+            step = Step(
+                None,
+                0,
+                None,
+                False,
+                (),
+                mamba.state_indices[contexts : md.num_seqs],
+                md.kv_cache_block_offsets[:, contexts : md.num_seqs],
+                decode_rows,
+                self.row_counts[decode_rows : decode_rows + 1],
+                positions[ctx_rows:],
+                decode_rows // num_decodes,
+                verify,
+                replay_slots[contexts : md.num_seqs] if replay_slots is not None else None,
             )
-        step = Step(
+            outputs.append(self._compute_layers(x[ctx_rows:], step))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+    def _context_step(
+        self,
+        md,
+        positions,
+        lengths: list[int],
+        first: int,
+        last: int,
+        begin: int,
+        end: int,
+        device: torch.device,
+    ) -> Step:
+        mamba = md.mamba_metadata
+        spans = list(accumulate(lengths, initial=0))
+        counts = [tr.cdiv(length, 64) for length in lengths]
+        chunks = [(seq, chunk) for seq, count in enumerate(counts) for chunk in range(count)]
+        slots = mamba.state_indices[first:last]
+        starts = mamba.cu_seqlens[first : last + 1]
+        indices = mamba.seq_idx.reshape(-1)[begin:end]
+        if first:
+            starts = starts - begin
+            indices = indices - first
+        context = Context(
+            starts,
+            _device_ints(chunks, device),
+            _device_ints(list(accumulate(counts, initial=0)), device),
+            slots,
+            mamba.has_initial_states[first:last],
+            last - first,
+            max(lengths),
+            min(64, max(16, tr.next_power_of_2(end - begin))),
+        )
+        projection_rows = max(end - begin, _PREFILL_MIN_ROWS)
+        return Step(
             context,
-            ctx_rows,
-            mamba.seq_idx.reshape(-1)[:ctx_rows] if contexts else None,
+            end - begin,
+            indices,
             not mamba.use_initial_states,
-            spans,
-            state_slots,
-            md.kv_cache_block_offsets,
+            tuple(zip(spans[:-1], spans[1:], strict=True)),
+            slots,
+            md.kv_cache_block_offsets[:, first:last],
             projection_rows,
             self.row_counts[projection_rows : projection_rows + 1],
             positions,
-            decode_width,
-            verify,
-            replay_slots[contexts : md.num_seqs] if replay_slots is not None else None,
+            1,
+            False,
+            None,
         )
+
+    def _compute_layers(self, x: torch.Tensor, step: Step) -> torch.Tensor:
         residual = None
         for i, cache in enumerate(self._caches):
             x, residual = self.layers[i](x, residual, step, self.rope, cache)

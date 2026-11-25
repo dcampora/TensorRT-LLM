@@ -133,9 +133,18 @@ def route(
             or spec.use_dynamic_tree
             or spec.use_relaxed_acceptance_for_thinking
             or spec.sa_config is not None
+            or spec.max_concurrency is not None
+            or spec.acceptance_rate_window_size
             or not 1 <= spec.max_draft_len <= 4
         ):
             raise NoTarget("Qwen3.8-27B supports linear one-model MTP with up to four drafts")
+        schedule = spec.draft_len_schedule
+        if schedule is not None and (
+            llm_args.max_batch_size is None
+            or max(schedule, default=0) < llm_args.max_batch_size
+            or any(not 1 <= depth <= spec.max_draft_len for depth in schedule.values())
+        ):
+            raise NoTarget("Qwen3.8-27B requires at least one draft at every configured batch size")
     if llm_args.prefill_cuda_graph_backend.value != "disabled":
         raise NoTarget("Qwen3.8-27B NVFP4 supports CUDA graphs for decode")
 

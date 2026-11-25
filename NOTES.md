@@ -199,6 +199,26 @@ outside the rule, so the wrapper still uses ordinary decoding.
 | 8 | 8 | 1287.49 | 994.78 | 4.950 |
 | 32 | 32 | 2293.27 | 2615.56 | 10.664 |
 
+### Mixed-step serving correctness
+
+Context and generation rows now retain their respective projection
+tactics inside a mixed scheduler iteration. The target returns both
+parts in the runtime's packed order. Short contexts share the calibrated
+128-row prefill shape from the standalone's `prefill_groups`, with
+separate groups when their combined token count would exceed it. Giving
+GDN's output kernel per-sequence tiles alone had no effect on the
+remaining differences.
+
+The split phases and short-context grouping accepted all 384 development
+responses at concurrency 1, 2, 4, 8, 16, 32, 64, and 128. Of those, 382
+matched the batch-1 engine exactly. The other two diverged at the same
+position, where its two leading tokens had equal log-probabilities.
+The serving wrapper enables the verified dynamic MTP schedule and uses
+the TP1 executor in one process with one HTTP frontend.
+The engine retained the preceding commit's 32 generations and score
+metrics. All 32 operation cells and both checkpoint-backed tests passed,
+including overlapping a new prefill with an active speculative decode.
+
 ## Standalone comparison
 
 The original `/ref-engine/engine.sh` copy crashed while instantiating its
