@@ -552,3 +552,51 @@ and 48. The batch-1 comparison also found a 0.75-nat difference at 64.
 | 1024 | 1024 | 1 | 667.9 | 25.84 |
 | 1024 | 1024 | 32 | 6375.9 | 223.71 |
 | 1024 | 1024 | 128 | 10520.2 | 287.70 |
+
+## Compact FP32 replay experiment
+
+Keeping normalized keys, update vectors, and the per-token exponential
+decay in FP32 with an eight-token history used roughly the same replay
+memory as the existing BF16 history with sixteen tokens. With a strided
+pool, the recurrence probe fell from 67.3 to 52.2 microseconds at
+batch 32 and width four, and from 237.9 to 162.8 microseconds at
+batch 128 and width two.
+
+The engine passed all 32 cases at unchanged scoring metrics, and all
+32 HTTP continuations at concurrency 2 matched batch 1 exactly. Against
+batch 1, concurrency 32 and 128 also passed. Direct comparison to the
+external oracle found two distinct strict differences at concurrency 32
+and two at 128. The BF16 replay format remains in use.
+
+| ISL | OSL | Batch-1 median TTFT (ms) | Batch-1 decode tokens/s |
+| ---: | ---: | ---: | ---: |
+| 128 | 1024 | 10.94 | 656.6 |
+| 1024 | 1024 | 18.54 | 750.9 |
+| 4096 | 1024 | 43.90 | 675.6 |
+
+| ISL | OSL | HTTP concurrency | Output tokens/s |
+| ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 685.2 |
+| 1024 | 1024 | 32 | 6239.2 |
+| 1024 | 1024 | 128 | 10971.8 |
+
+## Fused wide convolution and dependent GEMM launches
+
+A fused preparation kernel combined the verification convolution with
+Q/K normalization and gate preparation. It wrote the same BF16 convolution
+windows and outputs and the same recurrent state and replay records as the
+separate kernels in the operation fixture. The trial also fused the wide
+DeltaNet output cast and used programmatic dependent launches for up to
+512 routed input rows. On the layer-13 capture, raising this limit took
+the 512-row expert path from 146.2 to 141.2 microseconds with bitwise
+identical expert rows.
+
+The combined end-to-end trial passed all 32 engine oracle cases and both
+HTTP comparisons at concurrency 1, 32, and 128. It was slightly slower
+at 128. The combined change was set aside for isolated retesting.
+
+| ISL | OSL | HTTP concurrency | Output tokens/s |
+| ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 667.9 |
+| 1024 | 1024 | 32 | 6427.8 |
+| 1024 | 1024 | 128 | 10400.4 |

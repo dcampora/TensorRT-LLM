@@ -105,6 +105,7 @@ l0_cpu:
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
+  - unittest/_torch/modeling_v2/models/qwen3_5_moe/test_routing.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
   - unittest/test_startup.py
