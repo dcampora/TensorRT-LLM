@@ -507,3 +507,67 @@ one skipped.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 4002.88 | 918.52 | 6.675 |
 | 128 | 128 | 6087.69 | 2453.34 | 18.078 |
+
+### Sustained whole-prefill serving, ISL 1024 and 4096, OSL 1024
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 32 | 128 | 3576.05 | 145.79 | 8.447 |
+| 1024 | 128 | 512 | 5409.93 | 430.49 | 22.934 |
+| 4096 | 32 | 128 | 2590.62 | 351.55 | 11.367 |
+
+### Matched Modeling V1 serving, ISL 1024 and 4096, OSL 1024
+
+This run uses the same whole-prefill YAML with `modeling_v2: "off"`.
+The V1 dynamic draft schedule requires `TRTLLM_USE_GDN_REPLAY=0`
+to use full-state checkpointing. Each cell uses the standard
+warmup, 16 requests minimum, and four requests per concurrency
+slot. The input hashes match the corresponding V2 cells.
+
+| ISL | Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1 | 16 | 215.44 | 96.14 | 4.911 |
+| 1024 | 2 | 16 | 374.71 | 128.47 | 5.170 |
+| 1024 | 4 | 16 | 617.53 | 140.78 | 6.125 |
+| 1024 | 8 | 32 | 1252.58 | 162.10 | 6.036 |
+| 1024 | 16 | 64 | 2340.17 | 161.24 | 6.183 |
+| 1024 | 32 | 128 | 3416.93 | 264.62 | 8.781 |
+| 1024 | 64 | 256 | 3625.85 | 358.07 | 16.499 |
+| 1024 | 128 | 512 | 4612.22 | 448.97 | 25.854 |
+| 4096 | 1 | 16 | 202.11 | 138.24 | 4.968 |
+| 4096 | 8 | 32 | 1227.94 | 163.27 | 5.897 |
+| 4096 | 32 | 128 | 2558.43 | 305.98 | 10.278 |
+
+## Warp-local exact batched recurrence
+
+The wide verifier keeps four value coordinates and each full 128-element
+key reduction in one warp. The runtime's existing dummy-request mask
+lets both recurrent preparation and verification skip the padding slots.
+The FP32 state update and the two-bank replay format stay identical. On
+rotating native-stride cache views, the verifier took 88.94 microseconds
+at batch 32 with four verifier rows and 202.37 microseconds at batch 128
+with two verifier rows. The preceding kernel took 95.90 and 232.47
+microseconds. The outputs and committed states were bitwise equal.
+
+All 44 operation cells passed, including graph padding and replaying a
+wider accepted prefix in a narrower subsequent iteration. All 32 contract
+cases, 384 development serving responses, and 208 long serving responses
+passed. The 208 long responses matched batch 1 token for token. The only
+development serving differences from batch 1 occurred at the same zero-gap
+tie in one concurrency-64 replica and one concurrency-128 replica. An ordinary temperature 0.8 HTTP
+request also completed.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 14.08 | 2.389 | 418.56 |
+| 1024 | 1024 | 35.66 | 2.632 | 380.00 |
+| 4096 | 1024 | 126.27 | 2.867 | 348.80 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4110.60 | 927.00 | 6.452 |
+| 128 | 128 | 6261.63 | 2681.45 | 17.304 |

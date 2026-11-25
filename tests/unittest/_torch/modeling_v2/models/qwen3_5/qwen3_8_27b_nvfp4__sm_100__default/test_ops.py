@@ -246,24 +246,38 @@ def test_gdn_replay_acceptance(cell) -> None:
     )
     batches = torch.arange(batch, device="cuda")
     state_slots = slots.long()
-    replay_slots = replay.slots.long()
-    for offset in (1, 2, 0, 1):
+    dummy = batches % 2 == 1 if cell.spec.get("masked") else None
+    active = ~dummy if dummy is not None else slice(None)
+    replay_slots = replay.slots.long()[active]
+    saved = temporal[state_slots[dummy]].clone() if dummy is not None else None
+    widths = cell.spec.get("verify_widths", (width,) * 4)
+    for offset, width in zip((1, 2, 0, 1), widths, strict=True):
         x, ba = _random(batch * width, 16384), _random(batch * width, 96)
         inputs = x, ba, weight, decay, bias
-        actual = gdn_verify(*inputs, conv, temporal, slots, verify_conv, None, width, replay)
+        actual = gdn_verify(
+            *inputs, conv, temporal, slots, verify_conv, None, width, replay, dummy=dummy
+        )
         expected = gdn_verify(
             *inputs, full_conv, full_state, slots, full_conv_steps, full_ssm_steps, width
         )
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual = actual.view(batch, width, -1)
+        expected = expected.view(batch, width, -1)
+        torch.testing.assert_close(actual[active], expected[active], atol=0, rtol=0)
         torch.testing.assert_close(
-            verify_conv[:, :width], full_conv_steps[:, :width], atol=0, rtol=0
+            verify_conv[active, :width], full_conv_steps[active, :width], atol=0, rtol=0
         )
+        if dummy is not None:
+            torch.testing.assert_close(
+                actual[dummy], torch.zeros_like(actual[dummy]), atol=0, rtol=0
+            )
+            torch.testing.assert_close(temporal[state_slots[dummy]], saved, atol=0, rtol=0)
         accepted = (batches + offset).to(torch.int32) % width + 1
-        conv[state_slots] = verify_conv[batches, accepted - 1]
+        conv[state_slots[active]] = verify_conv[batches[active], accepted[active] - 1]
         full_conv[state_slots] = full_conv_steps[batches, accepted - 1]
         full_state[state_slots] = full_ssm_steps[batches, accepted - 1]
         prior = replay.accepted[replay_slots]
         checkpoint = prior + step_width > history_size
+        accepted = accepted[active]
         replay.accepted[replay_slots] = torch.where(checkpoint, accepted, prior + accepted)
         bank = replay.banks[replay_slots]
         replay.banks[replay_slots] = torch.where(checkpoint, 1 - bank, bank)

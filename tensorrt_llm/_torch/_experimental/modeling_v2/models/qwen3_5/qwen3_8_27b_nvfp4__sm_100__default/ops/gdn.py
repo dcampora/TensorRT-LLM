@@ -262,8 +262,22 @@ class GatedDeltaVerify(OpWrapper):
             spec={"batch": 1, "width": 5, "replay": True, "commit_width": 5},
         ),
         Cell(
-            why="Batched first-row commits with fewer drafts than the buffer permits",
-            spec={"batch": 64, "width": 2, "replay": True, "commit_width": 5},
+            why="The accepted prefix can be wider than the next verification",
+            spec={
+                "batch": 64,
+                "width": 4,
+                "replay": True,
+                "commit_width": 5,
+                "verify_widths": (4, 2, 4, 2),
+            },
+        ),
+        Cell(
+            why="CUDA graph padding does not read or update a recurrent state",
+            spec={"batch": 8, "width": 2, "replay": True, "commit_width": 5, "masked": True},
+        ),
+        Cell(
+            why="The full serving graph uses a warp per four state vectors",
+            spec={"batch": 128, "width": 2, "replay": True, "commit_width": 5},
         ),
     )
 
@@ -281,12 +295,16 @@ class GatedDeltaVerify(OpWrapper):
         intermediate_ssm: torch.Tensor | None,
         width: int,
         replay: Replay | None = None,
+        *,
+        dummy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch = slots.shape[0]
         rows = batch * width
         pdl = rows <= 8
-        qk = gates = None
+        qk = gates = mask = None
+        one_step = replay is not None and replay.deltas.shape[2] == intermediate_conv.shape[1]
         if replay is not None and batch >= 8:
+            mask = dummy if one_step else None
             qk = x.new_empty((rows, 4096), dtype=torch.float32)
             gates = x.new_empty((rows, 96), dtype=torch.float32)
             convolved = x.new_empty((rows, 6144))
@@ -308,6 +326,7 @@ class GatedDeltaVerify(OpWrapper):
                 *intermediate_conv.stride(),
                 width,
                 parts,
+                mask,
                 num_warps=parts,
             )
         else:
@@ -348,6 +367,26 @@ class GatedDeltaVerify(OpWrapper):
                 pdl,
                 num_warps=1,
                 launch_pdl=pdl,
+            )
+        elif qk is not None and one_step:
+            verify.verify_prepared_step[(32, batch * 48)](
+                qk,
+                convolved,
+                gates,
+                state,
+                slots,
+                *replay,
+                output,
+                state.stride(0),
+                replay.accepted.stride(0),
+                replay.banks.stride(0),
+                replay.deltas.stride(0),
+                replay.keys.stride(0),
+                replay.decays.stride(0),
+                width,
+                replay.deltas.shape[2],
+                mask,
+                num_warps=1,
             )
         else:
             verify.verify_replay[grid](

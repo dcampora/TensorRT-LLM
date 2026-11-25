@@ -89,9 +89,13 @@ def verify_prepare(
     I_TIME: gl.constexpr,
     WIDTH: gl.constexpr,
     PARTS: gl.constexpr,
+    Dummy=None,
 ):
     # Adapted from aegis-engines cb6779a, batch_spec_kernels.py.
     group, seq = gl.program_id(0), gl.program_id(1)
+    if Dummy is not None:
+        if gl.load(Dummy + seq):
+            return
     layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [PARTS, 1], [1, 0])
     part = group * PARTS + gl.arange(0, PARTS, layout=gl.SliceLayout(1, layout))
     lane = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
@@ -297,3 +301,85 @@ def verify_replay(
                     tl.store(kp + (off * 16 + group) * 128 + kc, key)
     if PDL:
         launch_dependents()
+
+
+@gluon.jit
+def verify_prepared_step(
+    QK,
+    Value,
+    Gates,
+    State,
+    StateSlots,
+    ReplaySlots,
+    Accepted,
+    Banks,
+    Deltas,
+    Keys,
+    Decays,
+    Output,
+    STATE_STRIDE: gl.constexpr,
+    ACCEPTED_STRIDE: gl.constexpr,
+    BANK_STRIDE: gl.constexpr,
+    DELTA_SLOT: gl.constexpr,
+    KEY_SLOT: gl.constexpr,
+    DECAY_SLOT: gl.constexpr,
+    WIDTH: gl.constexpr,
+    HISTORY: gl.constexpr,
+    Dummy=None,
+):
+    # Keep one warp on the four full key vectors. Each output row
+    # reduces over the same key lane order in every verifier width.
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [1, 1], [1, 0])
+    tile, work = gl.program_id(0), gl.program_id(1)
+    seq, head = work // 48, work % 48
+    group = head // 3
+    kc = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+    vc = tile * 4 + gl.arange(0, 4, layout=gl.SliceLayout(1, layout))
+    if Dummy is not None:
+        if gl.load(Dummy + seq):
+            for i in gl.static_range(WIDTH):
+                row = seq * WIDTH + i
+                gl.store(Output + (row * 48 + head) * 128 + vc, 0.0)
+            return
+    state_slot = gl.load(StateSlots + seq).to(gl.int64)
+    replay_slot = gl.load(ReplaySlots + seq).to(gl.int64)
+    count = gl.load(Accepted + replay_slot * ACCEPTED_STRIDE)
+    bank = gl.load(Banks + replay_slot * BANK_STRIDE)
+
+    dp = Deltas + replay_slot * DELTA_SLOT
+    kp = Keys + replay_slot * KEY_SLOT
+    gp = Decays + replay_slot * DECAY_SLOT + head * HISTORY
+    state_ptr = State + state_slot * STATE_STRIDE
+    state_ptr += head * 16384 + vc[:, None] * 128 + kc[None, :]
+    state = gl.load(state_ptr, cache_modifier=".cg")
+    for i in range(1, count):
+        off = bank * HISTORY + i
+        delta = gl.load(dp + (off * 48 + head) * 128 + vc)
+        key = gl.load(kp + (off * 16 + group) * 128 + kc)
+        decay = gl.load(gp + bank * (48 * HISTORY) + i)
+        state = gl.fma(delta[:, None], key[None, :], state * decay)
+    # The runtime flips the bank whenever this slot holds a previous step.
+    bank = bank ^ (count > 0).to(gl.int32)
+
+    for i in gl.static_range(WIDTH):
+        row = seq * WIDTH + i
+        channel = group * 128 + kc
+        q = gl.load(QK + row * 4096 + channel)
+        k = gl.load(QK + row * 4096 + 2048 + channel)
+        v = gl.load(Value + (row * 48 + head) * 128 + vc).to(gl.float32)
+        decay = gl.load(Gates + row * 96 + head)
+        beta = gl.load(Gates + row * 96 + 48 + head)
+        state *= decay
+        delta = (v - gl.sum(state * k[None, :], 1)) * beta
+        state = gl.fma(delta[:, None], k[None, :], state)
+        result = gl.sum(state * q[None, :], 1)
+        gl.store(Output + (row * 48 + head) * 128 + vc, result)
+        if i == 0:
+            gl.store(state_ptr, state, cache_modifier=".cs")
+        else:
+            off = bank * HISTORY + i
+            gl.store(dp + (off * 48 + head) * 128 + vc, delta)
+            if tile == 0:
+                gl.store(gp + bank * (48 * HISTORY) + i, decay)
+                if head % 3 == 0:
+                    gl.store(kp + (off * 16 + group) * 128 + kc, k)

@@ -84,6 +84,7 @@ class Step(NamedTuple):
     decode_width: int
     verify: bool
     replay_slots: torch.Tensor | None
+    dummy: torch.Tensor | None
 
 
 class Layer(nn.Module):
@@ -168,6 +169,7 @@ class Layer(nn.Module):
                 cache.intermediate_ssm,
                 step.decode_width,
                 replay,
+                dummy=step.dummy,
             )
         else:
             decoded = gdn_decode(*args)
@@ -355,6 +357,7 @@ class Qwen38Decoder(DecoderModel):
         if num_decodes:
             decode_rows = x.shape[0] - ctx_rows
             replay_slots = mamba.replay_state_indices
+            dummy = md.kv_cache_manager._dummy_request_mask if verify else None
             step = Step(
                 None,
                 None,
@@ -368,6 +371,7 @@ class Qwen38Decoder(DecoderModel):
                 decode_rows // num_decodes,
                 verify,
                 replay_slots[contexts : md.num_seqs] if replay_slots is not None else None,
+                dummy[contexts : md.num_seqs] if dummy is not None else None,
             )
             hidden.append(x[ctx_rows:])
             steps.append(step)
@@ -426,6 +430,7 @@ class Qwen38Decoder(DecoderModel):
             positions,
             1,
             False,
+            None,
             None,
         )
 
