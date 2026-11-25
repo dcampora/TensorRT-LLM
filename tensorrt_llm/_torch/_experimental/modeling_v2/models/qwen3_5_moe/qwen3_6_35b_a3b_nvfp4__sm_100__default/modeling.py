@@ -52,6 +52,7 @@ class Step:
     width: int
     replay_slots: torch.Tensor | None
     replay_width: int
+    context_sizes: tuple[int, ...] = ()
 
     @classmethod
     def from_metadata(cls, md, position_ids, request_indices, spec_metadata):
@@ -71,12 +72,13 @@ class Step:
             replay_slots = mamba.replay_state_indices[contexts:batch]
             replay_width = md.kv_cache_manager.get_replay_state_update_metadata().replay_step_width
         cu = initial = None
+        lengths = tuple(map(int, md.seq_lens[:contexts]))
         longest = 0
         if contexts:
             context_rows = mamba.seq_idx.reshape(-1)[:ctx].int()
             rows = torch.cat((context_rows, rows)) if md.num_generations else context_rows
             cu = mamba.query_start_loc_long[: contexts + 1]
-            longest = int(max(md.seq_lens[:contexts]))
+            longest = int(max(lengths))
             if mamba.use_initial_states:
                 initial = mamba.has_initial_states[:contexts]
         return cls(
@@ -93,6 +95,7 @@ class Step:
             width,
             replay_slots,
             replay_width,
+            lengths,
         )
 
 
@@ -329,9 +332,9 @@ class QwenDecoder(DecoderModel):
             x = self.embed_tokens(input_ids[: step.positions.numel()])
         else:
             x = inputs_embeds[: step.positions.numel()]
-        if 0 < step.contexts < step.batch <= 8:
-            # Small mixed steps preserve the arithmetic of the matching
-            # single-phase graph for each set of rows.
+        if 0 < step.contexts < step.batch and (step.batch <= 8 or step.context_tokens <= 128):
+            # Small context chunks can take the same routes as separate
+            # context-only and decode-only batches.
             contexts, tokens = step.contexts, step.context_tokens
             context_step = replace(
                 step,
@@ -345,7 +348,7 @@ class QwenDecoder(DecoderModel):
             generation_step = replace(
                 step,
                 positions=step.positions[tokens:],
-                request_rows=step.request_rows[tokens:],
+                request_rows=step.request_rows[tokens:] - contexts,
                 slots=step.slots[contexts:],
                 batch=step.batch - contexts,
                 contexts=0,
@@ -353,14 +356,49 @@ class QwenDecoder(DecoderModel):
                 cu=None,
                 has_initial=None,
                 max_context=0,
+                context_sizes=(),
             )
             return torch.cat(
                 (
-                    self._forward(x[:tokens], context_step, block_offsets, False),
-                    self._forward(x[tokens:], generation_step, block_offsets, False),
+                    self._prefill_contexts(
+                        x[:tokens], context_step, block_offsets[:, :contexts], False
+                    ),
+                    self._forward(x[tokens:], generation_step, block_offsets[:, contexts:], False),
                 )
             )
+        if step.contexts == step.batch:
+            return self._prefill_contexts(x, step, block_offsets, prefill_graph)
         return self._forward(x, step, block_offsets, prefill_graph)
+
+    def _prefill_contexts(self, x, step, block_offsets, prefill_graph):
+        if not (1 < step.contexts <= 8 and step.context_tokens <= 256):
+            return self._forward(x, step, block_offsets, prefill_graph)
+        # Small ragged chunks retain each sequence's own GEMM and GDN
+        # launch geometry. The page table slice makes its request index zero.
+        output = []
+        start = 0
+        for req, size in enumerate(step.context_sizes):
+            end = start + size
+            substep = replace(
+                step,
+                positions=step.positions[start:end],
+                request_rows=torch.zeros_like(step.request_rows[start:end]),
+                slots=step.slots[req : req + 1],
+                context_tokens=size,
+                contexts=1,
+                batch=1,
+                cu=step.cu[req : req + 2] - start,
+                has_initial=step.has_initial[req : req + 1]
+                if step.has_initial is not None
+                else None,
+                max_context=size,
+                context_sizes=(size,),
+            )
+            output.append(
+                self._forward(x[start:end], substep, block_offsets[:, req : req + 1], False)
+            )
+            start = end
+        return torch.cat(output)
 
     def _forward(self, x, step, block_offsets, prefill_graph):
         side = None if prefill_graph else self.side

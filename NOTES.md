@@ -706,3 +706,27 @@ measured requests for concurrency 1, 32, and 128 respectively.
 | 1024 | 1024 | 1 | 669.8 | 24.87 |
 | 1024 | 1024 | 32 | 6427.1 | 222.00 |
 | 1024 | 1024 | 128 | 10707.4 | 311.76 |
+
+## Short ragged context chunks
+
+When a small context chunk lands in a mixed step, the model runs the
+context and decode portions with their respective GEMM and recurrence
+layouts. Short ragged context-only sub-batches run each prompt using
+its own row count. The two phase views translate request-row indices
+to the corresponding slices of the runtime's physical page table.
+
+All 32 engine items passed again. At concurrency 8, the batch-1
+comparison went from 15 to 28 exact matches and both HTTP checks
+passed. The batch-1 comparison also passed at concurrency 24. The
+external oracle still found strict differences at 16, 24, and 48.
+The batch-1 comparison still found strict differences at 16, 48, and 64.
+
+| ISL | OSL | HTTP concurrency | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 670.9 | 22.82 |
+| 1024 | 1024 | 32 | 6599.7 | 209.18 |
+| 1024 | 1024 | 128 | 11136.1 | 282.96 |
+
+`AEGIS_MODELING_V2=off ./serve.sh /model` now keeps the same MTP
+and CUDA graph settings for paired tests. Set `AEGIS_MTP_DRAFTS=0`
+and `AEGIS_PREFILL_GRAPHS=0` to reproduce the initial V1 run.
