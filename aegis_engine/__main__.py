@@ -121,6 +121,11 @@ def _build_llm(model: Path, mode: Literal["require", "off"], draft_len: int) -> 
     from tensorrt_llm.llmapi import KvCacheConfig
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
+    prefill_graph = (
+        dict(prefill_cuda_graph_backend="breakable", prefill_capture_num_tokens=[128, 1024, 4096])
+        if draft_len and mode == "require"
+        else {}
+    )
     return LLM(
         model,
         modeling_v2=mode,
@@ -137,6 +142,7 @@ def _build_llm(model: Path, mode: Literal["require", "off"], draft_len: int) -> 
             mamba_ssm_cache_dtype="auto" if mode == "off" and draft_len == 0 else "float32",
         ),
         speculative_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len else None,
+        **prefill_graph,
     )
 
 
@@ -179,4 +185,4 @@ def main(mode: Literal["require", "off"] = "require", draft_len: int = 0) -> Non
 
 
 if __name__ == "__main__":
-    main(draft_len=3)
+    main(draft_len=4)

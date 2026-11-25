@@ -2878,6 +2878,15 @@ class DecoderInputPreparer:
                     or supports_mixed_breakable
                 )
             )
+            if getattr(layer_model, "prefill_cuda_graph_single_fresh_context", False):
+                contexts = scheduled_requests.context_requests
+                breakable_eligible = (
+                    breakable_eligible
+                    and len(contexts) == 1
+                    and not scheduled_requests.generation_requests
+                    and contexts[0].context_current_position == 0
+                    and total_num_tokens in self._config.prefill_cuda_graph_num_tokens
+                )
             if replay_plan is not None and replay_plan.replays_local_tokens and not is_dummy:
                 logger.debug(
                     "Breakable prefill CUDA graph is unavailable for batches that "

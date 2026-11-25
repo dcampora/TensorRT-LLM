@@ -5,7 +5,7 @@
 from typing import TYPE_CHECKING
 
 from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_required, is_gdn_replay_enabled
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, PrefillCudaGraphBackend
 
 from ..._router_index import NoTarget, routes
 
@@ -81,6 +81,8 @@ def route(
         raise NoTarget("Qwen3.8-27B FP8 requires TRTLLM attention metadata and beam width 1")
     if llm_args.sparse_attention_config is not None:
         raise NoTarget("Qwen3.8-27B FP8 uses dense full-attention layers")
+    if llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
+        raise NoTarget("Qwen3.8-27B FP8 supports breakable prefill CUDA graphs")
     spec = model_config.spec_config
     if spec is not None:
         if (
@@ -101,8 +103,8 @@ def route(
             raise NoTarget("Qwen3.8-27B MTP needs a float32 recurrent cache")
         if not is_gdn_replay_enabled() or is_gdn_flashinfer_replay_required():
             raise NoTarget("Qwen3.8-27B MTP needs the hybrid manager's double-buffer replay")
-    if llm_args.enable_lora or llm_args.mm_encoder_only:
-        raise NoTarget("Qwen3.8-27B FP8 serves the text decoder without adapters")
+    if not llm_args.disable_mm_encoder or llm_args.mm_encoder_only or llm_args.enable_lora:
+        raise NoTarget("Qwen3.8-27B FP8 serves the text decoder with the media encoder disabled")
     if llm_args.cache_transceiver_config is not None or llm_args.kv_connector_config is not None:
         raise NoTarget("Qwen3.8-27B FP8 requires a local hybrid KV cache")
 

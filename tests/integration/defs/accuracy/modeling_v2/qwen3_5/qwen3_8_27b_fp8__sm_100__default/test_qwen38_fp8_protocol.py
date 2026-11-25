@@ -179,3 +179,60 @@ def test_qwen38_fp8_mixed_prefill(model_path: Path) -> None:
         assert mixed[3].outputs[0].token_ids == solo
     finally:
         llm.shutdown()
+
+
+def test_qwen38_fp8_exact_prefill_graph(model_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replay exact buckets and retain the eager result on either side of each bucket."""
+    from transformers import AutoTokenizer
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    buckets = [128, 1024, 4096]
+    lengths = [127, 128, 129, 1024, 4096, 1025, 128]
+    replays: list[int] = []
+    execute = BreakableCUDAGraphRunner.execute
+
+    def count_replay(self, num_tokens, outer_forward):
+        if not self.is_capturing_break_graphs:
+            replays.append(num_tokens)
+        return execute(self, num_tokens, outer_forward)
+
+    monkeypatch.setattr(BreakableCUDAGraphRunner, "execute", count_replay)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    text = tokenizer.encode("Compare the memory usage and throughput of a paged KV cache. " * 512)
+    params = SamplingParams(max_tokens=24, temperature=0, ignore_eos=True, detokenize=False)
+
+    def run(prefill_backend: str) -> list[list[int]]:
+        with LLM(
+            model_path,
+            modeling_v2="require",
+            disable_mm_encoder=True,
+            skip_tokenizer_init=True,
+            max_batch_size=1,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            cuda_graph_config={"batch_sizes": [1]},
+            prefill_cuda_graph_backend=prefill_backend,
+            prefill_capture_num_tokens=buckets if prefill_backend == "breakable" else None,
+            speculative_config=MTPDecodingConfig(max_draft_len=4),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                max_tokens=8192,
+                host_cache_size=0,
+                mamba_ssm_cache_dtype="float32",
+            ),
+        ) as llm:
+            replays.clear()
+            return [
+                llm.generate(text[:length], params, use_tqdm=False).outputs[0].token_ids
+                for length in lengths
+            ]
+
+    eager = run("disabled")
+    graphed = run("breakable")
+    assert graphed == eager
+    assert replays == [length for length in lengths if length in buckets]

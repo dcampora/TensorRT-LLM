@@ -3,7 +3,7 @@
 """Text decoder for the official Qwen3.8-27B block-scaled FP8 checkpoint."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import accumulate
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +16,7 @@ from torch import nn
 
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
 from .... import disable_v2_by_default
@@ -166,6 +167,9 @@ class Step:
     host_offsets: list[int] | None = None
     context_lengths: list[int] | None = None
     initial_slots: torch.Tensor | None = None
+    context_seq_idx: torch.Tensor | None = None
+    context_has_initial: torch.Tensor | None = None
+    context_use_initial: bool = False
     short_contexts: ShortContexts | None = None
 
     @classmethod
@@ -198,6 +202,9 @@ class Step:
             step.context_lengths = lengths
             step.host_offsets = list(accumulate(lengths, initial=0))
             step.context_offsets = mamba.cu_seqlens[: contexts + 1]
+            step.context_seq_idx = mamba.seq_idx
+            step.context_has_initial = mamba.has_initial_states[:contexts]
+            step.context_use_initial = mamba.use_initial_states
             step.initial_slots = torch.where(
                 mamba.has_initial_states[:contexts], step.context_slots, -1
             )
@@ -285,7 +292,6 @@ class DecoderLayer(nn.Module):
         step: Step,
     ) -> torch.Tensor:
         manager = step.metadata.kv_cache_manager
-        mamba = step.metadata.mamba_metadata
         state = manager.get_ssm_states(self.index)
         conv_state = manager.get_conv_states(self.index)
         split = step.context_rows
@@ -311,8 +317,8 @@ class DecoderLayer(nn.Module):
                     conv_state,
                     step.context_slots,
                     step.context_offsets,
-                    mamba.seq_idx,
-                    mamba.has_initial_states,
+                    step.context_seq_idx,
+                    step.context_has_initial,
                 )
             decay, beta = delta_gates(ba, self.a_log, self.dt_bias)
             assert step.context_lengths is not None and step.context_offsets is not None
@@ -325,8 +331,8 @@ class DecoderLayer(nn.Module):
                         conv_state,
                         step.context_slots,
                         step.context_offsets,
-                        mamba.seq_idx,
-                        mamba.has_initial_states,
+                        step.context_seq_idx,
+                        step.context_has_initial,
                     )
                 else:
                     q, k, v = (
@@ -339,7 +345,7 @@ class DecoderLayer(nn.Module):
                     v,
                     decay,
                     beta,
-                    initial_state=state if mamba.use_initial_states else None,
+                    initial_state=state if step.context_use_initial else None,
                     output_final_state=True,
                     output_state=state,
                     state_indices=step.initial_slots,
@@ -459,8 +465,10 @@ class DecoderLayer(nn.Module):
         short = step.short_contexts
         split = step.context_rows
         if short is not None and short.rows is None and split == p.shape[0]:
-            pages, table, divisor = paged_kv_view(md, self.index)
-            seq_ids = md.mamba_metadata.seq_idx if md.num_contexts > 1 else None
+            pages, table, divisor = paged_kv_view(
+                md, self.index, step.attention_args["kv_cache_block_offsets"]
+            )
+            seq_ids = step.context_seq_idx if md.num_contexts > 1 else None
             append_short_context_kv(qkv, pages, table, divisor, short.offsets, seq_ids)
             return self._short_attention(qkv, p, short)
 
@@ -572,12 +580,16 @@ class TokenEmbedding(nn.Module):
 class Qwen38TextModel(DecoderModel):
     """Qwen3.8's text embedding, hybrid decoder, and final normalization."""
 
-    supports_prefill_cuda_graph = False
+    supports_prefill_cuda_graph = True
+    prefill_cuda_graph_single_fresh_context = True
 
     def __init__(self, model_config: "ModelConfig") -> None:
         super().__init__(model_config)
         self.config = model_config.pretrained_config
         self.embed_tokens = TokenEmbedding()
+        self._prefill_plans: dict[int, Step] = {}
+        self._prefill_pool: tuple[int, torch.Size] | None = None
+        self._prefill_step: Step | None = None
         self.aux_stream_dict = {}  # The draft is TP1 and has no auxiliary collectives.
         if model_config.spec_config is not None:
             from .draft import DraftLayer
@@ -592,6 +604,56 @@ class Qwen38TextModel(DecoderModel):
         for name in ("final_norm", "rope", "gate_workspace", "gemm_workspace"):
             self.register_buffer(name, None)
 
+    def stage_prefill_graph(
+        self, md: "TrtllmAttentionMetadata", position_ids: torch.Tensor
+    ) -> None:
+        """Stage the slot and page table of an exact-shape fresh prefill."""
+        assert md.num_contexts == md.num_seqs == 1 and md.padded_num_tokens is None
+        rows = md.num_ctx_tokens
+        positions = position_ids.reshape(-1, position_ids.shape[-1])[0]
+        pool = (id(md.kv_cache_manager), md.kv_cache_block_offsets.shape)
+        if pool != self._prefill_pool:
+            # Capacity profiling and the serving executor use different page pools.
+            self._prefill_plans.clear()
+            self._prefill_pool = pool
+        plan = self._prefill_plans.get(rows)
+        mamba = md.mamba_metadata
+        if plan is None:
+            speculative = self.model_config.spec_config is not None
+            plan = Step.prepare(md, positions, self.gate_workspace, speculative)
+            assert not plan.context_use_initial
+            assert plan.context_offsets is not None
+            assert plan.context_seq_idx is not None and plan.context_has_initial is not None
+            plan.positions = torch.empty_like(positions)
+            plan.context_slots = torch.empty_like(plan.context_slots)
+            plan.context_offsets = plan.context_offsets.clone()
+            plan.context_seq_idx = plan.context_seq_idx.clone()
+            plan.context_has_initial = plan.context_has_initial.clone()
+            if plan.short_contexts is not None:
+                plan.short_contexts = replace(
+                    plan.short_contexts, slots=plan.context_slots, offsets=plan.context_offsets
+                )
+            for name in (
+                "host_past_key_value_lengths",
+                "host_total_kv_lens",
+                "host_context_lengths",
+                "host_request_types",
+                "sequence_length",
+                "context_lengths",
+                "kv_cache_block_offsets",
+                "block_ids_per_seq",
+            ):
+                value = plan.attention_args[name]
+                if isinstance(value, torch.Tensor):
+                    plan.attention_args[name] = value.clone()
+            self._prefill_plans[rows] = plan
+        plan.positions.copy_(positions, non_blocking=True)
+        plan.context_slots.copy_(mamba.state_indices[:1], non_blocking=True)
+        plan.attention_args["kv_cache_block_offsets"].copy_(
+            md.kv_cache_block_offsets, non_blocking=True
+        )
+        self._prefill_step = plan
+
     def forward(
         self,
         attn_metadata: "TrtllmAttentionMetadata",
@@ -604,7 +666,9 @@ class Qwen38TextModel(DecoderModel):
         assert position_ids is not None
         positions = position_ids.reshape(-1, position_ids.shape[-1])[0]
         speculative = self.model_config.spec_config is not None
-        step = Step.prepare(attn_metadata, positions, self.gate_workspace, speculative)
+        step = self._prefill_step
+        if step is None:
+            step = Step.prepare(attn_metadata, positions, self.gate_workspace, speculative)
         x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         residual = None
         for layer in self.layers:
@@ -644,6 +708,23 @@ class ModelingV2Qwen38_27bFp8Sm100Default(SpecDecOneEngineForCausalLM):
                     "added_tokens_decoder", {}
                 )
                 self._draft_control_tokens.extend(map(int, added_tokens))
+
+    def forward(
+        self,
+        attn_metadata: "TrtllmAttentionMetadata",
+        input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        prefill_graph = is_in_breakable_cuda_graph()
+        if prefill_graph:
+            assert position_ids is not None
+            self.model.stage_prefill_graph(attn_metadata, position_ids)
+        try:
+            return super().forward(attn_metadata, input_ids, position_ids, **kwargs)
+        finally:
+            if prefill_graph:
+                self.model._prefill_step = None
 
     @classmethod
     def supports_spec_decode_fast_paths(cls, model_config: "ModelConfig") -> bool:

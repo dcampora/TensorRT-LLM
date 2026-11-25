@@ -476,3 +476,53 @@ lowered throughput at all three lengths.
 | 5 | Disabled | 1024 | 296.49 | 292.91 | 264.87 |
 | 6 | Disabled | 1024 | 310.97 | 289.36 | 248.87 |
 | 5 | Minimum match 4 | 1024 | 274.17 | 283.66 | 255.81 |
+
+## Exact-length prefill and serving configuration pilots
+
+The batch-1 generator captures breakable prefill CUDA graphs at 128,
+1,024, and 4,096 tokens. Fresh single-request batches of these exact
+lengths can replay a graph. The target stages the current positions,
+recurrent slot, and physical KV page table before replay. It rebuilds
+these plans when the cache manager changes between capacity profiling
+and serving. The shared decoder input preparer applies the exact-shape
+filter only when a model requests it. Other shapes, mixed steps,
+continuation chunks, and scoring run eagerly.
+
+With four MTP drafts and the three prefill graphs, the token protocol
+passed all 32 development items and both EOS checks. Mean KL stayed at
+0.003288 and non-tie top-1 agreement stayed at 99.909%. Decode
+throughput varied across the two chats at each ISL.
+
+| Batch | ISL | OSL | Prompt | TTFT (ms) | TPOT (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 1024 | 1 | 28.74 | 3.384 | 295.49 |
+| 1 | 128 | 1024 | 2 | 29.58 | 3.481 | 287.28 |
+| 1 | 1024 | 1024 | 1 | 44.75 | 3.434 | 291.19 |
+| 1 | 1024 | 1024 | 2 | 44.84 | 3.988 | 250.76 |
+| 1 | 4096 | 1024 | 1 | 130.69 | 4.052 | 246.82 |
+| 1 | 4096 | 1024 | 2 | 135.61 | 3.398 | 294.32 |
+
+The HTTP launcher returned the same development continuations at
+concurrency 1, 32, and 128. Five target routing tests and seven
+shared prefill graph tests passed on CPU. An initial integration
+control with a 4,352-token KV cap hit the runtime's page-table capacity
+error when scheduling a long request. The exact-bucket regression
+uses the launcher's 8,192-token cap.
+
+At ISL 1,024 and OSL 1,024, the serving pilots sent four chats at
+concurrency 1 and one wave of chats at each higher concurrency. All
+variants used the same passages from the checkout's README. The
+two-draft schedule applies above 32 requests.
+
+| Pilot | ISL | OSL | C1 tokens/s | C32 tokens/s | C128 tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prepared GDN control | 1024 | 1024 | 292.52 | 3993.39 | 6797.90 |
+| Two drafts above batch 32 | 1024 | 1024 | — | 3973.75 | 6508.59 |
+| Stream every three iterations | 1024 | 1024 | 293.07 | 4027.66 | 6820.40 |
+| 16,384-token step budget | 1024 | 1024 | — | 3996.21 | 6701.08 |
+| Four HTTP frontend processes | 1024 | 1024 | 294.04 | 4002.85 | 6793.25 |
+| 6,144-token sequence limit | 1024 | 1024 | 299.67 | 4048.07 | 6849.98 |
+
+The 16,384-token step budget produced 2,760.30 output tokens/s in the
+concurrency-32 pilot with ISL 4,096 and OSL 1,024. The smaller budget
+served the 1,024-token workload faster at concurrency 128.

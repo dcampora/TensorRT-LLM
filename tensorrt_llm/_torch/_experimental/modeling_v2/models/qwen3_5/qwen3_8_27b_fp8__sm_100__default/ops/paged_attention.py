@@ -44,7 +44,7 @@ def attention_arguments(md: "TrtllmAttentionMetadata", predicted: int) -> dict:
 
 
 def paged_kv_view(
-    md: "TrtllmAttentionMetadata", layer: int
+    md: "TrtllmAttentionMetadata", layer: int, block_offsets: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Return the BF16 physical pages and table for the model layer."""
     manager = md.kv_cache_manager
@@ -55,7 +55,8 @@ def paged_kv_view(
     divisor = 2 if scale % 2 == 0 else scale
     local_layer = manager.layer_offsets[layer]
     pool = int(md.host_kv_cache_pool_mapping[local_layer, 0])
-    table = md.kv_cache_block_offsets[pool, :, 0, :]
+    offsets = md.kv_cache_block_offsets if block_offsets is None else block_offsets
+    table = offsets[pool, :, 0, :]
     return pages, table, divisor
 
 
