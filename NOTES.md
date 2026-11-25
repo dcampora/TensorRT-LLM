@@ -112,6 +112,52 @@ The native NVFP4 GEMM tactics, indexed convolutions, GDN state updates, and
 heads that stage paged K/V are candidates for the family's `csrc/` when a
 full native build is available.
 
+### Validated Modeling V2 serving, ISL 1024 and OSL 1024
+
+`serve.sh` returned the configured model name and token-ID completions.
+The OpenAI completions endpoint passed the development oracle at
+concurrency 1, 32, and 128. Relative to the batch-1 engine's complete token
+lists, 32 of 32, 26 of 32, and 103 of 128 responses respectively were
+identical. The oracle checks apply its near-tie and fragile-position rule
+to each response.
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 160.34 | 65.92 | 6.178 |
+| 32 | 32 | 2941.47 | 726.76 | 10.167 |
+| 128 | 128 | 5359.29 | 2033.36 | 21.826 |
+
+### Split MTP, batch 1, ISL 128, 1024, 4096 and OSL 1024
+
+MTP loads the checkpoint's BF16 draft layer and shares the trunk's packed
+NVFP4 vocabulary projection. The draft runs through TensorRT-LLM's
+MTP-Eagle worker, using its own paged attention layer. The indexed
+convolution and temporal verify kernels adapt the standalone's
+`spec_kernels.py`. They replay the accepted GDN updates on the GPU and
+leave candidate deltas in two banks so the scheduler can accept a prefix
+without copying a full temporal state for every verified token.
+
+The shared GDN replay allocator accepts a history dtype from the target.
+The Qwen3.8 target selects FP32 history to preserve the state update
+precision and the existing allocator default is BF16. Disabling replay
+uses the runtime's ordinary full-state checkpoints. Both paths produced
+identical batch-1 development generations. The contract wrapper uses
+ordinary sampling for teacher-forced context logits and four drafts for
+generation. Across the 32 development prompts, it measured raw top-20
+KL 0.008055, conditional KL 0.008032, and non-tie top-1 agreement of
+99.54%. All 32 greedy generations passed and matched the preceding
+batch-1 engine token for token. Three operation cells cover the verify
+and replay transitions, including bank flips and independent state slots.
+
+Each row is the external median of three paired 32- and 1024-output
+measurements with the same natural-English chat prompts as the baseline.
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 64.83 | 3.097 | 322.87 |
+| 1024 | 1024 | 64.94 | 3.421 | 292.32 |
+| 4096 | 1024 | 133.05 | 3.662 | 273.05 |
+
 ## Standalone comparison
 
 The original `/ref-engine/engine.sh` copy crashed while instantiating its

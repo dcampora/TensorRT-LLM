@@ -123,8 +123,19 @@ def route(
         )
     if llm_args.max_beam_width != 1 or model_config.lora_config is not None:
         raise NoTarget("Qwen3.8-27B NVFP4 requires beam width 1 and no LoRA adapters")
-    if llm_args.cache_transceiver_config is not None or model_config.spec_config is not None:
-        raise NoTarget("Qwen3.8-27B NVFP4 currently uses one engine without speculative decoding")
+    if llm_args.cache_transceiver_config is not None:
+        raise NoTarget("Qwen3.8-27B NVFP4 requires one engine for context and generation")
+    spec = model_config.spec_config
+    if spec is not None:
+        if (
+            not spec.spec_dec_mode.is_mtp_eagle_one_model()
+            or spec.uses_external_draft_model
+            or spec.use_dynamic_tree
+            or spec.use_relaxed_acceptance_for_thinking
+            or spec.sa_config is not None
+            or not 1 <= spec.max_draft_len <= 4
+        ):
+            raise NoTarget("Qwen3.8-27B supports linear one-model MTP with up to four drafts")
     if llm_args.prefill_cuda_graph_backend.value != "disabled":
         raise NoTarget("Qwen3.8-27B NVFP4 supports CUDA graphs for decode")
 

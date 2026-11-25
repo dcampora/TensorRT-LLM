@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 import triton as tr
 
 from .....catalog._op import Arch, Cell, OpWrapper
-from ..kernels import gdn_prefill, recurrent
+from ..kernels import gdn_prefill, recurrent, verify
 from ..kernels.pointwise import gated_norm
 
 
@@ -231,6 +232,142 @@ class GatedDeltaContext(OpWrapper):
         )
 
 
+class Replay(NamedTuple):
+    slots: torch.Tensor
+    accepted: torch.Tensor
+    banks: torch.Tensor
+    deltas: torch.Tensor
+    keys: torch.Tensor
+    decays: torch.Tensor
+
+
+class GatedDeltaVerify(OpWrapper):
+    """Evaluate each draft prefix and save the states the runtime can promote."""
+
+    ARCHS = frozenset({Arch.SM_100})
+    CELLS = (
+        Cell(why="Four drafts for single-request decode", spec={"batch": 1, "width": 5}),
+        Cell(why="One draft per request with indexed states", spec={"batch": 32, "width": 2}),
+    )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        ba: torch.Tensor,
+        weight: torch.Tensor,
+        log_decay: torch.Tensor,
+        bias: torch.Tensor,
+        history: torch.Tensor,
+        state: torch.Tensor,
+        slots: torch.Tensor,
+        intermediate_conv: torch.Tensor,
+        intermediate_ssm: torch.Tensor | None,
+        width: int,
+        replay: Replay | None = None,
+    ) -> torch.Tensor:
+        batch = slots.shape[0]
+        rows = batch * width
+        convolved = x.new_empty((rows, 10240))
+        pdl = rows <= 8
+        verify.verify_conv[(batch, 40)](
+            x,
+            weight,
+            history,
+            slots,
+            convolved,
+            intermediate_conv,
+            x.stride(0),
+            *history.stride(),
+            *intermediate_conv.stride(),
+            width,
+            256,
+            pdl,
+            num_warps=4,
+            launch_pdl=pdl,
+        )
+        output = x.new_empty((rows, 6144))
+        if replay is None:
+            verify.verify_state[(4, batch * 48)](
+                convolved,
+                ba,
+                log_decay,
+                bias,
+                state,
+                slots,
+                output,
+                intermediate_ssm,
+                state.stride(0),
+                *intermediate_ssm.stride()[:2],
+                width,
+                32,
+                pdl,
+                num_warps=1,
+                launch_pdl=pdl,
+            )
+        else:
+            verify.verify_replay[(4, batch * 48)](
+                convolved,
+                ba,
+                log_decay,
+                bias,
+                state,
+                slots,
+                *replay,
+                output,
+                state.stride(0),
+                replay.accepted.stride(0),
+                replay.banks.stride(0),
+                replay.deltas.stride(0),
+                replay.keys.stride(0),
+                replay.decays.stride(0),
+                width,
+                intermediate_conv.shape[1],
+                replay.deltas.shape[2],
+                32,
+                pdl,
+                num_warps=1,
+                launch_pdl=pdl,
+            )
+        return output
+
+    def reference(
+        self,
+        x: torch.Tensor,
+        ba: torch.Tensor,
+        weight: torch.Tensor,
+        log_decay: torch.Tensor,
+        bias: torch.Tensor,
+        history: torch.Tensor,
+        state: torch.Tensor,
+        slots: torch.Tensor,
+        intermediate_conv: torch.Tensor,
+        intermediate_ssm: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        active = slots.long()
+        h = history.index_select(0, active)
+        s = state.index_select(0, active)
+        batch_slots = torch.arange(active.numel(), device=x.device)
+        outputs = []
+        for i in range(width):
+            y = _reference_recurrence(
+                x[i::width],
+                ba[i::width],
+                weight,
+                log_decay,
+                bias,
+                h,
+                s,
+                batch_slots,
+                [1] * active.numel(),
+                [True] * active.numel(),
+            )
+            intermediate_conv[: active.numel(), i].copy_(h)
+            intermediate_ssm[: active.numel(), i].copy_(s)
+            outputs.append(y)
+        return torch.stack(outputs, dim=1).flatten(0, 1)
+
+
 class GatedRmsNorm(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
@@ -289,4 +426,5 @@ class GatedRmsNorm(OpWrapper):
 
 gdn_decode = GatedDeltaDecode()
 gdn_context = GatedDeltaContext()
+gdn_verify = GatedDeltaVerify()
 gated_rmsnorm = GatedRmsNorm()

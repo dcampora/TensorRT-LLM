@@ -20,11 +20,15 @@ import triton as tr
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+from tensorrt_llm._torch.speculative.utils import get_spec_worker
+from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 
 from ...._router_index import disable_v2_by_default
 from . import weights
+from .mtp import MtpDraft, MtpLayer
 from .ops.attention import apply_gate, prepare_qkv
-from .ops.gdn import Context, gated_rmsnorm, gdn_context, gdn_decode
+from .ops.gdn import Context, Replay, gated_rmsnorm, gdn_context, gdn_decode, gdn_verify
 from .ops.paged import (
     Cache,
     append_kv,
@@ -62,6 +66,9 @@ class Step(NamedTuple):
     projection_rows: int
     mlp_rows: torch.Tensor
     positions: torch.Tensor
+    decode_width: int
+    verify: bool
+    replay_slots: torch.Tensor | None
 
 
 class Layer(nn.Module):
@@ -113,8 +120,17 @@ class Layer(nn.Module):
             )
         if context_rows < rows:
             decode_rows = rows - context_rows
-            ba = F.linear(_pad(x[context_rows:], _PREFILL_MIN_ROWS), self.ba)[:decode_rows]
-            decoded = gdn_decode(
+            x_decode = x[context_rows:]
+            if decode_rows <= _PREFILL_MIN_ROWS:
+                ba = F.linear(_pad(x_decode, _PREFILL_MIN_ROWS), self.ba)[:decode_rows]
+            else:
+                ba = torch.cat(
+                    [
+                        F.linear(_pad(tile, _PREFILL_MIN_ROWS), self.ba)[: tile.shape[0]]
+                        for tile in x_decode.split(_PREFILL_MIN_ROWS)
+                    ]
+                )
+            args = (
                 projection[context_rows:],
                 ba,
                 self.conv_weight,
@@ -124,6 +140,26 @@ class Layer(nn.Module):
                 cache.temporal,
                 step.state_slots[len(step.context_spans) :],
             )
+            if step.verify:
+                replay = None
+                if cache.old_x is not None:
+                    replay = Replay(
+                        step.replay_slots,
+                        cache.prev_num_accepted_tokens,
+                        cache.cache_buf_idx,
+                        cache.old_x,
+                        cache.old_B,
+                        cache.old_dt,
+                    )
+                decoded = gdn_verify(
+                    *args,
+                    cache.intermediate_conv_window,
+                    cache.intermediate_ssm,
+                    step.decode_width,
+                    replay,
+                )
+            else:
+                decoded = gdn_decode(*args)
             if not context_rows:
                 packed = gated_rmsnorm(
                     decoded,
@@ -157,8 +193,10 @@ class Layer(nn.Module):
         )
         table = step.block_offsets[cache.group, :, 0]
         if decode:
-            append_kv(k, v, step.positions, cache, table, None)
-            result = decode_attention(q, gate, step.positions, cache, table, self.out.input_scale)
+            append_kv(k, v, step.positions, cache, table, None, step.decode_width)
+            result = decode_attention(
+                q, gate, step.positions, cache, table, self.out.input_scale, step.decode_width
+            )
             return self.out.gemm(result, decode=True)
 
         ctx = step.context_rows
@@ -176,9 +214,17 @@ class Layer(nn.Module):
         if ctx < rows:
             positions = step.positions[ctx:]
             first_request = len(step.context_spans)
-            append_kv(k[ctx:], v[ctx:], positions, cache, table, None, request_start=first_request)
+            append_kv(
+                k[ctx:], v[ctx:], positions, cache, table, None, step.decode_width, first_request
+            )
             generated = decode_attention(
-                q[ctx:], gate[ctx:], positions, cache, table, request_start=first_request
+                q[ctx:],
+                gate[ctx:],
+                positions,
+                cache,
+                table,
+                rows_per_seq=step.decode_width,
+                request_start=first_request,
             )
             output = torch.cat((output, generated))
         return self.out(_pad(output, step.projection_rows))[:rows]
@@ -218,6 +264,7 @@ class Qwen38Decoder(DecoderModel):
         self.layers = nn.ModuleList(
             Layer(i, kind, self.eps) for i, kind in enumerate(config.layer_types)
         )
+        self.num_trunk_layers = len(self.layers)
         self.register_buffer("embedding", None)
         self.register_buffer("norm_weight", None)
         self.register_buffer("rope", None, persistent=False)
@@ -230,6 +277,7 @@ class Qwen38Decoder(DecoderModel):
         attn_metadata,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
+        verify: bool = False,
     ) -> torch.Tensor:
         md = attn_metadata
         manager = md.kv_cache_manager
@@ -238,7 +286,7 @@ class Qwen38Decoder(DecoderModel):
                 manager.mamba_layer_cache(layer.index)
                 if layer.is_linear
                 else bind_layer(manager, layer.index, md.host_kv_cache_pool_mapping)
-                for layer in self.layers
+                for layer in self.layers[: self.num_trunk_layers]
             )
             self._manager = manager
 
@@ -246,9 +294,12 @@ class Qwen38Decoder(DecoderModel):
         positions = position_ids.reshape(-1, x.shape[0])[0]
         contexts = md.num_contexts
         ctx_rows = md.num_ctx_tokens
+        num_decodes = md.num_seqs - contexts
+        decode_width = (x.shape[0] - ctx_rows) // num_decodes if num_decodes else 1
         projection_rows = max(x.shape[0], _PREFILL_MIN_ROWS) if contexts else x.shape[0]
         mamba = md.mamba_metadata
         state_slots = mamba.state_indices[: md.num_seqs]
+        replay_slots = mamba.replay_state_indices
         context = None
         spans = ()
         if contexts:
@@ -278,10 +329,13 @@ class Qwen38Decoder(DecoderModel):
             projection_rows,
             self.row_counts[projection_rows : projection_rows + 1],
             positions,
+            decode_width,
+            verify,
+            replay_slots[contexts : md.num_seqs] if replay_slots is not None else None,
         )
         residual = None
-        for layer, cache in zip(self.layers, self._caches, strict=True):
-            x, residual = layer(x, residual, step, self.rope, cache)
+        for i, cache in enumerate(self._caches):
+            x, residual = self.layers[i](x, residual, step, self.rope, cache)
         fi.gemma_fused_add_rmsnorm(x, residual, self.norm_weight, self.eps)
         return x
 
@@ -304,6 +358,25 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
         self.has_custom_lm_head = False
         self.prologue = []
         self.epilogue = [self.lm_head]
+        self.spec_config = model_config.spec_config
+        self.draft_config = None
+        self.draft_model = None
+        self.spec_worker = None
+        if self.spec_config is not None:
+            text.num_nextn_predict_layers = 1
+            if is_gdn_replay_enabled():
+                text._gdn_replay_history_dtype = torch.float32
+            draft_layer = MtpLayer(text.num_hidden_layers, text.rms_norm_eps)
+            self.model.layers.append(draft_layer)
+            self.draft_model = MtpDraft(self.model, draft_layer, self.lm_head)
+            self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
+            self.spec_worker = get_spec_worker(
+                self.spec_config,
+                self.model_config,
+                self.model_config.mapping,
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+            )
+            self.spec_worker.set_draft_model(self.draft_model)
 
     def __post_init__(self) -> None:
         pass
@@ -323,6 +396,8 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
             torch.arange(text.max_position_embeddings, device=device, dtype=torch.float32), freq
         )
         model.rope = torch.cat((phase.cos(), phase.sin()), dim=-1)
+        if self.draft_model is not None:
+            self.draft_model.mtp_layers[0].rope = model.rope
         model.row_counts = torch.arange(
             max(self.model_config.max_num_tokens, _PREFILL_MIN_ROWS) + 1,
             dtype=torch.int32,
@@ -336,11 +411,26 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         return_context_logits: bool = False,
+        spec_metadata=None,
+        resource_manager=None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         if inputs_embeds is not None:
             raise ValueError("Qwen3.8-27B text target requires token IDs")
-        hidden = self.model(attn_metadata, input_ids, position_ids)
+        speculative = self.spec_worker is not None
+        hidden = self.model(attn_metadata, input_ids, position_ids, speculative)
+        if speculative:
+            logits = self.lm_head(hidden.index_select(0, spec_metadata.gather_ids)).float()
+            return self.spec_worker(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden,
+                logits=logits,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=self.draft_model,
+                resource_manager=resource_manager,
+            )
         if not return_context_logits:
             end = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             hidden = hidden.index_select(0, end)

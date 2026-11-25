@@ -302,7 +302,12 @@ class GDNReplayState:
     replay slots the manager hands to the kernels.
     """
 
-    def __init__(self, tokens_per_gen_step: int, use_flashinfer_ring: bool = False) -> None:
+    def __init__(
+        self,
+        tokens_per_gen_step: int,
+        use_flashinfer_ring: bool = False,
+        history_dtype: torch.dtype | None = None,
+    ) -> None:
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._stacked_conv: torch.Tensor | None = None
@@ -312,6 +317,7 @@ class GDNReplayState:
         self._seed_request_counter = 0
         self._seed_rank_offset = 0
         self.use_flashinfer_ring = use_flashinfer_ring
+        self.history_dtype = history_dtype
         self.replay_step_width = tokens_per_gen_step
         self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
         # Whether the GDN layers verify drafts with the fused kernels, which commit
@@ -391,13 +397,14 @@ class GDNReplayState:
             }
         else:
             history = self.replay_history_size
+            dtype = self.history_dtype or context.conv_state_dtype
             layout = {
                 _GDN_REPLAY_HISTORY_ROLES["old_x"]: (
-                    context.conv_state_dtype,
+                    dtype,
                     [2, history, num_heads, head_dim],
                 ),
                 _GDN_REPLAY_HISTORY_ROLES["old_B"]: (
-                    context.conv_state_dtype,
+                    dtype,
                     [2, history, num_groups, d_state],
                 ),
                 _GDN_REPLAY_HISTORY_ROLES["old_dt"]: (torch.float32, [2, num_heads, history]),
@@ -959,8 +966,11 @@ def _estimated_gdn_replay_state(
         conv_state_layout="q_k_v",
     )
     requested, reason = _flashinfer_ring_replay_reason(layout, spec_config, use_replay)
+    history_dtype = getattr(model_config.pretrained_config, "_gdn_replay_history_dtype", None)
     state = GDNReplayState(
-        spec_config.tokens_per_gen_step, use_flashinfer_ring=requested and reason is None
+        spec_config.tokens_per_gen_step,
+        use_flashinfer_ring=history_dtype is None and requested and reason is None,
+        history_dtype=history_dtype,
     )
     return state, layout
 
@@ -996,12 +1006,21 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
+        self._replay_history_dtype = getattr(
+            kwargs.get("pretrained_config"), "_gdn_replay_history_dtype", None
+        )
+        if self._replay_history_dtype is not None:
+            kwargs["gdn_fused_verify"] = True
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
     @override
     def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
-        state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
+        state = create_gdn_state(
+            self, self._requested_replay, allow_flashinfer_ring=self._replay_history_dtype is None
+        )
+        if isinstance(state, GDNReplayState):
+            state.history_dtype = self._replay_history_dtype
 
         validate_gdn_layout(self, state)
         return state

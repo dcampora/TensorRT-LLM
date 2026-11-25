@@ -14,9 +14,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nv
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.gdn import (
     Context,
+    Replay,
     gated_rmsnorm,
     gdn_context,
     gdn_decode,
+    gdn_verify,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.paged import (  # noqa: E501
     Cache,
@@ -171,6 +173,65 @@ def test_gdn_decode(cell) -> None:
     batch = cell.spec["batch"]
     args = _gdn_inputs(batch, batch)
     _check_recurrent(gdn_decode, *args, args[-1], 1)
+
+
+@pytest.mark.parametrize("cell", gdn_verify.CELLS)
+def test_gdn_verify(cell) -> None:
+    torch.manual_seed(22)
+    batch, width = (cell.spec[key] for key in ("batch", "width"))
+    args = _gdn_inputs(batch * width, batch)
+    history, state = args[-3:-1]
+    saved_history, saved_state = history.clone(), state.clone()
+    conv = torch.empty((batch, width, *history.shape[1:]), dtype=history.dtype, device="cuda")
+    ssm = torch.empty((batch, width, *state.shape[1:]), dtype=state.dtype, device="cuda")
+    expected_conv, expected_ssm = torch.empty_like(conv), torch.empty_like(ssm)
+    output = gdn_verify(*args, conv, ssm, width)
+    expected = gdn_verify.reference(*args, expected_conv, expected_ssm, width)
+    _assert_bf16(output, expected)
+    _assert_bf16(ssm.flatten(0, 2).bfloat16(), expected_ssm.flatten(0, 2).bfloat16())
+    torch.testing.assert_close(conv, expected_conv, atol=0, rtol=0)
+    torch.testing.assert_close(history, saved_history, atol=0, rtol=0)
+    torch.testing.assert_close(state, saved_state, atol=0, rtol=0)
+
+
+def test_gdn_replay_acceptance() -> None:
+    torch.manual_seed(23)
+    batch, width, history_size = 2, 3, 5
+    _, _, weight, decay, bias, conv, temporal, slots = _gdn_inputs(batch * width, batch)
+    full_conv, full_state = conv.clone(), temporal.clone()
+    conv_planes = (batch, width, *conv.shape[1:])
+    verify_conv = conv.new_empty(conv_planes)
+    full_conv_steps = conv.new_empty(conv_planes)
+    full_ssm_steps = temporal.new_empty((batch, width, *temporal.shape[1:]))
+    replay = Replay(
+        slots.flip(0),
+        torch.zeros(4, dtype=torch.int32, device="cuda"),
+        torch.zeros(4, dtype=torch.int32, device="cuda"),
+        temporal.new_empty((4, 2, history_size, 48, 128)),
+        temporal.new_empty((4, 2, history_size, 16, 128)),
+        temporal.new_empty((4, 2, 48, history_size)),
+    )
+    batches = torch.arange(batch, device="cuda")
+    state_slots = slots.long()
+    replay_slots = replay.slots.long()
+    for counts in ((2, 3), (1, 3), (3, 1), (1, 1)):
+        x, ba = _random(batch * width, 16384), _random(batch * width, 96)
+        inputs = x, ba, weight, decay, bias
+        actual = gdn_verify(*inputs, conv, temporal, slots, verify_conv, None, width, replay)
+        expected = gdn_verify(
+            *inputs, full_conv, full_state, slots, full_conv_steps, full_ssm_steps, width
+        )
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        torch.testing.assert_close(verify_conv, full_conv_steps, atol=0, rtol=0)
+        accepted = torch.tensor(counts, device="cuda", dtype=torch.int32)
+        conv[state_slots] = verify_conv[batches, accepted - 1]
+        full_conv[state_slots] = full_conv_steps[batches, accepted - 1]
+        full_state[state_slots] = full_ssm_steps[batches, accepted - 1]
+        prior = replay.accepted[replay_slots]
+        checkpoint = prior + width > history_size
+        replay.accepted[replay_slots] = torch.where(checkpoint, accepted, prior + accepted)
+        bank = replay.banks[replay_slots]
+        replay.banks[replay_slots] = torch.where(checkpoint, 1 - bank, bank)
 
 
 @pytest.mark.parametrize("cell", gdn_context.CELLS)

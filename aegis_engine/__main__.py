@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -19,8 +20,11 @@ _MAX_SEQ_LEN = 8192
 
 
 class Engine:
-    def __init__(self, llm: LLM, eos_ids: list[int], vocab_size: int) -> None:
+    def __init__(
+        self, llm: LLM, eos_ids: list[int], vocab_size: int, score_llm: LLM | None = None
+    ) -> None:
         self.llm = llm
+        self.score_llm = score_llm if score_llm is not None else llm
         self.eos_ids = eos_ids
         self.vocab_size = vocab_size
 
@@ -76,7 +80,7 @@ class Engine:
             detokenize=False,
             return_context_logits=True,
         )
-        logits = self.llm.generate(ids, params, use_tqdm=False).context_logits
+        logits = self.score_llm.generate(ids, params, use_tqdm=False).context_logits
         if logits is None or logits.shape != (len(ids), self.vocab_size):
             raise RuntimeError("TensorRT-LLM did not return one vocabulary vector per position")
 
@@ -139,8 +143,12 @@ def run(model: Path, responses: TextIO, mode: str) -> None:
     if isinstance(eos_ids, int):
         eos_ids = [eos_ids]
 
-    with LLM(
-        str(model),
+    cache_config = dict(
+        free_gpu_memory_fraction=0.3,
+        enable_block_reuse=False,
+        mamba_ssm_cache_dtype="float32",
+    )
+    options = dict(
         modeling_v2=mode,
         disable_mm_encoder=True,
         skip_tokenizer_init=True,
@@ -150,14 +158,29 @@ def run(model: Path, responses: TextIO, mode: str) -> None:
         max_num_tokens=_MAX_SEQ_LEN,
         max_seq_len=_MAX_SEQ_LEN,
         cuda_graph_config={"batch_sizes": [1]},
-        kv_cache_config={
-            "free_gpu_memory_fraction": 0.3,
-            "enable_block_reuse": False,
-            "mamba_ssm_cache_dtype": "float32",
-        },
-    ) as llm:
-        engine = Engine(llm, eos_ids, config["vocab_size"])
-        engine.generate([config["bos_token_id"]], 2, True)
+        kv_cache_config=cache_config,
+    )
+    with ExitStack() as stack:
+        score_llm = None
+        generate_options = options
+        if mode == "require":
+            generate_options = {
+                **options,
+                "speculative_config": {"decoding_type": "MTP", "max_draft_len": 4},
+            }
+        llm = stack.enter_context(LLM(str(model), **generate_options))
+        if mode == "require":
+            # The speculative sampler does not return context logits.
+            # Scoring uses the same trunk in an executor with ordinary sampling.
+            score_options = {
+                **options,
+                "cuda_graph_config": None,
+                "kv_cache_config": {**cache_config, "free_gpu_memory_fraction": 0.06},
+            }
+            score_llm = stack.enter_context(LLM(str(model), **score_options))
+        engine = Engine(llm, eos_ids, config["vocab_size"], score_llm)
+        for rows in (1, 128, 1024, 4096):
+            engine.generate([config["bos_token_id"]] * rows, 8, True)
         engine.score([config["bos_token_id"]] * 2, {})
         print(json.dumps({"ready": True}), file=responses, flush=True)
         for line in sys.stdin:

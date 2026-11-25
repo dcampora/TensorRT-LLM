@@ -70,7 +70,7 @@ def load(model: ModelingV2Qwen38Nvfp4Sm100Default, weights: Mapping[str, torch.T
     core = model.model
     core.embedding = checkpoint.tensor(prefix + "embed_tokens.weight")
     core.norm_weight = checkpoint.tensor(prefix + "norm.weight")
-    for i, layer in enumerate(core.layers):
+    for i, layer in enumerate(core.layers[: core.num_trunk_layers]):
         base = f"{prefix}layers.{i}."
         layer.input_norm = checkpoint.tensor(base + "input_layernorm.weight")
         layer.post_norm = checkpoint.tensor(base + "post_attention_layernorm.weight")
@@ -94,3 +94,22 @@ def load(model: ModelingV2Qwen38Nvfp4Sm100Default, weights: Mapping[str, torch.T
             layer.q_norm = checkpoint.tensor(name + "q_norm.weight")
             layer.k_norm = checkpoint.tensor(name + "k_norm.weight")
     checkpoint.fp4(model.lm_head, "lm_head")
+    if model.draft_model is not None:
+        draft = model.draft_model.mtp_layers[0]
+        draft.embedding_norm = checkpoint.tensor("mtp.pre_fc_norm_embedding.weight")
+        draft.hidden_norm = checkpoint.tensor("mtp.pre_fc_norm_hidden.weight")
+        draft.fc = checkpoint.tensor("mtp.fc.weight")
+        draft.final_norm = checkpoint.tensor("mtp.norm.weight")
+        base = "mtp.layers.0."
+        draft.input_norm = checkpoint.tensor(base + "input_layernorm.weight")
+        draft.post_norm = checkpoint.tensor(base + "post_attention_layernorm.weight")
+        draft.q_norm = checkpoint.tensor(base + "self_attn.q_norm.weight")
+        draft.k_norm = checkpoint.tensor(base + "self_attn.k_norm.weight")
+        draft.qkv = torch.cat(
+            [checkpoint.tensor(base + f"self_attn.{name}_proj.weight") for name in ("q", "k", "v")]
+        )
+        draft.out = checkpoint.tensor(base + "self_attn.o_proj.weight")
+        draft.gate_up = torch.cat(
+            [checkpoint.tensor(base + f"mlp.{name}_proj.weight") for name in ("gate", "up")]
+        )
+        draft.down = checkpoint.tensor(base + "mlp.down_proj.weight")
