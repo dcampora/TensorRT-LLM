@@ -278,6 +278,17 @@ batch 128 fell from 302 to 213 microseconds. The replay cells compare
 BF16 outputs and convolution windows bit for bit against full FP32
 checkpointing across history bank switches.
 
+### Prepared GDN serving, ISL 1024 and OSL 1024
+
+The one-wave measurements use the same prompts as the dynamic MTP trial.
+All 384 serving checks still passed, with the same two tied divergences
+from the contract engine.
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 3733.80 | 1122.83 | 6.923 |
+| 128 | 128 | 5638.72 | 2852.12 | 19.263 |
+
 ## Standalone comparison
 
 The original `/ref-engine/engine.sh` copy crashed while instantiating its
@@ -298,3 +309,40 @@ controls. Each row is the median of two paired measurements.
 | 128 | 1024 | 10.02 | 2.413 | 414.36 |
 | 1024 | 1024 | 30.07 | 2.644 | 378.23 |
 | 4096 | 1024 | 109.53 | 2.885 | 346.56 |
+
+### Standalone warmed batches, ISL 1024 and OSL 1024
+
+The copied reference ran one full warmup for each batch size, followed
+by three one-output requests and three paired 32- and 1024-output
+requests. The timings use the same compatibility settings and disable
+prompt caching. Each batch uses distinct thinking-enabled chat prompts.
+
+| Batch | TTFT (ms) | TPOT after 32 (ms) | Aggregate decode tokens/s |
+| ---: | ---: | ---: | ---: |
+| 32 | 782.72 | 6.090 | 5254.26 |
+| 128 | 3172.90 | 14.334 | 8929.58 |
+
+## MTP draft front and single-output requests
+
+The draft front ports the embedding gather and the two RMSNorms from
+aegis-engines' `draft_front.py` into a single target operator. The
+single-request draft projections use FlashInfer's CuTe BF16 GEMM.
+One-output contract requests use the ordinary executor's prefill graph,
+since the request ends with the first verified token. All 36 operation
+cells passed. The contract's 32 oracle outcomes and the 384 serving
+comparisons were unchanged.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 14.33 | 2.454 | 407.42 |
+| 1024 | 1024 | 36.70 | 2.701 | 370.28 |
+| 4096 | 1024 | 125.28 | 2.944 | 339.62 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 3749.64 | 1098.92 | 6.970 |
+| 128 | 128 | 5688.52 | 2783.28 | 19.114 |

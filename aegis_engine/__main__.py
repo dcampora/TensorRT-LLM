@@ -42,7 +42,8 @@ class Engine:
             ignore_eos=ignore_eos,
             detokenize=False,
         )
-        tokens = self.llm.generate(ids, params, use_tqdm=False).outputs[0].token_ids
+        llm = self.score_llm if length == 1 else self.llm
+        tokens = llm.generate(ids, params, use_tqdm=False).outputs[0].token_ids
         if ignore_eos and len(tokens) != length:
             raise RuntimeError(f"expected {length} generated tokens, received {len(tokens)}")
         return tokens
@@ -160,6 +161,11 @@ def run(model: Path, responses: TextIO, mode: str) -> None:
         cuda_graph_config={"batch_sizes": [1]},
         kv_cache_config=cache_config,
     )
+    if mode == "require":
+        options.update(
+            prefill_cuda_graph_backend="breakable",
+            prefill_capture_num_tokens=[128, 1024, 4096],
+        )
     with ExitStack() as stack:
         score_llm = None
         generate_options = options
@@ -167,13 +173,11 @@ def run(model: Path, responses: TextIO, mode: str) -> None:
             generate_options = {
                 **options,
                 "speculative_config": {"decoding_type": "MTP", "max_draft_len": 4},
-                "prefill_cuda_graph_backend": "breakable",
-                "prefill_capture_num_tokens": [128, 1024, 4096],
             }
         llm = stack.enter_context(LLM(str(model), **generate_options))
         if mode == "require":
-            # The speculative sampler does not return context logits.
-            # Scoring uses the same trunk in an executor with ordinary sampling.
+            # Ordinary sampling returns context logits and serves requests
+            # for a single new token without building drafts.
             score_options = {
                 **options,
                 "cuda_graph_config": None,
@@ -182,7 +186,10 @@ def run(model: Path, responses: TextIO, mode: str) -> None:
             score_llm = stack.enter_context(LLM(str(model), **score_options))
         engine = Engine(llm, eos_ids, config["vocab_size"], score_llm)
         for rows in (1, 128, 1024, 4096):
-            engine.generate([config["bos_token_id"]] * rows, 8, True)
+            ids = [config["bos_token_id"]] * rows
+            engine.generate(ids, 8, True)
+            if score_llm is not None:
+                engine.generate(ids, 1, True)
         engine.score([config["bos_token_id"]] * 2, {})
         print(json.dumps({"ready": True}), file=responses, flush=True)
         for line in sys.stdin:

@@ -14,11 +14,18 @@ import triton as tr
 from torch import nn
 
 from .ops.attention import apply_gate, prepare_qkv
+from .ops.draft import draft_features
 from .ops.paged import append_kv, bind_layer, decode_attention, paged_context_attention
 
 if TYPE_CHECKING:
     from .modeling import Qwen38Decoder
     from .ops.projections import Fp4Linear
+
+
+def _draft_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if x.shape[0] <= 8:
+        return fi.mm_bf16(x, weight.T, backend="cute-dsl")
+    return F.linear(x, weight)
 
 
 class MtpLayer(nn.Module):
@@ -62,12 +69,12 @@ class MtpLayer(nn.Module):
         md = attn_metadata
         rows = input_ids.shape[0]
         positions = position_ids.reshape(-1, rows)[0]
-        embeddings = embed_tokens.index_select(0, input_ids.clamp_min(0))
-        emb = fi.gemma_rmsnorm(embeddings, self.embedding_norm, self.eps)
-        hidden = fi.gemma_rmsnorm(hidden_states, self.hidden_norm, self.eps)
-        residual = F.linear(torch.cat((emb, hidden), dim=-1), self.fc)
+        features = draft_features(
+            input_ids, embed_tokens, hidden_states, self.embedding_norm, self.hidden_norm, self.eps
+        )
+        residual = _draft_linear(features, self.fc)
         x = fi.gemma_rmsnorm(residual, self.input_norm, self.eps)
-        projection = F.linear(x, self.qkv)
+        projection = _draft_linear(x, self.qkv)
         q, k, v, gate = prepare_qkv(
             projection, self.q_norm, self.k_norm, self.rope, positions, self.eps
         )
@@ -116,7 +123,7 @@ class MtpLayer(nn.Module):
         if pick_rows is not None:
             x = x.index_select(0, pick_rows)
             residual = residual.index_select(0, pick_rows)
-        x = F.linear(x, self.out)
+        x = _draft_linear(x, self.out)
         fi.gemma_fused_add_rmsnorm(x, residual, self.post_norm, self.eps)
         x = F.linear(fi.silu_and_mul(F.linear(x, self.gate_up)), self.down)
         fi.gemma_fused_add_rmsnorm(x, residual, self.final_norm, self.eps)

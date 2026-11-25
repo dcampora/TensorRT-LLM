@@ -12,6 +12,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nv
     apply_gate,
     prepare_qkv,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.draft import (  # noqa: E501
+    draft_features,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_100__default.ops.gdn import (
     Context,
     Replay,
@@ -51,6 +54,17 @@ def _assert_bf16(actual: torch.Tensor, expected: torch.Tensor, ulps: float = 1) 
     scale = expected.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     eps = torch.finfo(torch.bfloat16).eps
     assert (delta <= ulps * eps * scale).all(), (delta / (eps * scale)).amax().item()
+
+
+@pytest.mark.parametrize("cell", draft_features.CELLS)
+def test_mtp_features(cell) -> None:
+    torch.manual_seed(24)
+    rows = cell.spec["rows"]
+    ids = torch.arange(-1, rows - 1, device="cuda", dtype=torch.int32).clamp(max=63)
+    embedding, hidden = _random(64, 5120), _random(rows, 5120)
+    embedding_norm, hidden_norm = _random(5120), _random(5120)
+    args = ids, embedding, hidden, embedding_norm, hidden_norm, 1.0e-6
+    _assert_bf16(draft_features(*args), draft_features.reference(*args))
 
 
 @pytest.mark.parametrize("cell", fp8_quantize.CELLS)
