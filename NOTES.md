@@ -681,9 +681,9 @@ logits with the BF16 head. Its first FlashInfer top-k compilation took about
 nine minutes. BF16 verifier logits saved the FP32 conversion in a separate
 greedy-only pilot. Both used the same earlier batched-projection build and
 showed small throughput differences. A third pilot ran the BF16 prefill
-gate GEMM at each request's own length for every packed prefill. It caused a
-0.625-nat first difference from solo at concurrency 32 on a supplemental
-chat. The serving launcher retains the validated paths.
+gate GEMM at each request's own length for every packed prefill. It returned
+a 0.625-nat first difference from solo at concurrency 32 on a supplemental
+chat.
 
 | Pilot | ISL | OSL | C1 tokens/s | C32 tokens/s | C128 tokens/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -713,3 +713,30 @@ pages used BF16 throughout this trial.
 | Pilot | ISL | OSL | C1 tokens/s | C32 tokens/s | C128 tokens/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16 recurrent state | 1024 | 1024 | 268.72 | 4194.66 | 7275.69 |
+
+## Full packed-scale serving sweep
+
+This run used `serve.sh`, the default request counts in `/task/bench_serving.py`,
+and the checkout's README as the passage source. The server used BF16 KV pages,
+FP32 recurrent state, three draft tokens through concurrency 32, and one
+draft token above 32.
+
+| ISL | OSL | Concurrency | Requests | Output tokens/s | Median TTFT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 16 | 302.01 | 58.19 |
+| 1024 | 1024 | 2 | 16 | 538.12 | 75.20 |
+| 1024 | 1024 | 4 | 16 | 976.66 | 95.64 |
+| 1024 | 1024 | 8 | 32 | 1710.72 | 74.81 |
+| 1024 | 1024 | 16 | 64 | 2859.09 | 93.47 |
+| 1024 | 1024 | 32 | 128 | 4223.34 | 134.90 |
+| 1024 | 1024 | 64 | 256 | 5463.39 | 194.01 |
+| 1024 | 1024 | 128 | 512 | 7055.93 | 336.62 |
+| 4096 | 1024 | 1 | 16 | 292.80 | 140.05 |
+| 4096 | 1024 | 8 | 32 | 1499.55 | 166.42 |
+| 4096 | 1024 | 32 | 128 | 2990.78 | 347.32 |
+
+The development HTTP checks reproduced all solo continuations. A repeat
+of the nine supplemental mixed chats returned an intermittent first
+difference at a 0.625-nat solo score gap on one 1,024-input chat at
+concurrency 32 and 128. The earlier run of the same serving configuration
+had gaps of at most 0.375 nats on these chats.
