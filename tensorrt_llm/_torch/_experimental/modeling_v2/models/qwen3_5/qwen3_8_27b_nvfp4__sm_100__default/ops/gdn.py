@@ -27,6 +27,7 @@ class Context:
     batch: int
     longest: int
     gdn_output_tile: int
+    fresh: bool = False
 
 
 def _reference_recurrence(
@@ -156,6 +157,10 @@ class GatedDeltaContext(OpWrapper):
             why="Continuation and fresh request sharing a step",
             spec={"lengths": (1, 141), "carried": (True, False)},
         ),
+        Cell(
+            why="Fresh contexts of uneven lengths share a wide convolution tile",
+            spec={"lengths": (37, 1024, 71), "carried": (False, False, False)},
+        ),
         Cell(why="Chunked prefill", spec={"lengths": (1024,), "carried": (True,)}),
     )
 
@@ -172,8 +177,11 @@ class GatedDeltaContext(OpWrapper):
     ) -> torch.Tensor:
         rows = x.shape[0]
         convolved = x.new_empty((rows, 10240))
-        tile = 16 if context.longest >= 1024 else 4
-        recurrent.context_conv[(context.batch, tr.cdiv(context.longest, tile), 40)](
+        if context.fresh:
+            tile, channels = (32, 128) if context.longest >= 512 else (8, 256)
+        else:
+            tile, channels = (16 if context.longest >= 1024 else 4), 256
+        recurrent.context_conv[(context.batch, tr.cdiv(context.longest, tile), 10240 // channels)](
             x,
             weight,
             convolved,
@@ -185,7 +193,8 @@ class GatedDeltaContext(OpWrapper):
             *history.stride(),
             10240,
             tile,
-            256,
+            channels,
+            context.fresh,
             num_warps=4,
         )
         recurrent.context_conv_tail[(context.batch, 40)](
@@ -276,7 +285,7 @@ class GatedDeltaVerify(OpWrapper):
             spec={"batch": 8, "width": 2, "replay": True, "commit_width": 5, "masked": True},
         ),
         Cell(
-            why="The full serving graph uses a warp per four state vectors",
+            why="Wide decode groups adjacent state tiles and preserves replay",
             spec={"batch": 128, "width": 2, "replay": True, "commit_width": 5},
         ),
     )
@@ -369,7 +378,8 @@ class GatedDeltaVerify(OpWrapper):
                 launch_pdl=pdl,
             )
         elif qk is not None and one_step:
-            verify.verify_prepared_step[(32, batch * 48)](
+            tiles = 4 if batch >= 64 and width == 2 else 1
+            verify.verify_prepared_step[(32 // tiles, batch * 48)](
                 qk,
                 convolved,
                 gates,
@@ -385,6 +395,7 @@ class GatedDeltaVerify(OpWrapper):
                 replay.decays.stride(0),
                 width,
                 replay.deltas.shape[2],
+                tiles,
                 mask,
                 num_warps=1,
             )

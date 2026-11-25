@@ -827,3 +827,65 @@ across 24 natural-language prompts at ISLs 128, 1024, and 4096.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 4263.59 | 852.15 | 6.233 |
 | 128 | 128 | 6614.25 | 2305.95 | 16.600 |
+
+## Fresh-context convolution and wide recurrent verification
+
+Fresh packed contexts specialize the existing indexed depthwise
+convolution. The convolution omits carried-history loads when the
+runtime marks the batch fresh and uses a separate time and channel tile
+for long contexts. The carried-context path retains its prior arithmetic.
+The raw kernel outputs matched bit for bit at lengths 128, 1024 and 4096,
+for eight 1024-token prompts together, and for packed lengths 37, 1024
+and 71. At the three individual lengths, kernel times were 5.55, 20.57
+and 65.58 microseconds, down from 8.92, 52.25 and 187.99.
+
+In the wide two-row verifier, a warp processes four consecutive
+state tiles with the same FP32 reduction order and the same read and
+write banks. The raw verifier matched both the outputs and committed
+states bit for bit. At batches 64, 96 and 128, the per-layer timings
+were 98.87, 144.59 and 189.88 microseconds, down from 102.71,
+152.22 and 202.05.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 13.25 | 2.307 | 433.45 |
+| 1024 | 1024 | 33.47 | 2.545 | 392.99 |
+| 4096 | 1024 | 114.06 | 2.783 | 359.31 |
+
+The operation and checkpoint-integration suite passed all 52 cases.
+The contract engine again passed all 32 development prompts with
+mean KL 0.008055 and 99.537% non-tie agreement over 2,161 positions.
+
+### Serving configuration controls, ISL 1024 and OSL 1024
+
+The control uses the preceding first-token prefill build. The sustained
+control at concurrency 32 delivered 3,630.59 output tokens/s over
+128 requests. The three alternatives below use one wave with 32 or
+128 requests. The distributed graph buckets and higher token budget
+changed wave throughput by less than 1%. Streaming every four steps
+raised median TTFT at concurrency 32 from 852 to 1,011 milliseconds.
+The launcher retains its original graph buckets, token budget and
+stream interval.
+
+| Configuration | Concurrency 32 output tokens/s | Concurrency 128 output tokens/s |
+| --- | ---: | ---: |
+| Launcher defaults | 4263.59 | 6614.25 |
+| Finer CUDA graph buckets | 4276.41 | 6659.56 |
+| 12,288-token step budget | 4280.76 | 6630.43 |
+| Quiet host and four-step streaming | 4178.17 | 6632.79 |
+
+### One-wave serving with fresh-context convolution, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 4313.19 | 797.92 | 6.206 |
+| 128 | 128 | 6655.56 | 2857.06 | 15.994 |
+
+The launched server passed all 384 development comparisons under
+the oracle rule. The two differences from batch 1 were at the same
+zero-gap token. All 208 long-prompt OSL 128 responses and all 160
+long-prompt OSL 1024 responses matched batch 1 exactly. All 56
+ordinary one-token requests matched the corresponding first MTP
+output. A sampled completion at temperature 0.8 also returned.

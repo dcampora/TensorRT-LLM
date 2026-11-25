@@ -465,6 +465,7 @@ class Qwen38Decoder(DecoderModel):
         if first:
             starts = starts - begin
             indices = indices - first
+        fresh = not mamba.use_initial_states
         context = Context(
             starts,
             chunks,
@@ -474,12 +475,13 @@ class Qwen38Decoder(DecoderModel):
             last - first,
             max(lengths),
             min(64, max(16, tr.next_power_of_2(end - begin))),
+            fresh,
         )
         projection_rows = max(end - begin, _PREFILL_MIN_ROWS)
         return Step(
             context,
             indices,
-            not mamba.use_initial_states,
+            fresh,
             tuple(zip(spans[:-1], spans[1:], strict=True)),
             slots,
             md.kv_cache_block_offsets[:, first:last],

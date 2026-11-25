@@ -74,14 +74,16 @@ def context_conv(
     C: tl.constexpr,
     BT: tl.constexpr,
     BC: tl.constexpr,
+    FRESH: tl.constexpr = False,
 ):
     seq, tile, channel = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     start = tl.load(Starts + seq)
     end = tl.load(Starts + seq + 1)
     first = start + tile * BT
     if first < end:
-        slot = tl.load(Slots + seq).to(tl.int64)
-        initial = tl.load(Initial + seq)
+        if not FRESH:
+            slot = tl.load(Slots + seq).to(tl.int64)
+            initial = tl.load(Initial + seq)
         t = first + tl.arange(0, BT)
         c = channel * BC + tl.arange(0, BC)
         acc = tl.full((BT, BC), 0, tl.float32)
@@ -89,13 +91,15 @@ def context_conv(
             pos = t + j - 3
             live = (pos[:, None] >= start) & (pos[:, None] < end)
             x = tl.load(X + pos[:, None] * XS + c[None, :], live & (c[None, :] < C), 0)
-            carried = tl.load(
-                History + slot * HS + c[None, :] * HC + (pos[:, None] - start + 3) * HT,
-                (pos[:, None] < start) & (t[:, None] < end) & (c[None, :] < C) & initial,
-                0,
-            )
+            if not FRESH:
+                carried = tl.load(
+                    History + slot * HS + c[None, :] * HC + (pos[:, None] - start + 3) * HT,
+                    (pos[:, None] < start) & (t[:, None] < end) & (c[None, :] < C) & initial,
+                    0,
+                )
+                x = tl.where(pos[:, None] < start, carried, x)
             w = tl.load(W + c * 4 + j, c < C, 0)
-            acc += _conv_product(tl.where(pos[:, None] < start, carried, x), w[None, :])
+            acc += _conv_product(x, w[None, :])
         tl.store(
             Y + t[:, None] * C + c[None, :],
             acc / (1 + tl.exp(-acc)),

@@ -287,6 +287,7 @@ def test_gdn_replay_acceptance(cell) -> None:
 def test_gdn_context(cell) -> None:
     torch.manual_seed(17)
     lengths = cell.spec["lengths"]
+    carried = cell.spec["carried"]
     args = _gdn_inputs(sum(lengths), len(lengths))
     counts = [(n + 63) // 64 for n in lengths]
     chunks = [(i, c) for i, n in enumerate(counts) for c in range(n)]
@@ -294,10 +295,11 @@ def test_gdn_context(cell) -> None:
     ctx = Context(
         *(torch.tensor(x, device="cuda", dtype=torch.int32) for x in inputs),
         args[-1],
-        torch.tensor(cell.spec["carried"], device="cuda"),
+        torch.tensor(carried, device="cuda"),
         len(lengths),
         max(lengths),
         64,
+        fresh=not any(carried),
     )
     # The chunked solve rounds normalized Q/K, triangular factors and its
     # boundary-state dot products to BF16 before the final output rounding.
