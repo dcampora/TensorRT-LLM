@@ -852,3 +852,110 @@ at all 11 tested concurrency levels.
 
 The quick HTTP run at ISL 1024 and OSL 1024 produced 681.5,
 6655.4, and 11349.4 output tokens/s at concurrency 1, 32, and 128.
+
+## Final-query prefill trial
+
+The trial retained all last-layer K/V writes and restricted the final
+attention output and expert computation to the last prompt token for a
+single ordinary request. Breakable graphs required the decoder body to
+return a dense hidden buffer with one row per input token. Keeping that
+buffer made capture succeed and preserved all 28 first-token tests.
+The same trial ported the accepted-row gather from aegis-engines
+`spec_kernels.py`, widened short ragged passes, and used sparse decode
+graph sizes.
+
+All engine oracle items passed. The HTTP comparison against batch 1
+passed at 48 and still found strict differences at 16 and 64. The
+external comparison found an additional strict difference at 16.
+At ISL 1024 and OSL 1024, the HTTP sweep reached 674.3, 6857.8, and
+11300.0 output tokens/s at concurrency 1, 32, and 128. Seed-100
+batch-1 TTFT was 11.20, 20.83, and 45.57 ms at ISL 128, 1024, and
+4096 with OSL 1024. The production path keeps the established
+prefill layout and graph list.
+
+## Final batch-1 verification
+
+The checkout's `engine.sh` passed all 32 development items. It scored
+2524 positions with mean KL 0.005972. Top-1 agreement was 2187 of 2193
+confident positions (99.7264%). Fourteen greedy continuations matched
+exactly, 17 first diverged at near-ties, and one passed the fragile
+check. All 28 first-token checks matched the first token of a
+35-token request.
+
+The external timer used two runs per chat seed. TTFT is the latency
+of the one-token request. TPOT is the elapsed-time difference
+between the 32- and 1024-token requests divided by 992.
+
+| ISL | OSL | Chat seed | Median TTFT (ms) | Median TPOT (ms) | Median decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 100 | 10.57 | 1.509 | 662.5 |
+| 1024 | 1024 | 100 | 19.21 | 1.322 | 756.2 |
+| 4096 | 1024 | 100 | 43.16 | 1.491 | 670.7 |
+| 128 | 1024 | 133 | 10.37 | 1.410 | 709.4 |
+| 1024 | 1024 | 133 | 18.26 | 1.485 | 673.4 |
+| 4096 | 1024 | 133 | 42.83 | 1.438 | 695.6 |
+
+The CPU regression set for runtime hooks, Modeling V2 contracts,
+routing, and CI selection passed 531 checks with 76 skips.
+
+I also compared six held-out chat prompts sampled from the prose corpus
+with the standalone engine at ISL 128, 1024, and 4096 and OSL 64.
+Five continuations passed the first-divergence rule. The other first
+diverged at output token index 11 for ISL 4096, where the standalone
+teacher-forced margin was 0.50 nats. On 712 sampled scoring positions,
+the mean KL over the standalone top 32 entries plus one tail bucket
+was 0.06103, and confident top-1 agreement was 97.86%.
+
+## Wide-batch proposal policy
+
+The fastest quick three-cell scheduler run used three proposals
+through batch 32 and two proposals above 32. The same schedule
+passed the HTTP comparison with batch 1 at concurrency 128. Its
+independent development comparison found three distinct strict
+differences there, with margins from 1.125 through 1.75 nats.
+The final launcher uses three proposals at every batch size.
+
+## Final serving verification
+
+The checkout's `serve.sh` passed the development greedy checks
+against both batch 1 and the independent oracle at concurrency
+1, 2, 4, 8, 32, 96, and 128. Against batch 1, strict differences
+remained at 16, 48, and 64, with margins of 0.50, 0.50, and
+0.75 nats respectively. The independent comparison also found
+strict differences at 16, 24, and 48.
+
+The six additional chats were also sent through the completion
+endpoint using the same token IDs and OSL 64. Against the batch-1
+engine, there were no strict differences through concurrency 8.
+The concurrency-32 burst repeated one ISL-4096 strict difference
+in 4 of 32 responses. The concurrency-128 burst repeated two
+distinct differences (ISL 1024 and 4096) across 22 of 128 responses.
+The two batch-1 teacher margins were 0.625 nats.
+
+## Final closed-loop throughput
+
+Both servers used the same three-draft policy, eleven generation graph
+sizes, six breakable prefill buckets, 8192-token scheduler budget, and
+FP8 KV cache settings. The V1 command selected `modeling_v2=off`.
+The `bench_serving.py` chat client used identical prompt hashes and
+request counts in every pair, with a minimum of 16 requests and four
+requests per concurrent client.
+
+| ISL | OSL | Concurrency | Requests | Modeling V2 output tokens/s | Modeling V1 output tokens/s | V2 median TTFT (ms) | V2 median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 1024 | 1 | 16 | 684.6 | 456.9 | 26.79 | 1.440 |
+| 1024 | 1024 | 2 | 16 | 904.9 | 795.0 | 106.02 | 2.070 |
+| 1024 | 1024 | 4 | 16 | 1193.7 | 1440.4 | 131.18 | 3.171 |
+| 1024 | 1024 | 8 | 32 | 1691.4 | 2260.4 | 122.75 | 4.560 |
+| 1024 | 1024 | 16 | 64 | 4112.0 | 3495.3 | 145.67 | 3.672 |
+| 1024 | 1024 | 32 | 128 | 6577.2 | 5622.7 | 151.99 | 4.666 |
+| 1024 | 1024 | 64 | 256 | 8804.9 | 9045.9 | 189.86 | 6.971 |
+| 1024 | 1024 | 128 | 512 | 11190.5 | 12371.3 | 244.09 | 10.966 |
+| 4096 | 1024 | 1 | 16 | 652.1 | 446.6 | 54.53 | 1.486 |
+| 4096 | 1024 | 8 | 32 | 1613.0 | 2116.3 | 209.87 | 4.607 |
+| 4096 | 1024 | 32 | 128 | 5510.9 | 4620.5 | 227.19 | 5.390 |
+
+HTTP throughput includes prompt processing and streaming. The standalone
+numbers above measure static-batch decode by differencing two output
+lengths. For ISL 1024 and OSL 1024, the standalone measured 6649.1 at
+batch 32 and 14233.7 at batch 128.
