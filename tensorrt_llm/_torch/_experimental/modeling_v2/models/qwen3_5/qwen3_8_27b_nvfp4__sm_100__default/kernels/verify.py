@@ -238,6 +238,9 @@ def verify_replay(
     PreparedQK=None,
     PreparedGates=None,
 ):
+    # When every step starts a new bank, the state includes the first
+    # guaranteed verifier row and the history starts at its first draft.
+    COMMIT_FIRST: tl.constexpr = HISTORY == STEP_WIDTH
     tile, work = tl.program_id(0), tl.program_id(1)
     seq, head = work // 48, work % 48
     kc = tl.arange(0, 128)
@@ -258,7 +261,7 @@ def verify_replay(
     state_ptr = State + state_slot * STATE_STRIDE
     state_ptr += head * 16384 + vc[:, None] * 128 + kc[None, :]
     state = tl.load(state_ptr, cache_modifier=".cg" if PreparedQK is not None else "")
-    for i in range(count):
+    for i in range(1 if COMMIT_FIRST else 0, count):
         off = bank * HISTORY + i
         delta = tl.load(dp + (off * 48 + head) * 128 + vc)
         key = tl.load(kp + (off * 16 + group) * 128 + kc)
@@ -266,7 +269,8 @@ def verify_replay(
         state = tl.fma(delta[:, None], key[None, :], state * decay)
 
     if count + STEP_WIDTH > HISTORY:
-        tl.store(state_ptr, state)
+        if not COMMIT_FIRST:
+            tl.store(state_ptr, state)
         count = 0
         bank = 1 - bank
     for i in tl.static_range(WIDTH):
@@ -282,11 +286,14 @@ def verify_replay(
         state = tl.fma(delta[:, None], key[None, :], state)
         result = tl.sum(state * q[None, :], 1)
         tl.store(Output + (row * 48 + head) * 128 + vc, result)
-        off = bank * HISTORY + count + i
-        tl.store(dp + (off * 48 + head) * 128 + vc, delta)
-        if tile == 0:
-            tl.store(gp + bank * (48 * HISTORY) + count + i, decay)
-            if head % 3 == 0:
-                tl.store(kp + (off * 16 + group) * 128 + kc, key)
+        if COMMIT_FIRST and i == 0:
+            tl.store(state_ptr, state, cache_modifier=".cs")
+        else:
+            off = bank * HISTORY + count + i
+            tl.store(dp + (off * 48 + head) * 128 + vc, delta)
+            if tile == 0:
+                tl.store(gp + bank * (48 * HISTORY) + count + i, decay)
+                if head % 3 == 0:
+                    tl.store(kp + (off * 16 + group) * 128 + kc, key)
     if PDL:
         launch_dependents()

@@ -212,11 +212,12 @@ def test_gdn_verify(cell) -> None:
 def test_gdn_replay_acceptance(cell) -> None:
     torch.manual_seed(23)
     batch, width = (cell.spec[key] for key in ("batch", "width"))
-    history_size = width + 2
+    step_width = cell.spec.get("commit_width", width)
+    history_size = cell.spec.get("commit_width", width + 2)
     replay_capacity = 2 * batch
     _, _, weight, decay, bias, conv, temporal, slots = _gdn_inputs(batch * width, batch)
     full_conv, full_state = conv.clone(), temporal.clone()
-    conv_planes = (batch, width, *conv.shape[1:])
+    conv_planes = (batch, step_width, *conv.shape[1:])
     verify_conv = conv.new_empty(conv_planes)
     full_conv_steps = conv.new_empty(conv_planes)
     full_ssm_steps = temporal.new_empty((batch, width, *temporal.shape[1:]))
@@ -239,13 +240,13 @@ def test_gdn_replay_acceptance(cell) -> None:
             *inputs, full_conv, full_state, slots, full_conv_steps, full_ssm_steps, width
         )
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        torch.testing.assert_close(verify_conv, full_conv_steps, atol=0, rtol=0)
+        torch.testing.assert_close(verify_conv[:, :width], full_conv_steps[:, :width], atol=0, rtol=0)
         accepted = (batches + offset).to(torch.int32) % width + 1
         conv[state_slots] = verify_conv[batches, accepted - 1]
         full_conv[state_slots] = full_conv_steps[batches, accepted - 1]
         full_state[state_slots] = full_ssm_steps[batches, accepted - 1]
         prior = replay.accepted[replay_slots]
-        checkpoint = prior + width > history_size
+        checkpoint = prior + step_width > history_size
         replay.accepted[replay_slots] = torch.where(checkpoint, accepted, prior + accepted)
         bank = replay.banks[replay_slots]
         replay.banks[replay_slots] = torch.where(checkpoint, 1 - bank, bank)

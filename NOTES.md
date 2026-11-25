@@ -346,3 +346,35 @@ comparisons were unchanged.
 | ---: | ---: | ---: | ---: | ---: |
 | 32 | 32 | 3749.64 | 1098.92 | 6.970 |
 | 128 | 128 | 5688.52 | 2783.28 | 19.114 |
+
+## First-row GDN checkpoint
+
+A verifier always consumes its first input token. The recurrence now
+commits the FP32 state after that row and records only subsequent draft
+corrections, following aegis-engines' `batch_spec_kernels.py`. The target
+selects a one-step history in the shared GDN allocator and its capacity
+estimator. The runtime's existing bank promotion, state slots, and
+convolution promotion apply at each accepted prefix. New operation cells
+cover widths five and two when the allocator reserves five rows. All
+38 cells passed. The full contract scores and generations matched the
+previous commit, and all 384 serving responses passed.
+
+A separate contract probe verified malformed-input recovery, zero-output
+generation, ragged score requests, and inclusive EOS stopping. Captured
+prefill and eager prefill emitted identical 64-token continuations on ten
+distinct prompts at ISLs 127, 128, 257, 1024, and 4096.
+
+### Contract engine, ISL 128, 1024, 4096 and OSL 1024
+
+| ISL | OSL | TTFT (ms) | TPOT after 32 (ms) | Decode tokens/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 1024 | 15.04 | 2.414 | 414.22 |
+| 1024 | 1024 | 36.42 | 2.655 | 376.61 |
+| 4096 | 1024 | 126.00 | 2.914 | 343.19 |
+
+### One-wave serving, ISL 1024 and OSL 1024
+
+| Concurrency | Requests | Aggregate output tokens/s | Median TTFT (ms) | Median TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 3887.93 | 1123.86 | 6.601 |
+| 128 | 128 | 5789.07 | 3040.77 | 18.510 |

@@ -257,6 +257,14 @@ class GatedDeltaVerify(OpWrapper):
             why="Wide replay prepares two vectors per block",
             spec={"batch": 64, "width": 2, "replay": True},
         ),
+        Cell(
+            why="A committed first row precedes four pending drafts",
+            spec={"batch": 1, "width": 5, "replay": True, "commit_width": 5},
+        ),
+        Cell(
+            why="Batched first-row commits with fewer drafts than the buffer permits",
+            spec={"batch": 64, "width": 2, "replay": True, "commit_width": 5},
+        ),
     )
 
     def __call__(

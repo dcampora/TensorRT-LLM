@@ -307,6 +307,7 @@ class GDNReplayState:
         tokens_per_gen_step: int,
         use_flashinfer_ring: bool = False,
         history_dtype: torch.dtype | None = None,
+        step_history: bool = False,
     ) -> None:
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
@@ -319,7 +320,10 @@ class GDNReplayState:
         self.use_flashinfer_ring = use_flashinfer_ring
         self.history_dtype = history_dtype
         self.replay_step_width = tokens_per_gen_step
-        self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
+        self.replay_history_size = (
+            tokens_per_gen_step if step_history
+            else max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
+        )
         # Whether the GDN layers verify drafts with the fused kernels, which commit
         # in-layer at every batch size (the manager's gdn_fused_verify).
         self.fused_verify = False
@@ -971,6 +975,7 @@ def _estimated_gdn_replay_state(
         spec_config.tokens_per_gen_step,
         use_flashinfer_ring=history_dtype is None and requested and reason is None,
         history_dtype=history_dtype,
+        step_history=getattr(model_config.pretrained_config, "_gdn_replay_step_history", False),
     )
     return state, layout
 
@@ -1009,6 +1014,9 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
         self._replay_history_dtype = getattr(
             kwargs.get("pretrained_config"), "_gdn_replay_history_dtype", None
         )
+        self._replay_step_history = getattr(
+            kwargs.get("pretrained_config"), "_gdn_replay_step_history", False
+        )
         if self._replay_history_dtype is not None:
             kwargs["gdn_fused_verify"] = True
         kwargs.setdefault("conv_state_layout", "q_k_v")
@@ -1021,6 +1029,8 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
         )
         if isinstance(state, GDNReplayState):
             state.history_dtype = self._replay_history_dtype
+            if self._replay_step_history:
+                state.replay_history_size = state.replay_step_width
 
         validate_gdn_layout(self, state)
         return state

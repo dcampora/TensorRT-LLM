@@ -394,6 +394,7 @@ class ModelingV2Qwen38Nvfp4Sm100Default(DecoderModelForCausalLM):
             text.num_nextn_predict_layers = 1
             if is_gdn_replay_enabled():
                 text._gdn_replay_history_dtype = torch.float32
+                text._gdn_replay_step_history = True
             draft_layer = MtpLayer(text.num_hidden_layers, text.rms_norm_eps)
             self.model.layers.append(draft_layer)
             self.draft_model = MtpDraft(self.model, draft_layer, self.lm_head)
